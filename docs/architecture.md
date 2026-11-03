@@ -247,7 +247,13 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 
 ### 6.2 Agent session 与 compaction
 
-`packages/agents/src/base-agent/` 将 Pi `AgentHarness`、原生 JSONL session、model、thinking level、tools 和 skills 组合成 `BaseAgent`。自动 compaction 默认开启，Solver 使用 `CTF_COMPACTION_PROMPT`，compaction 后由 Project 重新注入 challenge context、黑板、公告和活跃 SubAgent 快照。
+`packages/agents/src/base-agent/` 基于 pi-coding-agent 的 `AgentSession` 与 `SessionManager` 组合出 `BaseAgent`，对 Core 暴露自己的 `BaseAgentEvent`，不让 Pi 的事件和会话类型扩散到调用方。
+
+- 模型请求只走 jyff 的 Models registry：`AgentSession` 内置的 `ModelRuntime` 只用于确认 Provider 已配置，不读取 `~/.pi` 下的凭据或模型文件。
+- 资源只来自 jyff：系统提示词、skills、tools 由调用方传入，不加载 context file、extension 或 prompt template。Pi 会在提示词后附加 skills 列表（需有 read 或 bash 工具）和工作目录（沙箱内的容器路径）。
+- Pi 的自动 compaction 与自动重试关闭：BaseAgent 在每次 prompt 前检查上下文压力并调用 `compact()`，Solver 的这一步由 Scheduler 接管；瞬时网络错误由 Core 分类重试。Solver 使用 `CTF_COMPACTION_PROMPT`，compaction 后由 Project 重新注入 challenge context、黑板、公告和活跃 SubAgent 快照。
+- Session 文件位于固定路径，header 由 BaseAgent 预先写入以保留 Run ID。当前工具集记录为 `jyff.active_tools` 自定义条目，恢复时与现有工具取交集，收窄后不会被重新放开。Pi 0.82 写入的旧会话可以继续打开和恢复。
+- 容器内的 read、write、edit、bash 工具由 jyff 维护（`packages/agents/src/tools/`），通过 `ExecutionEnv` 在容器中按 POSIX 路径执行，截断后的完整 bash 输出也保存在容器内。Pi 1.x 的同名工具按宿主机规则解析路径，Windows 宿主下不能直接用于容器。
 
 ### 6.3 Web Access
 

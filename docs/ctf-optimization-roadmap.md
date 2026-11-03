@@ -68,7 +68,7 @@
 
 ### 3.3 阶段 1.5：Pi 运行时迁移
 
-目标版本为开始实施时官方的最新稳定版（2026-11-03 为 1.5.0），`pi-agent-core`、`pi-ai`、`pi-coding-agent`、`pi-durable` 同版本并精确锁定。
+目标版本为开始实施时官方的最新稳定版（2026-11-03 为 1.5.0），`pi-agent-core`、`pi-ai`、`pi-coding-agent` 同版本并精确锁定。`pi-durable` 是独立的文档/任务运行时，职责与 RunStore 和调度器重叠，不纳入本次迁移。
 
 **为什么放在这里。**
 
@@ -81,6 +81,14 @@
 1. **U1 隔离原型**（独立分支/worktree）：1.x 已从 core 移除 `AgentHarness`、`Session`、`JsonlSessionStorage`、`ExecutionEnv`、内置工具、技能与压缩等 31 个本项目使用的符号及 `./node` 子路径（按官方 tarball 的类型声明与本仓库实际导入逐项比对得出）。按设计说明书 18.4 节建立 `AgentRuntimeAdapter`、`ExecutionTranscriptReader`、`ModelRequestPolicy`、`ConversationReader/Exporter` 四个窄接口，改接 BaseAgent/Session、DockerExecutionEnv、工具、技能、压缩、模型注册与 HTML 导出。
 2. **U2 兼容验收**：U01—U10 中适用的检查；阶段 0/1 的全部用例回归；旧 JSONL 会话至少可只读浏览；Pi 契约测试（`pi-session-contract.test.ts`）按新存储合同改写并通过。
 3. **U3 冻结**：精确版本与完整锁文件；记录 runtimeProfile；先在新 Run 上小批放量。
+
+**实施结果。**
+
+- BaseAgent 改为基于 pi-coding-agent 的 `AgentSession` 与 `SessionManager`，公开接口基本不变；Core 与后端改用 jyff 自有的 `BaseAgentEvent`。
+- 容器内 read/write/edit/bash 由 jyff 维护：1.x 的同名工具按宿主机规则解析路径，Windows 宿主会把 `/workspace/x` 解析成盘符路径；bash 还会把截断输出写进宿主机临时文件。移植的工具保持 0.82 的模型可见行为。
+- Pi 的自动 compaction 与自动重试关闭，由 Core 负责；小上下文窗口下保留的近期上下文上限为可用窗口的一半，避免 1.5 拒绝压缩。
+- 工具集记录为 `jyff.active_tools` 自定义条目；0.82 会话（`active_tools_change` 等旧条目）可继续打开和恢复。
+- `pi-session-contract.test.ts` 已按 SessionManager 合同改写。
 
 **出口门。** 上述检查全部通过，`vp check / typecheck / test / build` 全绿，A-fixed-pi 与 A-fixed 同配置对照无明显回归（小样本只能发现明显回归）。迁移不与阶段 2 及之后的功能同时放量。
 
@@ -193,7 +201,7 @@ P1-a、P1-b、P2 三线并行，合入后做一次同 Run 配置、恢复与生�
 | ----------------- | ----------------------------------------------------------- |
 | 0 准备与决策      | 完成；U0 定为升级到官方最新版                               |
 | 1 正确性修复      | 完成；小规模 A-fixed 对照中网络瞬断修复在真实连接抖动下生效 |
-| 1.5 Pi 运行时迁移 | 进行中                                                      |
+| 1.5 Pi 运行时迁移 | 迁移完成，四项检查全绿；待 A-fixed-pi 对照                  |
 | 2—6               | 未开始                                                      |
 
 各阶段的详细执行记录（环境、评测数据与花费）保存在本地，不纳入版本库。
