@@ -12,6 +12,26 @@ export const SUBAGENT_SHARED_SYSTEM_PROMPT = [
   "Finish with concise, verifiable findings including relevant paths, commands, addresses, constants, negative results, and recommended next steps.",
 ].join("\n")
 
+/**
+ * Compaction instructions for SubAgents. Unlike the Solver, nothing is re-injected
+ * after a SubAgent compacts: only its system prompt survives, so the summary must
+ * carry every fact needed to continue rather than references to state it cannot read.
+ */
+export const SUBAGENT_COMPACTION_PROMPT = [
+  "Compact this SubAgent investigation so it can continue after the summary replaces the earlier messages.",
+  "Nothing is re-injected after compaction. Only your system prompt (role and <subagent_context>) survives; " +
+    "you cannot read the primary Solver's blackboard, challenge snapshots, or other SubAgents' state afterwards.",
+  "Preserve the delegated task as given: objective, scope, required deliverables, stop conditions, and constraints, " +
+    "plus any later instructions from the primary Solver.",
+  "Preserve concrete facts, not references: what you ran and what it actually returned, the conditions each result depends on " +
+    "(input files and hashes, endpoints, parameters, environment), and negative results with exactly what was and was not tested.",
+  "Keep paths of files, scripts, and logs you created or rely on; processes you left running; critical constants, addresses, " +
+    "payloads, and credential sources; and the smallest executable next steps.",
+  "Keep any candidate flag with its verification status. Label unverified interpretations and partial tool output as unverified; " +
+    "never present them as confirmed.",
+  "Note which findings you have not yet reported to the primary Solver.",
+].join("\n")
+
 export function subagentTaskContextPrompt(options: {
   title: string
   id: string

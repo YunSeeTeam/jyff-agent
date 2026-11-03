@@ -148,6 +148,50 @@ describe("BaseAgent native session", () => {
     expect(entriesAfter).toEqual(entriesBefore)
   })
 
+  it("restores only active tools the current tool set still allows", async () => {
+    const root = await mkdtemp(join(tmpdir(), "base-agent-tool-restore-"))
+    roots.push(root)
+    const extraTool: AgentTool = { ...noopTool, name: "extra", label: "Extra" }
+    const common = {
+      session: { path: join(root, "session.jsonl"), id: "run-tools", cwd: root },
+      models: modelsFromAgentOptions(legacy, model),
+      model,
+      compaction: false,
+    }
+
+    const names = (agent: TestAgent) => agent.activeTools.map((tool) => tool.name)
+
+    const first = await TestAgent.open({ ...common, tools: [noopTool, extraTool] })
+    expect(names(first)).toEqual(["noop", "extra"])
+
+    // The role whitelist no longer includes `extra`: it must not come back on restore.
+    const narrowed = await TestAgent.open({ ...common, tools: [noopTool] })
+    expect(names(narrowed)).toEqual(["noop"])
+
+    // Widening the tool set again does not silently re-grant what the session lost.
+    const widened = await TestAgent.open({ ...common, tools: [noopTool, extraTool] })
+    expect(names(widened)).toEqual(["noop"])
+  })
+
+  it("keeps a phase-restricted tool set on restore", async () => {
+    const root = await mkdtemp(join(tmpdir(), "base-agent-phase-restore-"))
+    roots.push(root)
+    const extraTool: AgentTool = { ...noopTool, name: "extra", label: "Extra" }
+    const common = {
+      session: { path: join(root, "session.jsonl"), id: "run-phase", cwd: root },
+      models: modelsFromAgentOptions(legacy, model),
+      model,
+      tools: [noopTool, extraTool],
+      compaction: false,
+    }
+
+    const writeup = await TestAgent.open(common)
+    await writeup.setActiveTools(["noop"])
+
+    const restored = await TestAgent.open(common)
+    expect(restored.activeTools.map((tool) => tool.name)).toEqual(["noop"])
+  })
+
   it("runs compaction lifecycle hooks around the configured CTF instructions", async () => {
     const root = await mkdtemp(join(tmpdir(), "base-agent-compact-hook-"))
     roots.push(root)

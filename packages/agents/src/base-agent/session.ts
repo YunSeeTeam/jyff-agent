@@ -94,9 +94,17 @@ export async function openAgentSession(
       `Session model is unavailable: ${context.model?.provider}/${context.model?.modelId}`,
     )
   }
-  const activeToolNames = context.activeToolNames ?? [
+  // A session may outlive the tools it was created with (role whitelist narrowed,
+  // tool removed). Restore only names the current tool set still allows, and persist
+  // the narrowed set so a later reopen cannot silently re-expand it.
+  const legalToolNames = new Set(options.tools.map((tool) => tool.name))
+  const persistedToolNames = context.activeToolNames ?? [
     ...(options.activeToolNames ?? options.tools.map((tool) => tool.name)),
   ]
+  const activeToolNames = persistedToolNames.filter((name) => legalToolNames.has(name))
+  if (context.activeToolNames && activeToolNames.length !== context.activeToolNames.length) {
+    await session.appendActiveToolsChange(activeToolNames)
+  }
   return {
     session,
     model,
