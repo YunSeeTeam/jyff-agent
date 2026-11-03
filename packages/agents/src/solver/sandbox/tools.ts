@@ -30,6 +30,11 @@ export interface SolverToolOptions {
   capability: ChallengeCapability
   sandbox: Sandbox
   onTerminalSubmission(submission: FlagSubmission): void
+  /**
+   * Durably records an accepted/already_solved answer before the tool returns, so
+   * the platform's verdict survives later writeup or cleanup failures.
+   */
+  recordTerminalSubmission?(submission: FlagSubmission, observedAt: string): Promise<void>
   submissionRateLimiter?: FlagSubmissionRateLimiter
 }
 
@@ -171,10 +176,24 @@ export function createSolverTools(options: SolverToolOptions): AgentTool[] {
         submissionRateLimiter?.acquire()
         const submission = await options.capability.submitFlag((params as { flag: string }).flag)
         const terminal = submission.status === "accepted" || submission.status === "already_solved"
-        if (terminal) options.onTerminalSubmission(submission)
+        if (!terminal) return result(submission)
+        const observedAt = new Date().toISOString()
+        let persistence: Record<string, string> | undefined
+        try {
+          await options.recordTerminalSubmission?.(submission, observedAt)
+        } catch (error) {
+          // The platform has already accepted; the local record is what failed.
+          // Never present this as a rejected flag that should be resubmitted.
+          persistence = {
+            code: "accepted_persistence_failed",
+            message: error instanceof Error ? error.message : String(error),
+            instruction: "The platform accepted this flag. Do not submit it again.",
+          }
+        }
+        options.onTerminalSubmission(submission)
         return {
-          ...result(submission),
-          ...(terminal ? { terminate: true } : {}),
+          ...result(persistence ? { ...submission, persistence } : submission),
+          terminate: true,
         }
       },
     },

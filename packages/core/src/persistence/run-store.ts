@@ -28,6 +28,38 @@ export type RunStatus =
 
 export type RunSource = "direct" | "auto" | "manual" | "retry" | "revival" | "test"
 
+/**
+ * Platform-confirmed success, recorded when the submission response arrives and
+ * independent of the Run lifecycle: writeup or cleanup failures never clear it.
+ * `already_solved` means the platform already counted the challenge as solved
+ * before this Run; `legacy_success` marks Runs that ended `solved` before this
+ * fact was recorded (acceptance time unknown).
+ */
+export type SolveOutcome = "accepted" | "already_solved" | "legacy_success"
+
+export type WriteupStatus =
+  | "not_requested"
+  | "pending"
+  | "running"
+  | "validated"
+  | "failed"
+  | "interrupted"
+  | "legacy_unknown"
+
+const WRITEUP_STATUSES = [
+  "not_requested",
+  "pending",
+  "running",
+  "validated",
+  "failed",
+  "interrupted",
+  "legacy_unknown",
+] as const satisfies readonly WriteupStatus[]
+const WRITEUP_STATUS_SQL = WRITEUP_STATUSES.map((status) => `'${status}'`).join(", ")
+
+/** Data features this store has migrated to; checked before rolling back to older builds. */
+export const RUN_STORE_DATA_CAPABILITIES = { "accepted-fact": 1 } as const
+
 export type RunCloseReason =
   | "submitted"
   | "manual"
@@ -51,6 +83,11 @@ export interface RunRecord {
   updatedAt: string
   startedAt?: string
   finishedAt?: string
+  solveOutcome?: SolveOutcome
+  /** Host time of the first observed `accepted` response; not the platform's clock. */
+  observedAcceptedAt?: string
+  platformAcceptedAt?: string
+  writeupStatus: WriteupStatus
 }
 
 /**
@@ -130,6 +167,17 @@ export interface UpdateRunRecord {
   cleanupError?: string | null
   startedAt?: string | null
   finishedAt?: string | null
+  writeupStatus?: WriteupStatus
+}
+
+export interface RecordSolveOutcome {
+  runId: string
+  outcome: "accepted" | "already_solved"
+  /** Defaults to now; the host time the platform response was received. */
+  observedAt?: string
+  /** Only when the platform contract returns a verifiable acceptance time. */
+  platformAcceptedAt?: string
+  message?: string
 }
 
 export interface RunFilter {
@@ -396,6 +444,10 @@ interface RunRow {
   updated_at: string
   started_at: string | null
   finished_at: string | null
+  solve_outcome: SolveOutcome | null
+  observed_accepted_at: string | null
+  platform_accepted_at: string | null
+  writeup_status: WriteupStatus
 }
 
 interface EventRow {
@@ -702,6 +754,10 @@ function runFromRow(row: RunRow): RunRecord {
     updatedAt: row.updated_at,
     ...(row.started_at ? { startedAt: row.started_at } : {}),
     ...(row.finished_at ? { finishedAt: row.finished_at } : {}),
+    ...(row.solve_outcome ? { solveOutcome: row.solve_outcome } : {}),
+    ...(row.observed_accepted_at ? { observedAcceptedAt: row.observed_accepted_at } : {}),
+    ...(row.platform_accepted_at ? { platformAcceptedAt: row.platform_accepted_at } : {}),
+    writeupStatus: row.writeup_status,
   }
 }
 
@@ -849,7 +905,18 @@ export class RunStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         started_at TEXT,
-        finished_at TEXT
+        finished_at TEXT,
+        solve_outcome TEXT
+          CHECK (solve_outcome IN ('accepted', 'already_solved', 'legacy_success')),
+        observed_accepted_at TEXT,
+        platform_accepted_at TEXT,
+        writeup_status TEXT NOT NULL DEFAULT 'legacy_unknown'
+          CHECK (writeup_status IN (${WRITEUP_STATUS_SQL}))
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS runtime_data_capabilities (
+        name TEXT PRIMARY KEY,
+        version INTEGER NOT NULL CHECK (version >= 1)
       ) STRICT;
 
       CREATE UNIQUE INDEX IF NOT EXISTS runs_challenge_attempt
@@ -1111,6 +1178,45 @@ export class RunStore {
     if (!runColumns.some((column) => column.name === "source")) {
       database.exec("ALTER TABLE runs ADD COLUMN source TEXT NOT NULL DEFAULT 'direct'")
     }
+    const runColumnNames = new Set(runColumns.map((column) => column.name))
+    const hadSolveOutcome = runColumnNames.has("solve_outcome")
+    const acceptedFactMigrations = [
+      [
+        "solve_outcome",
+        "ALTER TABLE runs ADD COLUMN solve_outcome TEXT CHECK (solve_outcome IN ('accepted', 'already_solved', 'legacy_success'))",
+      ],
+      ["observed_accepted_at", "ALTER TABLE runs ADD COLUMN observed_accepted_at TEXT"],
+      ["platform_accepted_at", "ALTER TABLE runs ADD COLUMN platform_accepted_at TEXT"],
+      [
+        "writeup_status",
+        `ALTER TABLE runs ADD COLUMN writeup_status TEXT NOT NULL DEFAULT 'legacy_unknown' CHECK (writeup_status IN (${WRITEUP_STATUS_SQL}))`,
+      ],
+    ] as const
+    database.exec("BEGIN IMMEDIATE")
+    try {
+      for (const [name, sql] of acceptedFactMigrations) {
+        if (!runColumnNames.has(name)) database.exec(sql)
+      }
+      // Runs that ended solved before the fact existed: success is known, its time is not.
+      // Only on the migration that adds the column, so reopening never relabels new data.
+      if (!hadSolveOutcome) {
+        database.exec(`
+          UPDATE runs SET solve_outcome = 'legacy_success'
+          WHERE status = 'solved' AND solve_outcome IS NULL
+        `)
+      }
+      const registerCapability = database.prepare(`
+        INSERT INTO runtime_data_capabilities (name, version) VALUES (?, ?)
+        ON CONFLICT(name) DO UPDATE SET version = MAX(version, excluded.version)
+      `)
+      for (const [name, version] of Object.entries(RUN_STORE_DATA_CAPABILITIES)) {
+        registerCapability.run(name, version)
+      }
+      database.exec("COMMIT")
+    } catch (error) {
+      database.exec("ROLLBACK")
+      throw error
+    }
 
     const subagentColumns = new Set(
       (
@@ -1370,8 +1476,9 @@ export class RunStore {
       this.database
         .prepare(`
         INSERT INTO runs (
-          id, challenge_id, workspace, attempt, source, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, ?)
+          id, challenge_id, workspace, attempt, source, status, writeup_status,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'preparing', 'not_requested', ?, ?)
       `)
         .run(
           input.id,
@@ -1449,6 +1556,7 @@ export class RunStore {
     const finishedAt =
       patch.finishedAt === undefined ? (current.finishedAt ?? null) : patch.finishedAt
     const status = patch.status ?? current.status
+    const writeupStatus = patch.writeupStatus ?? current.writeupStatus
 
     const hasBlockLedger = this.database
       .prepare("SELECT 1 FROM challenge_block_events WHERE run_id = ? LIMIT 1")
@@ -1464,10 +1572,20 @@ export class RunStore {
         .prepare(`
         UPDATE runs
         SET status = ?, close_reason = ?, error = ?, cleanup_error = ?,
-            updated_at = ?, started_at = ?, finished_at = ?
+            updated_at = ?, started_at = ?, finished_at = ?, writeup_status = ?
         WHERE id = ?
       `)
-        .run(status, closeReason, error, cleanupError, timestamp, startedAt, finishedAt, id)
+        .run(
+          status,
+          closeReason,
+          error,
+          cleanupError,
+          timestamp,
+          startedAt,
+          finishedAt,
+          writeupStatus,
+          id,
+        )
       if (recordsSessionInterruption) {
         this.database
           .prepare(`
@@ -1507,9 +1625,73 @@ export class RunStore {
     return this.getRunOrThrow(id)
   }
 
+  /**
+   * Persist the platform's terminal answer for a Run. The first `accepted` time is
+   * never rewritten and `accepted` is never downgraded; `already_solved` only fills
+   * an empty outcome. Idempotent for duplicate receipts.
+   */
+  recordSolveOutcome(input: RecordSolveOutcome): RunRecord {
+    this.assertOpen()
+    const timestamp = new Date().toISOString()
+    const observedAt = input.observedAt ?? timestamp
+    this.database.exec("BEGIN IMMEDIATE")
+    try {
+      const current = this.getRunOrThrow(input.runId)
+      const previous = current.solveOutcome
+      const upgradesToAccepted = input.outcome === "accepted" && previous !== "accepted"
+      const fillsEmpty = input.outcome === "already_solved" && previous === undefined
+      if (upgradesToAccepted || fillsEmpty) {
+        this.database
+          .prepare(`
+            UPDATE runs
+            SET solve_outcome = ?, observed_accepted_at = ?, platform_accepted_at = ?,
+                updated_at = ?
+            WHERE id = ?
+          `)
+          .run(
+            input.outcome,
+            upgradesToAccepted ? observedAt : null,
+            upgradesToAccepted ? (input.platformAcceptedAt ?? null) : null,
+            timestamp,
+            input.runId,
+          )
+        this.insertEvent(
+          input.runId,
+          "solve_outcome_recorded",
+          {
+            outcome: input.outcome,
+            previousOutcome: previous ?? null,
+            observedAt,
+            ...(input.platformAcceptedAt ? { platformAcceptedAt: input.platformAcceptedAt } : {}),
+            ...(input.message ? { message: input.message.slice(0, 500) } : {}),
+          },
+          timestamp,
+        )
+      }
+      this.database.exec("COMMIT")
+    } catch (error) {
+      this.database.exec("ROLLBACK")
+      throw error
+    }
+    return this.getRunOrThrow(input.runId)
+  }
+
+  dataCapabilities(): Record<string, number> {
+    this.assertOpen()
+    const rows = this.database
+      .prepare("SELECT name, version FROM runtime_data_capabilities ORDER BY name")
+      .all() as unknown as Array<{ name: string; version: number }>
+    return Object.fromEntries(rows.map((row) => [row.name, row.version]))
+  }
+
   markInterruptedRuns(message = "进程退出时 Run 未进入终态"): RunRecord[] {
     this.assertOpen()
-    const active = this.listRuns({ status: ["preparing", "running"] })
+    // blocking/writing_writeup also own a sandbox and would otherwise stay "active"
+    // forever. A recorded solve outcome survives, so the challenge stays solved and
+    // only the writeup is marked interrupted.
+    const active = this.listRuns({
+      status: ["preparing", "running", "blocking", "writing_writeup"],
+    })
     return active.map((run) =>
       this.updateRun(
         run.id,
@@ -1518,6 +1700,7 @@ export class RunStore {
           closeReason: "interrupted",
           error: message,
           finishedAt: new Date().toISOString(),
+          ...(run.status === "writing_writeup" ? { writeupStatus: "interrupted" as const } : {}),
         },
         "run_interrupted",
         { previousStatus: run.status },
@@ -2562,7 +2745,7 @@ export class RunStore {
       .prepare(`
       SELECT 1 AS solved
       FROM runs
-      WHERE challenge_id = ? AND status = 'solved'
+      WHERE challenge_id = ? AND (status = 'solved' OR solve_outcome IS NOT NULL)
       LIMIT 1
     `)
       .get(challengeId)

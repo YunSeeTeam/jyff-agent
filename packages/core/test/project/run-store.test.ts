@@ -1321,4 +1321,154 @@ describe("RunStore", () => {
     })
     migrated.close()
   })
+
+  it("打开旧数据库时把已解 Run 迁移为 legacy_success，重复打开不改写新数据", async () => {
+    const { path, store } = await storeFixture({ persistent: true })
+    store.close()
+    const legacy = new DatabaseSync(path)
+    for (const column of [
+      "solve_outcome",
+      "observed_accepted_at",
+      "platform_accepted_at",
+      "writeup_status",
+    ]) {
+      legacy.exec(`ALTER TABLE runs DROP COLUMN ${column}`)
+    }
+    legacy.exec("DROP TABLE runtime_data_capabilities")
+    legacy.exec(`
+      INSERT INTO runs (
+        id, challenge_id, workspace, attempt, source, status, close_reason,
+        created_at, updated_at, finished_at
+      ) VALUES
+        ('legacy-solved', 'web-1', 'workspace', 1, 'auto', 'solved', 'submitted',
+         '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z', '2026-01-01T00:10:00.000Z'),
+        ('legacy-failed', 'web-2', 'workspace', 1, 'auto', 'failed', 'failed',
+         '2026-01-01T00:00:00.000Z', '2026-01-01T00:10:00.000Z', '2026-01-01T00:10:00.000Z')
+    `)
+    legacy.close()
+
+    const migrated = await RunStore.open(path)
+    expect(migrated.getRun("legacy-solved")).toMatchObject({
+      solveOutcome: "legacy_success",
+      writeupStatus: "legacy_unknown",
+    })
+    // Success is known for legacy Runs, the acceptance time is not; never invent one.
+    expect(migrated.getRun("legacy-solved")?.observedAcceptedAt).toBeUndefined()
+    expect(migrated.getRun("legacy-failed")?.solveOutcome).toBeUndefined()
+    expect(migrated.isSolved("web-1")).toBe(true)
+    expect(migrated.dataCapabilities()).toEqual({ "accepted-fact": 1 })
+    migrated.createRun({ id: "new-run", challengeId: "web-3", workspace: "w", attempt: 1 })
+    migrated.updateRun("new-run", { status: "solved", closeReason: "submitted" })
+    migrated.close()
+
+    const reopened = await RunStore.open(path)
+    expect(reopened.getRun("new-run")?.writeupStatus).toBe("not_requested")
+    expect(reopened.getRun("new-run")?.solveOutcome).toBeUndefined()
+    expect(reopened.getRun("legacy-solved")?.solveOutcome).toBe("legacy_success")
+    reopened.close()
+  })
+
+  it("记录平台成功事实：首次接受时间不被改写，accepted 不降级", async () => {
+    const { store } = await storeFixture()
+    store.createRun({ id: "run-1", challengeId: "web-1", workspace: "w", attempt: 1 })
+    expect(store.getRun("run-1")?.writeupStatus).toBe("not_requested")
+
+    store.recordSolveOutcome({
+      runId: "run-1",
+      outcome: "already_solved",
+      observedAt: "2026-01-01T00:00:30.000Z",
+    })
+    expect(store.getRun("run-1")?.solveOutcome).toBe("already_solved")
+    expect(store.getRun("run-1")?.observedAcceptedAt).toBeUndefined()
+
+    store.recordSolveOutcome({
+      runId: "run-1",
+      outcome: "accepted",
+      observedAt: "2026-01-01T00:01:00.000Z",
+      message: "Correct",
+    })
+    store.recordSolveOutcome({
+      runId: "run-1",
+      outcome: "accepted",
+      observedAt: "2026-01-01T00:02:00.000Z",
+    })
+    store.recordSolveOutcome({
+      runId: "run-1",
+      outcome: "already_solved",
+      observedAt: "2026-01-01T00:03:00.000Z",
+    })
+
+    expect(store.getRun("run-1")).toMatchObject({
+      solveOutcome: "accepted",
+      observedAcceptedAt: "2026-01-01T00:01:00.000Z",
+    })
+    expect(
+      store
+        .events("run-1")
+        .filter((event) => event.type === "solve_outcome_recorded")
+        .map((event) => event.data),
+    ).toEqual([
+      expect.objectContaining({ outcome: "already_solved", previousOutcome: null }),
+      expect.objectContaining({
+        outcome: "accepted",
+        previousOutcome: "already_solved",
+        message: "Correct",
+      }),
+    ])
+    store.close()
+  })
+
+  it("writeup 失败的 Run 只要平台已接受就算已解", async () => {
+    const { store } = await storeFixture()
+    store.createRun({ id: "run-1", challengeId: "web-1", workspace: "w", attempt: 1 })
+    store.recordSolveOutcome({ runId: "run-1", outcome: "accepted" })
+    store.updateRun("run-1", {
+      status: "failed",
+      closeReason: "failed",
+      error: "writeup validation failed",
+      writeupStatus: "failed",
+    })
+
+    expect(store.getRun("run-1")).toMatchObject({
+      status: "failed",
+      solveOutcome: "accepted",
+      writeupStatus: "failed",
+    })
+    expect(store.isSolved("web-1")).toBe(true)
+    expect(store.isSolved("web-2")).toBe(false)
+    store.close()
+  })
+
+  it("进程重启时回收 blocking 与 writing_writeup Run，并保留成功事实", async () => {
+    const { store } = await storeFixture()
+    const runs = [
+      ["run-writeup", "web-1", "writing_writeup"],
+      ["run-blocking", "web-2", "blocking"],
+      ["run-done", "web-3", "failed"],
+    ] as const
+    for (const [id, challengeId, status] of runs) {
+      store.createRun({ id, challengeId, workspace: "w", attempt: 1 })
+      store.updateRun(id, { status })
+    }
+    store.recordSolveOutcome({ runId: "run-writeup", outcome: "accepted" })
+
+    const interrupted = store.markInterruptedRuns()
+
+    expect(interrupted).toHaveLength(2)
+    expect(interrupted.map((run) => run.id)).toEqual(
+      expect.arrayContaining(["run-writeup", "run-blocking"]),
+    )
+    expect(store.getRun("run-writeup")).toMatchObject({
+      status: "interrupted",
+      writeupStatus: "interrupted",
+      solveOutcome: "accepted",
+    })
+    expect(store.getRun("run-blocking")).toMatchObject({
+      status: "interrupted",
+      writeupStatus: "not_requested",
+    })
+    expect(store.getRun("run-done")?.status).toBe("failed")
+    expect(store.isSolved("web-1")).toBe(true)
+    store.close()
+  })
 })

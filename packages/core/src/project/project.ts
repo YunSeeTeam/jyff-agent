@@ -851,7 +851,7 @@ export class Project {
         title: challengeId,
         category: "本地记录",
         score: 0,
-        solved: this.runStore.listRuns({ challengeId }).some((run) => run.status === "solved"),
+        solved: this.runStore.isSolved(challengeId),
       }))
     return [...cached, ...localOnly]
   }
@@ -1045,9 +1045,20 @@ export class Project {
   async markRunWritingWriteup(runId: string): Promise<RunRecord> {
     const run = this.runStore.updateRun(
       runId,
-      { status: "writing_writeup", error: null },
+      { status: "writing_writeup", error: null, writeupStatus: "running" },
       "run_writing_writeup",
     )
+    await this.persistRecord(run, join(this.agentDirectory, "runs", runId))
+    return run
+  }
+  /** Records the writeup result separately from the solve outcome. */
+  async markRunWriteupStatus(
+    runId: string,
+    writeupStatus: "validated" | "failed",
+  ): Promise<RunRecord> {
+    const run = this.runStore.updateRun(runId, { writeupStatus }, "run_writeup_status", {
+      writeupStatus,
+    })
     await this.persistRecord(run, join(this.agentDirectory, "runs", runId))
     return run
   }
@@ -1393,6 +1404,14 @@ export class Project {
           closeOnSubmission: options.writeup !== true,
         },
         onTerminalSubmission: () => subagentManager?.close(),
+        recordSolveOutcome: async (submission, observedAt) => {
+          this.runStore.recordSolveOutcome({
+            runId,
+            outcome: submission.status === "accepted" ? "accepted" : "already_solved",
+            observedAt,
+            message: submission.message,
+          })
+        },
         onBeforeCleanup: async () => {
           webAccessSignal.abort()
           shellpoopSignal.abort()

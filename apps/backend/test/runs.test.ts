@@ -257,6 +257,7 @@ describe("Run 与 SubAgent 会话路由", () => {
       attempt: 1,
       source: "manual",
       status: "running",
+      writeupStatus: "not_requested",
       createdAt: "2026-07-29T12:06:00.000Z",
       updatedAt: "2026-07-29T12:06:00.000Z",
     })

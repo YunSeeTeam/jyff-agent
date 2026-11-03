@@ -240,6 +240,62 @@ describe("Solver tools", () => {
     expect(submission).toMatchObject({ status: "accepted" })
   })
 
+  it("accepted 先持久化成功事实，再通知回收", async () => {
+    const order: string[] = []
+    let recorded: { status: string; observedAt: string } | undefined
+    const submit = tool(
+      "ctf_submit_flag",
+      createSolverTools({
+        capability: capability(),
+        sandbox: new FakeSandbox(),
+        recordTerminalSubmission: async (value, observedAt) => {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          recorded = { status: value.status, observedAt }
+          order.push("recorded")
+        },
+        onTerminalSubmission: () => {
+          order.push("cleanup")
+        },
+      }),
+    )
+
+    const result = await submit.execute("submit", { flag: "FLAG" })
+
+    expect(order).toEqual(["recorded", "cleanup"])
+    expect(recorded?.status).toBe("accepted")
+    expect(Number.isNaN(Date.parse(recorded?.observedAt ?? ""))).toBe(false)
+    expect(result).toMatchObject({ terminate: true, details: { status: "accepted" } })
+  })
+
+  it("平台已接受但本地持久化失败时明确报告且不提示重复提交", async () => {
+    let cleanedUp = false
+    const submit = tool(
+      "ctf_submit_flag",
+      createSolverTools({
+        capability: capability(),
+        sandbox: new FakeSandbox(),
+        recordTerminalSubmission: async () => {
+          throw new Error("database is locked")
+        },
+        onTerminalSubmission: () => {
+          cleanedUp = true
+        },
+      }),
+    )
+
+    const result = await submit.execute("submit", { flag: "FLAG" })
+
+    expect(result).toMatchObject({
+      terminate: true,
+      details: {
+        status: "accepted",
+        persistence: { code: "accepted_persistence_failed", message: "database is locked" },
+      },
+    })
+    expect(JSON.stringify(result.content)).toContain("Do not submit it again")
+    expect(cleanedUp).toBe(true)
+  })
+
   it("Flag 提交以滑动窗口限制为每分钟 5 次", async () => {
     let now = 1_000
     let calls = 0

@@ -1464,6 +1464,7 @@ export class ContestScheduler {
       } else {
         const validation = await validateChallengeWriteup(solver.workspace)
         if (validation.valid) {
+          await this.project.markRunWriteupStatus(solver.runId, "validated")
           await solver.close("submitted")
           return
         }
@@ -1488,6 +1489,8 @@ export class ContestScheduler {
       challengeId: active.challenge.id,
       errors: lastErrors,
     })
+    // Only the writeup failed: the accepted solve outcome recorded at submission stays.
+    await this.project.markRunWriteupStatus(solver.runId, "failed")
     solver.discardTerminalSubmissionForWriteupFailure()
     await solver.close("failed", error)
   }

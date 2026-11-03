@@ -109,6 +109,7 @@ export class FakeDashboardProject implements DashboardProject {
       attempt: 1,
       source: "auto",
       status: "running",
+      writeupStatus: "not_requested",
       createdAt: "2026-07-29T11:55:00.000Z",
       updatedAt: now,
       startedAt: "2026-07-29T11:55:01.000Z",

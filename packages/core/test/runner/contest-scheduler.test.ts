@@ -292,6 +292,54 @@ describe("ContestScheduler", () => {
     }
   })
 
+  // 端到端评测复现：模型在 writeup 阶段只回复文本、不写 writeup.md，三轮校验失败后
+  // Run 记为 failed。平台已接受的事实必须保留，且不得把该题当作未解重新求解。
+  it("accepted 后 writeup 三轮校验失败仍保留成功事实，不会重新求解", async () => {
+    const item = challenge(92)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: `writeup-exhausted-${item.id}` })
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("ctf_submit_flag", { flag: item.flag }, { id: "submit-writeup-exhausted" }),
+        { stopReason: "toolUse" },
+      ),
+      ...Array.from({ length: 3 }, () =>
+        fauxAssistantMessage("The flag was submitted.", { stopReason: "stop" }),
+      ),
+    ])
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 1,
+      writeup: true,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => scheduler.snapshot().active.length === 0)
+
+      const [run] = project.runs({ challengeId: item.id })
+      expect(run).toMatchObject({
+        status: "failed",
+        solveOutcome: "accepted",
+        writeupStatus: "failed",
+      })
+      expect(run?.observedAcceptedAt).toBeDefined()
+      const events = project.runEvents(run?.id ?? "").map((event) => event.type)
+      expect(events.filter((type) => type === "solve_outcome_recorded")).toHaveLength(1)
+      expect(events.filter((type) => type === "writeup_validation_failed")).toHaveLength(3)
+      expect(project.isChallengeSolved(item.id)).toBe(true)
+      await expect(scheduler.dispatch(item.id)).rejects.toMatchObject({ code: "already_solved" })
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
   it("writeup 模型错误后的重试继续 writeup，而不是重新注入解题 continuation", async () => {
     const item = challenge(103)
     const tracker = new SandboxTracker()
@@ -326,6 +374,10 @@ describe("ContestScheduler", () => {
       expect(project.runEvents(failedRun?.id ?? "").map((event) => event.type)).toContain(
         "writeup_failed",
       )
+      // The writeup failed, not the solve: the platform's acceptance is kept.
+      expect(failedRun).toMatchObject({ solveOutcome: "accepted", writeupStatus: "failed" })
+      expect(failedRun?.observedAcceptedAt).toBeDefined()
+      expect(project.isChallengeSolved(item.id)).toBe(true)
 
       await writeFile(
         join(failedRun?.workspace ?? "", "writeup.md"),
@@ -333,7 +385,9 @@ describe("ContestScheduler", () => {
       )
       await scheduler.retryAttempt(failedRun?.id ?? "")
       await waitUntil(
-        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+        () =>
+          project.runs({ challengeId: item.id })[0]?.status === "solved" &&
+          scheduler.snapshot().active.length === 0,
       )
 
       const [run] = project.runs({ challengeId: item.id })
@@ -351,6 +405,11 @@ describe("ContestScheduler", () => {
       )
       expect(session).not.toContain(INCOMPLETE_CONTINUATION_PROMPT)
       expect(run).toEqual(expect.objectContaining({ status: "solved", closeReason: "submitted" }))
+      expect(run).toMatchObject({
+        solveOutcome: "accepted",
+        observedAcceptedAt: failedRun?.observedAcceptedAt,
+        writeupStatus: "validated",
+      })
     } finally {
       await scheduler.shutdown()
       await project.close()

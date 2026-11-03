@@ -18,6 +18,7 @@ describe("AttemptHistory", () => {
             id: "run-1",
             attempt: 1,
             status: "failed",
+            writeupStatus: "not_requested",
             createdAt: "2026-08-10T00:00:00.000Z",
             events: [
               {

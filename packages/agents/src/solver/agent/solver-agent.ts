@@ -38,6 +38,9 @@ export interface CreateCtfSolverAgentOptions {
   onBeforeCleanup?: () => Promise<void> | void
   /** Starts immediately after the first accepted submission, before the writeup turn. */
   onTerminalSubmission?: (submission: FlagSubmission) => Promise<void> | void
+  /** Durably records the platform's terminal answer before the submit tool returns. */
+  recordSolveOutcome?: (submission: FlagSubmission, observedAt: string) => Promise<void>
+
   onClosed?: (details: SolverCloseDetails) => Promise<void> | void
 }
 
@@ -155,6 +158,9 @@ export class CtfSolverAgent extends BaseAgent {
         capability: options.capability,
         sandbox: options.sandbox,
         onTerminalSubmission: (submission) => solver?.markTerminal(submission),
+        ...(options.recordSolveOutcome
+          ? { recordTerminalSubmission: options.recordSolveOutcome }
+          : {}),
       }),
     ]
     const model = options.agent.initialState?.model ?? FALLBACK_MODEL
@@ -197,7 +203,10 @@ export class CtfSolverAgent extends BaseAgent {
     await this.setActiveTools(["read", "write", "edit", "list"])
   }
 
-  /** Writeup 校验失败时关闭不得被 accepted submission 改回 solved。 */
+  /**
+   * Writeup 校验失败时 Run 生命周期按 failed 关闭，不被 accepted submission 改回 solved。
+   * 平台接受事实已由 recordSolveOutcome 在提交时独立持久化，不受此影响。
+   */
   discardTerminalSubmissionForWriteupFailure(): void {
     this.finalSubmission = undefined
   }

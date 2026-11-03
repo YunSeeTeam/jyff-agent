@@ -20,6 +20,11 @@ import type {
 } from "../types.ts"
 
 const ACTIVE = new Set<RunRecord["status"]>(["preparing", "running", "blocking", "writing_writeup"])
+
+/** Solved once the platform accepted, even if the writeup or cleanup failed afterwards. */
+function isSolvedRun(run: RunRecord): boolean {
+  return run.status === "solved" || run.solveOutcome !== undefined
+}
 const FAILED = new Set<DashboardChallengeStatus>([
   "failed",
   "timed_out",
@@ -54,7 +59,7 @@ export async function buildDashboardSnapshot(
     title: challengeId,
     category: "本地记录",
     score: 0,
-    solved: runs.some((run) => run.challengeId === challengeId && run.status === "solved"),
+    solved: runs.some((run) => run.challengeId === challengeId && isSolvedRun(run)),
   }))
   const overview = settledValue(reads[0]) ??
     cached.overview ?? {
@@ -88,9 +93,13 @@ export async function buildDashboardSnapshot(
     const active = [...challengeRuns].reverse().find((run) => ACTIVE.has(run.status))
     const solvedRun = [...challengeRuns]
       .reverse()
-      .find((run) => run.status === "solved" && run.finishedAt)
+      .find((run) => isSolvedRun(run) && (run.observedAcceptedAt ?? run.finishedAt))
+    // Acceptance ends the solve; writeup time afterwards is not solving time.
     const solveDurationMs = solvedRun
-      ? durationBetween(solvedRun.startedAt ?? solvedRun.createdAt, solvedRun.finishedAt)
+      ? durationBetween(
+          solvedRun.startedAt ?? solvedRun.createdAt,
+          solvedRun.observedAcceptedAt ?? solvedRun.finishedAt,
+        )
       : null
     const idle = idleByChallenge.get(challenge.id)
     const queued = queuedByChallenge.get(challenge.id)
@@ -408,7 +417,7 @@ function challengeStatus(
   if (active) return active.status
   if (queued) return "queued"
   if (idle) return "idle"
-  if (platformSolved || runs.some((run) => run.status === "solved")) return "solved"
+  if (platformSolved || runs.some(isSolvedRun)) return "solved"
   return runs.at(-1)?.status ?? "pending"
 }
 
