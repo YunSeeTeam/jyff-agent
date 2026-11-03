@@ -1,0 +1,14 @@
+{
+  "name": "@ctf-agent/evaluator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main.ts"
+  },
+  "devDependencies": {
+    "@ctf-agent/core": "workspace:*",
+    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-ai": "0.82.1"
+  }
+}

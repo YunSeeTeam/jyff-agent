@@ -15,6 +15,7 @@ export default defineConfig({
       // symlinks under node_modules and executes dependency tests repeatedly.
       "../../packages/*/test/**/*.test.ts",
       "../../apps/backend/test/**/*.test.ts",
+      "../../apps/evaluator/test/**/*.test.ts",
       "test/**/*.test.ts",
     ],
     testTimeout: 20_000,
