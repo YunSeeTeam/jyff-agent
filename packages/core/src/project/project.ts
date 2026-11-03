@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import {
   type AgentSkill,
+  type BaseAgentEvent,
   CtfSolverAgent,
   CtfTldrAgent,
   type DiscoveredSubagentRoles,
@@ -45,7 +46,6 @@ import {
 } from "@ctf-agent/shellpoop"
 import { createWebAccessTools, type WebAccessConfig } from "@ctf-agent/web-access"
 import type {
-  AgentHarnessEvent,
   AgentMessage,
   AgentOptions,
   AgentTool,
@@ -1624,7 +1624,7 @@ export class Project {
   private recordAuxiliaryTokenUsage(
     runId: string,
     actor: "solver" | "subagent",
-    event: AgentHarnessEvent,
+    event: BaseAgentEvent,
     model: { provider: string; id: string },
   ): void {
     if (!this.tokenUsageEnabled()) return
@@ -1694,7 +1694,7 @@ export class Project {
   private publishAgentEvent(
     runId: string,
     subagentId: string | undefined,
-    event: AgentHarnessEvent,
+    event: BaseAgentEvent,
   ): void {
     const key = `${runId}\u0000${subagentId ?? "solver"}`
     const messageId = (): string => {
@@ -1953,7 +1953,7 @@ function injectBlackboard(runStore: RunStore, challengeId: string): string {
 }
 
 /** Pi 将压缩/分支摘要的供应商用量放在 session 事件中，不会产生 assistant message。 */
-function auxiliaryTokenUsage(event: AgentHarnessEvent) {
+function auxiliaryTokenUsage(event: BaseAgentEvent) {
   if (event.type === "session_compact" && !event.fromHook && event.compactionEntry.usage) {
     return {
       source: "compaction",
@@ -1972,7 +1972,7 @@ function auxiliaryTokenUsage(event: AgentHarnessEvent) {
 }
 
 function progressEvents(
-  event: AgentHarnessEvent,
+  event: BaseAgentEvent,
   telemetry: Required<ProjectTelemetryOptions>,
   calls: Map<string, { toolName: string; args: unknown }>,
 ): Array<{ type: string; data?: unknown }> {

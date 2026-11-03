@@ -1,10 +1,10 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { type AgentMessage, JsonlSessionStorage, Session } from "@earendil-works/pi-agent-core"
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node"
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai"
+import type { AgentMessage } from "@earendil-works/pi-agent-core"
+import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai"
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux"
+import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent"
 
 const roots: string[] = []
 
@@ -51,22 +51,25 @@ export function assistant(
   }
 }
 
-export function user(text: string): AgentMessage {
+export function user(text: string): UserMessage & AgentMessage {
   return { role: "user", content: text, timestamp: Date.now() }
 }
 
 /** Write a real Pi JSONL session at path. */
 export async function writeSession(
   path: string,
-  build: (session: Session) => Promise<void>,
+  build: (session: SessionManager) => Promise<void> | void,
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
-  const env = new NodeExecutionEnv({ cwd: dirname(path) })
-  const storage = await JsonlSessionStorage.create(env, path, {
+  const header = {
+    type: "session",
+    version: CURRENT_SESSION_VERSION,
+    id: "fixture",
+    timestamp: new Date().toISOString(),
     cwd: dirname(path),
-    sessionId: "fixture",
-  })
-  await build(new Session(storage))
+  }
+  await writeFile(path, `${JSON.stringify(header)}\n`)
+  await build(SessionManager.open(path))
 }
 
 /** Minimal configured data root whose root Project is projectId. */

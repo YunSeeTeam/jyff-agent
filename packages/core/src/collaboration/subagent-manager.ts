@@ -3,6 +3,7 @@ import { join } from "node:path"
 import {
   type AgentSkill,
   availableSubagentRoles,
+  type BaseAgentEvent,
   type ChallengeCapability,
   type ChallengeInfo,
   type CtfSolverAgent,
@@ -13,12 +14,7 @@ import {
 } from "@ctf-agent/agents"
 import { subagentCompletionNotificationPrompt } from "@ctf-agent/prompts"
 import { DockerExecutionEnv } from "@ctf-agent/sandbox"
-import type {
-  AgentHarnessEvent,
-  AgentOptions,
-  AgentTool,
-  AgentToolResult,
-} from "@earendil-works/pi-agent-core"
+import type { AgentOptions, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 import { extractAssistantText } from "../agent/thinking.ts"
 
@@ -86,7 +82,7 @@ export interface SubagentManagerOptions {
   /** 将 Pi 的细粒度运行事件转发给控制面，不参与 Agent 生命周期结算。 */
   onAgentEvent?: (
     record: SubagentRecord,
-    event: AgentHarnessEvent,
+    event: BaseAgentEvent,
     model: { provider: string; id: string } | undefined,
   ) => void
 }
@@ -533,7 +529,7 @@ export class CtfSubagentManager {
     })
   }
 
-  private captureProgress(managed: ManagedSubagent, event: AgentHarnessEvent): void {
+  private captureProgress(managed: ManagedSubagent, event: BaseAgentEvent): void {
     let changed = false
     if (event.type === "turn_end") {
       managed.record.turns++

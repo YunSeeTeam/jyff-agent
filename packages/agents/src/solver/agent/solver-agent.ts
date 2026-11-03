@@ -2,7 +2,7 @@ import { join } from "node:path"
 import type { ChallengeCapability, ChallengeInfo, FlagSubmission } from "@ctf-agent/platform"
 import { CTF_COMPACTION_PROMPT, SOLVER_SYSTEM_PROMPT } from "@ctf-agent/prompts"
 import type { Sandbox } from "@ctf-agent/sandbox"
-import type { AgentMessage, AgentOptions, Skill } from "@earendil-works/pi-agent-core"
+import type { AgentMessage, AgentOptions } from "@earendil-works/pi-agent-core"
 import type { Model } from "@earendil-works/pi-ai"
 import {
   type AgentSkill,
@@ -72,15 +72,6 @@ const FALLBACK_MODEL: Model<"openai-completions"> = {
   maxTokens: 4_096,
 }
 
-function piSkills(skills: readonly AgentSkill[]): Skill[] {
-  return skills.map((skill) => ({
-    name: skill.name,
-    description: skill.description,
-    content: skill.content,
-    filePath: skill.sandboxPath ?? skill.filePath,
-  }))
-}
-
 function unsupportedAgentOptions(options: AgentOptions): string[] {
   return [
     "convertToLlm",
@@ -147,9 +138,7 @@ export class CtfSolverAgent extends BaseAgent {
   static async create(options: CreateCtfSolverAgentOptions): Promise<CtfSolverAgent> {
     const unsupported = unsupportedAgentOptions(options.agent)
     if (unsupported.length > 0) {
-      throw new Error(
-        `AgentHarness migration does not support legacy hooks: ${unsupported.join(", ")}`,
-      )
+      throw new Error(`BaseAgent does not support legacy Agent hooks: ${unsupported.join(", ")}`)
     }
     let solver: CtfSolverAgent | undefined
     const tools = [
@@ -177,10 +166,10 @@ export class CtfSolverAgent extends BaseAgent {
       },
       models: modelsFromAgentOptions(options.agent, model),
       model,
-      systemPrompt: options.agent.initialState?.systemPrompt ?? SOLVER_SYSTEM_PROMPT,
+      systemPrompt: options.agent.initialState?.systemPrompt || SOLVER_SYSTEM_PROMPT,
       thinkingLevel: options.agent.initialState?.thinkingLevel ?? DEFAULT_SOLVER_THINKING_LEVEL,
       tools,
-      skills: piSkills(options.features?.skills ?? []),
+      skills: options.features?.skills ?? [],
       initialMessages: options.agent.initialState?.messages,
       compaction: options.features?.compaction !== false,
     })

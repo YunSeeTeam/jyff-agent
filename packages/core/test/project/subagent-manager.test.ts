@@ -2,13 +2,14 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  type BaseAgentEvent,
   type ChallengeInfo,
   type CtfSolverAgent,
   discoverSubagentRoles,
   type Sandbox,
 } from "@ctf-agent/agents"
 import type { CommandResult, SandboxExecOptions } from "@ctf-agent/sandbox"
-import type { AgentHarnessEvent, AgentOptions } from "@earendil-works/pi-agent-core"
+import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import {
   createFauxCore,
   fauxAssistantMessage,
@@ -523,12 +524,12 @@ function fakeParent(): {
 } {
   const steered: string[] = []
   const followedUp: string[] = []
-  const listeners = new Set<(event: AgentHarnessEvent) => void>()
+  const listeners = new Set<(event: BaseAgentEvent) => void>()
   let queued = false
   const parent = {
     isClosed: false,
     hasQueuedSteerMessages: () => queued,
-    subscribe(listener: (event: AgentHarnessEvent) => void) {
+    subscribe(listener: (event: BaseAgentEvent) => void) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
@@ -551,7 +552,7 @@ function fakeParent(): {
       for (const listener of listeners) {
         listener({
           type: "queue_update",
-          steer: [{ role: "user", content: "notice", timestamp: Date.now() }],
+          steer: ["notice"],
           followUp: [],
           nextTurn: [],
         })

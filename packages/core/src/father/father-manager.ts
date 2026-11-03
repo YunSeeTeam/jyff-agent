@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto"
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { type AgentSkill, CtfFatherAgent, materializeSkills } from "@ctf-agent/agents"
+import {
+  type AgentSkill,
+  type BaseAgentEvent,
+  CtfFatherAgent,
+  materializeSkills,
+} from "@ctf-agent/agents"
 import {
   DockerSandbox,
   type DockerWorkspaceMount,
   removeManagedContainers,
 } from "@ctf-agent/sandbox"
-import type { AgentHarnessEvent, AgentOptions } from "@earendil-works/pi-agent-core"
+import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import type {
   AgentStreamEvent,
   AgentStreamListener,
@@ -382,7 +387,7 @@ export class FatherSessionManager {
     )
   }
 
-  private publish(sessionId: string, event: AgentHarnessEvent): void {
+  private publish(sessionId: string, event: BaseAgentEvent): void {
     const messageId = (): string => {
       const current = this.activeMessageIds.get(sessionId)
       if (current) return current

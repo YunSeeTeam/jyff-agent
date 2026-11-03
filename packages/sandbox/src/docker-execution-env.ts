@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { randomUUID } from "node:crypto"
 import { posix } from "node:path"
+import { type CommandResult, type Sandbox, SandboxCommandError } from "./docker-sandbox.ts"
 import {
   type ExecutionEnv,
   ExecutionError,
@@ -11,8 +12,8 @@ import {
   ok,
   type Result,
   type ShellExecOptions,
-} from "@earendil-works/pi-agent-core"
-import { type CommandResult, type Sandbox, SandboxCommandError } from "./docker-sandbox.ts"
+  type ShellResult,
+} from "./execution-env.ts"
 
 const WORKSPACE = "/workspace"
 const MAX_TIMER_MS = 2_147_483_647
@@ -147,7 +148,7 @@ interface FileResponse<T> {
   path?: string
 }
 
-/** Pi ExecutionEnv whose filesystem and shell namespace are the run container. */
+/** ExecutionEnv whose filesystem and shell namespace are the run container. */
 export class DockerExecutionEnv implements ExecutionEnv {
   readonly cwd: string
 
@@ -172,16 +173,7 @@ export class DockerExecutionEnv implements ExecutionEnv {
   async exec(
     command: string,
     options: ShellExecOptions = {},
-  ): Promise<
-    Result<
-      {
-        stdout: string
-        stderr: string
-        exitCode: number
-      },
-      ExecutionError
-    >
-  > {
+  ): Promise<Result<ShellResult, ExecutionError>> {
     const cwd = this.address(options.cwd ?? this.cwd)
     if (!cwd.ok) {
       return err(new ExecutionError("unknown", cwd.error.message, cwd.error))
@@ -526,7 +518,7 @@ interface BufferedCapture {
 }
 
 /**
- * Pi 会把被截断的 bash 完整输出逐 chunk 追加到临时文件。该专用环境按 512 KiB
+ * bash 工具会把被截断的完整输出逐 chunk 追加到临时文件。该专用环境按 512 KiB
  * 合并写入，避免长任务为每个输出 chunk 启动一个 docker CLI 进程。
  * 每次 bash 工具调用必须创建独立实例，避免并行工具之间共享缓冲区。
  */
@@ -565,7 +557,7 @@ export class DockerBashExecutionEnv extends DockerExecutionEnv {
   override async exec(
     command: string,
     options: ShellExecOptions = {},
-  ): Promise<Result<{ stdout: string; stderr: string; exitCode: number }, ExecutionError>> {
+  ): Promise<Result<ShellResult, ExecutionError>> {
     const result = await super.exec(command, options)
     await this.drainPendingOperations()
     for (const path of this.captures.keys()) {

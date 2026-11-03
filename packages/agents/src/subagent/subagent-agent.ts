@@ -2,7 +2,7 @@ import { join } from "node:path"
 import type { ChallengeCapability, ChallengeInfo } from "@ctf-agent/platform"
 import { SUBAGENT_COMPACTION_PROMPT, subagentTaskContextPrompt } from "@ctf-agent/prompts"
 import type { Sandbox } from "@ctf-agent/sandbox"
-import type { AgentMessage, AgentOptions, AgentTool, Skill } from "@earendil-works/pi-agent-core"
+import type { AgentMessage, AgentOptions, AgentTool } from "@earendil-works/pi-agent-core"
 import type { Api, Model } from "@earendil-works/pi-ai"
 import {
   type AgentSkill,
@@ -31,15 +31,6 @@ export interface CreateCtfSubagentOptions {
   /** 可选注入 ShellPoop 反弹 shell 工具；role.tools 白名单未包含时不会启用。 */
   shellpoopTools?: readonly AgentTool[]
   compaction?: boolean
-}
-
-function piSkills(skills: readonly AgentSkill[]): Skill[] {
-  return skills.map((skill) => ({
-    name: skill.name,
-    description: skill.description,
-    content: skill.content,
-    filePath: skill.sandboxPath ?? skill.filePath,
-  }))
 }
 
 /** A non-owning worker: its manager owns lifecycle; the main Solver owns Docker. */
@@ -113,7 +104,8 @@ export class CtfSubagent extends BaseAgent {
       ].join("\n\n"),
       thinkingLevel: options.role.thinkingLevel,
       tools,
-      skills: piSkills(options.skills ?? []),
+      skills: options.skills ?? [],
+      workingDirectory: options.containerCwd,
       compaction: options.compaction !== false,
     })
     return new CtfSubagent(options, prepared)

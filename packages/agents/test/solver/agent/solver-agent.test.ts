@@ -4,8 +4,9 @@ import { join } from "node:path"
 import type { ChallengeCapability } from "@ctf-agent/platform"
 import { BLOCKED_FINALIZATION_PROMPT, CTF_COMPACTION_PROMPT } from "@ctf-agent/prompts"
 import type { CommandResult, Sandbox } from "@ctf-agent/sandbox"
-import { AgentHarness, type AgentOptions } from "@earendil-works/pi-agent-core"
+import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import type { Model } from "@earendil-works/pi-ai"
+import { AgentSession } from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { CtfSolverAgent, type SolverCloseDetails } from "../../../src/solver/agent/solver-agent.js"
 
@@ -87,8 +88,9 @@ class OrderedSandbox implements Sandbox {
 
 describe("CtfSolverAgent 强制清理", () => {
   it("将 CTF_COMPACTION_PROMPT 原样传给 Pi compact", async () => {
-    const compact = vi.spyOn(AgentHarness.prototype, "compact").mockResolvedValue({
+    const compact = vi.spyOn(AgentSession.prototype, "compact").mockResolvedValue({
       summary: "compacted investigation",
+      firstKeptEntryId: "entry",
       tokensBefore: 1_024,
     })
     const log: string[] = []

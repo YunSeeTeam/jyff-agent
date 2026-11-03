@@ -55,11 +55,16 @@ export async function piSessionHasConversation(sessionPath: string): Promise<boo
     .some((entry) => entry.type === "message" && entry.message.role === "assistant")
 }
 
-/** 读取当前 Pi 分支上的原生消息，供 WebUI 的 Solver/SubAgent 对话视图复用。 */
+/**
+ * 读取当前 Pi 分支上的原生消息，供 WebUI 的 Solver/SubAgent 对话视图复用。
+ * Pi 1.x 把系统提示词和工具声明记作 system 消息，它们不属于对话内容。
+ */
 export function readPiSessionConversation(sessionPath: string): DashboardConversation {
   const messages = SessionManager.open(sessionPath)
     .getBranch()
-    .filter((entry) => entry.type === "message")
+    .flatMap((entry) =>
+      entry.type === "message" && entry.message.role !== "system" ? [entry] : [],
+    )
     .map((entry) => ({
       entryId: entry.id,
       timestamp: entry.timestamp,

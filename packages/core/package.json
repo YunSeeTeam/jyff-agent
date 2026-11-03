@@ -14,10 +14,10 @@
     "@ctf-agent/sandbox": "workspace:*",
     "@ctf-agent/shellpoop": "workspace:*",
     "@ctf-agent/web-access": "workspace:*",
-    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-agent-core": "1.5.0",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.82.1"
+    "@earendil-works/pi-ai": "1.5.0"
   }
 }

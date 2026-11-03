@@ -929,7 +929,11 @@ describe("ContestScheduler", () => {
         initialState: {
           model: faux.getModel(),
           thinkingLevel: "off",
-          messages: [{ role: "user", content: "x".repeat(20_000), timestamp: 1 }],
+          // Two older turns: Pi keeps the newest one and summarizes the rest.
+          messages: [
+            { role: "user", content: "x".repeat(10_000), timestamp: 1 },
+            { role: "user", content: "y".repeat(10_000), timestamp: 2 },
+          ],
         },
       }),
     })

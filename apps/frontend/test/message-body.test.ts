@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
+import type { JsonObject } from "@earendil-works/pi-ai"
 import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { createElement } from "react"
 import { describe, expect, it, vi } from "vite-plus/test"
@@ -175,7 +176,7 @@ function thinkingMessage(): AgentMessage {
   }
 }
 
-function assistantToolCall(name: string, args: Record<string, unknown>): AgentMessage {
+function assistantToolCall(name: string, args: JsonObject): AgentMessage {
   return {
     role: "assistant",
     content: [{ type: "toolCall", id: "tool-subagent", name, arguments: args }],

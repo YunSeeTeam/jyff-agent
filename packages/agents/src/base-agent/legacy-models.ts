@@ -2,7 +2,6 @@ import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import {
   type Api,
   type AssistantMessage,
-  type Context,
   createAssistantMessageEventStream,
   createModels,
   createProvider,
@@ -10,6 +9,7 @@ import {
   type Models,
   type AssistantMessageEventStream as PiAssistantMessageEventStream,
   type SimpleStreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai"
 
 const AGENT_MODELS = Symbol.for("@ctf-agent/agent-options-models")
@@ -58,7 +58,7 @@ function failureMessage(model: Model<Api>, error: unknown, aborted: boolean): As
 function adaptStream(
   streamFn: AgentOptions["streamFn"],
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): PiAssistantMessageEventStream {
   const output = createAssistantMessageEventStream()
@@ -88,8 +88,11 @@ export function modelsFromAgentOptions(options: AgentOptions, model: Model<Api>)
   const attached = (options as AgentOptionsWithModels)[AGENT_MODELS]
   if (attached) return attached
   const models = createModels()
-  const stream = (candidate: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions) =>
-    adaptStream(options.streamFn, candidate, context, streamOptions)
+  const stream = (
+    candidate: Model<Api>,
+    context: TranscriptContext,
+    streamOptions?: SimpleStreamOptions,
+  ) => adaptStream(options.streamFn, candidate, context, streamOptions)
   models.setProvider(
     createProvider({
       id: model.provider,

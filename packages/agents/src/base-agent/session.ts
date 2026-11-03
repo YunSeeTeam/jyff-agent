@@ -1,18 +1,26 @@
+import { existsSync } from "node:fs"
+import { mkdir, writeFile } from "node:fs/promises"
+import { dirname } from "node:path"
+import type { AgentMessage, AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import {
-  type AgentMessage,
-  type AgentTool,
-  JsonlSessionStorage,
-  Session,
-  SessionError,
-  type ThinkingLevel,
-} from "@earendil-works/pi-agent-core"
-import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node"
-import type { Api, Model, Models } from "@earendil-works/pi-ai"
+  type Api,
+  getCurrentTools,
+  type Model,
+  type Models,
+  type SystemMessage,
+} from "@earendil-works/pi-ai"
+import {
+  CURRENT_SESSION_VERSION,
+  type SessionEntry,
+  type SessionHeader,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent"
 import { DEFAULT_SOLVER_THINKING_LEVEL, isThinkingLevel, resolveThinkingLevel } from "./thinking.ts"
 
 export interface NativeSessionOptions {
   path: string
   id: string
+  /** Host directory recorded in the session header. */
   cwd: string
   metadata?: Record<string, unknown>
 }
@@ -28,92 +36,178 @@ export interface OpenAgentSessionOptions {
 }
 
 export interface OpenedAgentSession {
-  session: Session
+  sessionManager: SessionManager
   model: Model<Api>
   thinkingLevel: ThinkingLevel
   activeToolNames: string[]
+  /** Model-visible transcript, including the prompt and tool system messages. */
+  messages: AgentMessage[]
   restored: boolean
 }
 
+/** Raised when a persisted session cannot be resumed with the current configuration. */
+export class SessionRestoreError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "SessionRestoreError"
+  }
+}
+
+/** The header carries jyff metadata so a session file identifies its owner without RunStore. */
+type JyffSessionHeader = SessionHeader & { metadata?: Record<string, unknown> }
+
+/** Pi 0.82 recorded tool loadouts as their own entry type; keep reading them for old runs. */
+interface LegacyActiveToolsEntry {
+  type: "active_tools_change"
+  activeToolNames: string[]
+}
+
+function isLegacyActiveToolsEntry(entry: unknown): entry is LegacyActiveToolsEntry {
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    (entry as { type?: unknown }).type === "active_tools_change" &&
+    Array.isArray((entry as { activeToolNames?: unknown }).activeToolNames)
+  )
+}
+
 function restoredThinkingLevel(
-  value: string,
+  branch: readonly SessionEntry[],
   fallback: ThinkingLevel,
   model: Model<Api>,
 ): ThinkingLevel {
-  if (!isThinkingLevel(value)) {
-    throw new SessionError(
-      "invalid_session",
-      `Session contains unsupported thinking level: ${value}`,
-    )
+  let value: string | undefined
+  for (const entry of branch) {
+    if (entry.type === "thinking_level_change") value = entry.thinkingLevel
   }
-  return resolveThinkingLevel(model, value || fallback)
+  if (value === undefined) return resolveThinkingLevel(model, fallback)
+  if (!isThinkingLevel(value)) {
+    throw new SessionRestoreError(`Session contains unsupported thinking level: ${value}`)
+  }
+  return resolveThinkingLevel(model, value)
 }
 
-/** Create a Pi JSONL session, or reopen and restore its persisted runtime settings. */
+/**
+ * Custom entry recording the active tool loadout jyff selected. Pi's system
+ * messages only show what was declared to the model by the last request, so a
+ * loadout changed or narrowed between requests needs its own record.
+ */
+export const ACTIVE_TOOLS_ENTRY_TYPE = "jyff.active_tools"
+
+interface ActiveToolsData {
+  activeToolNames: string[]
+}
+
+function isActiveToolsData(data: unknown): data is ActiveToolsData {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    Array.isArray((data as { activeToolNames?: unknown }).activeToolNames)
+  )
+}
+
+export function recordActiveTools(sessionManager: SessionManager, names: readonly string[]): void {
+  sessionManager.appendCustomEntry(ACTIVE_TOOLS_ENTRY_TYPE, {
+    activeToolNames: [...names],
+  } satisfies ActiveToolsData)
+}
+
+/** The latest recorded loadout, falling back to the tools last declared to the model. */
+function restoredToolNames(branch: readonly SessionEntry[]): string[] | undefined {
+  const systemMessages: SystemMessage[] = []
+  let recorded: string[] | undefined
+  for (const entry of branch) {
+    if (entry.type === "message" && entry.message.role === "system") {
+      systemMessages.push(entry.message)
+    } else if (entry.type === "custom" && entry.customType === ACTIVE_TOOLS_ENTRY_TYPE) {
+      if (isActiveToolsData(entry.data)) recorded = [...entry.data.activeToolNames]
+    } else {
+      const raw: unknown = entry
+      if (isLegacyActiveToolsEntry(raw)) recorded = [...raw.activeToolNames]
+    }
+  }
+  if (recorded) return recorded
+  const declares = systemMessages.some(
+    (message) => (message.toolsAdded?.length ?? 0) + (message.toolsRemoved?.length ?? 0) > 0,
+  )
+  return declares ? getCurrentTools(systemMessages).map((tool) => tool.name) : undefined
+}
+
+async function createSessionFile(options: OpenAgentSessionOptions): Promise<SessionManager> {
+  await mkdir(dirname(options.session.path), { recursive: true })
+  const header: JyffSessionHeader = {
+    type: "session",
+    version: CURRENT_SESSION_VERSION,
+    id: options.session.id,
+    timestamp: new Date().toISOString(),
+    cwd: options.session.cwd,
+    ...(options.session.metadata ? { metadata: options.session.metadata } : {}),
+  }
+  // Writing the header eagerly fixes the session id and path; Pi otherwise picks
+  // a random id and defers the file until the first conversation message.
+  await writeFile(options.session.path, `${JSON.stringify(header)}\n`, { flag: "wx" })
+  return SessionManager.open(options.session.path)
+}
+
+/** Create a Pi JSONL session, or reopen one and restore its persisted runtime settings. */
 export async function openAgentSession(
   options: OpenAgentSessionOptions,
 ): Promise<OpenedAgentSession> {
-  const env = new NodeExecutionEnv({ cwd: options.session.cwd })
-  const exists = await env.exists(options.session.path)
-  if (!exists.ok) throw new SessionError("storage", exists.error.message, exists.error)
+  const legalToolNames = options.tools.map((tool) => tool.name)
+  const defaultToolNames = [...(options.activeToolNames ?? legalToolNames)]
 
-  if (!exists.value) {
+  if (!existsSync(options.session.path)) {
     const thinkingLevel = resolveThinkingLevel(
       options.model,
       options.thinkingLevel ?? DEFAULT_SOLVER_THINKING_LEVEL,
     )
-    const storage = await JsonlSessionStorage.create(env, options.session.path, {
-      cwd: options.session.cwd,
-      sessionId: options.session.id,
-      metadata: options.session.metadata,
-    })
-    const session = new Session(storage)
-    for (const message of options.initialMessages ?? []) await session.appendMessage(message)
-    await session.appendModelChange(options.model.provider, options.model.id)
-    await session.appendThinkingLevelChange(thinkingLevel)
-    await session.appendActiveToolsChange([
-      ...(options.activeToolNames ?? options.tools.map((tool) => tool.name)),
-    ])
+    const sessionManager = await createSessionFile(options)
+    for (const message of options.initialMessages ?? []) {
+      sessionManager.appendMessage(message as Parameters<SessionManager["appendMessage"]>[0])
+    }
+    sessionManager.appendModelChange(options.model.provider, options.model.id)
+    sessionManager.appendThinkingLevelChange(thinkingLevel)
+    recordActiveTools(sessionManager, defaultToolNames)
     return {
-      session,
+      sessionManager,
       model: options.model,
       thinkingLevel,
-      activeToolNames: [...(options.activeToolNames ?? options.tools.map((tool) => tool.name))],
+      activeToolNames: defaultToolNames,
+      messages: sessionManager.buildSessionContext().messages,
       restored: false,
     }
   }
 
-  const session = new Session(await JsonlSessionStorage.open(env, options.session.path))
-  const context = await session.buildContext()
+  const sessionManager = SessionManager.open(options.session.path)
+  const context = sessionManager.buildSessionContext()
   const model = context.model
     ? options.models.getModel(context.model.provider, context.model.modelId)
     : options.model
   if (!model) {
-    throw new SessionError(
-      "invalid_session",
+    throw new SessionRestoreError(
       `Session model is unavailable: ${context.model?.provider}/${context.model?.modelId}`,
     )
   }
+  const branch = sessionManager.getBranch()
   // A session may outlive the tools it was created with (role whitelist narrowed,
-  // tool removed). Restore only names the current tool set still allows, and persist
+  // tool removed). Restore only names the current tool set still allows, and record
   // the narrowed set so a later reopen cannot silently re-expand it.
-  const legalToolNames = new Set(options.tools.map((tool) => tool.name))
-  const persistedToolNames = context.activeToolNames ?? [
-    ...(options.activeToolNames ?? options.tools.map((tool) => tool.name)),
-  ]
-  const activeToolNames = persistedToolNames.filter((name) => legalToolNames.has(name))
-  if (context.activeToolNames && activeToolNames.length !== context.activeToolNames.length) {
-    await session.appendActiveToolsChange(activeToolNames)
+  const legal = new Set(legalToolNames)
+  const persisted = restoredToolNames(branch)
+  const activeToolNames = (persisted ?? defaultToolNames).filter((name) => legal.has(name))
+  if (persisted && activeToolNames.length !== persisted.length) {
+    recordActiveTools(sessionManager, activeToolNames)
   }
   return {
-    session,
+    sessionManager,
     model,
     thinkingLevel: restoredThinkingLevel(
-      context.thinkingLevel,
+      branch,
       options.thinkingLevel ?? DEFAULT_SOLVER_THINKING_LEVEL,
       model,
     ),
     activeToolNames,
+    messages: sessionManager.buildSessionContext().messages,
     restored: true,
   }
 }

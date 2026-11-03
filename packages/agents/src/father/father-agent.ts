@@ -1,9 +1,10 @@
 import { join } from "node:path"
 import { FATHER_SYSTEM_PROMPT } from "@ctf-agent/prompts"
 import type { Sandbox } from "@ctf-agent/sandbox"
-import type { AgentMessage, AgentOptions, AgentTool, Skill } from "@earendil-works/pi-agent-core"
+import type { AgentMessage, AgentOptions, AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 import {
+  type AgentSkill,
   BaseAgent,
   modelsFromAgentOptions,
   type PreparedBaseAgent,
@@ -16,7 +17,7 @@ export interface CreateCtfFatherAgentOptions {
   sessionDirectory: string
   sandbox: Sandbox
   agent: AgentOptions
-  skills?: readonly Skill[]
+  skills?: readonly AgentSkill[]
   onIdentifyPlugin?(input: {
     pluginId: string
     displayName: string

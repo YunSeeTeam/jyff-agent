@@ -6,17 +6,14 @@ import {
   RtkRewriter,
   type Sandbox,
 } from "@ctf-agent/sandbox"
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core"
+import { Type } from "typebox"
 import {
-  type AgentHarnessTool,
-  type AgentTool,
-  type AgentToolResult,
   createBashTool,
   createEditTool,
   createReadTool,
   createWriteTool,
-  type ExecutionToolContext,
-} from "@earendil-works/pi-agent-core"
-import { type TSchema, Type } from "typebox"
+} from "../../tools/index.ts"
 
 function result(details: object): AgentToolResult<Record<string, unknown>> {
   const value = details as Record<string, unknown>
@@ -91,24 +88,22 @@ export class FlagSubmissionRateLimiter {
 /** Container-native tools reusable by the main Solver and isolated worker sessions. */
 export function createSandboxTools(options: SandboxToolOptions): AgentTool[] {
   const env = new DockerExecutionEnv(options.sandbox, { cwd: options.cwd })
-  const context: ExecutionToolContext = { env }
   const rtk = new RtkRewriter(env)
   return [
-    bindDynamicExecutionTool(createBashTool({ prepare: rtk.prepare() }), () => ({
-      env: new DockerBashExecutionEnv(options.sandbox, { cwd: options.cwd }),
-    })),
-    bindExecutionTool(createReadTool(), context),
-    bindExecutionTool(createWriteTool(), context),
-    bindExecutionTool(createEditTool(), context),
+    createBashTool(() => new DockerBashExecutionEnv(options.sandbox, { cwd: options.cwd }), {
+      prepare: rtk.prepare(),
+    }),
+    createReadTool(env),
+    createWriteTool(env),
+    createEditTool(env),
     createListTool(env),
-  ]
+  ] as AgentTool[]
 }
 
 /** Workers share the prepared workspace, but cannot submit or own remote-instance lifecycle. */
 export function createReadonlySandboxTools(options: SandboxToolOptions): AgentTool[] {
   const env = new DockerExecutionEnv(options.sandbox, { cwd: options.cwd })
-  const context: ExecutionToolContext = { env }
-  return [bindExecutionTool(createReadTool(), context), createListTool(env)]
+  return [createReadTool(env), createListTool(env)] as AgentTool[]
 }
 
 export function createSubagentTools(options: SubagentToolOptions): AgentTool[] {
@@ -273,30 +268,6 @@ function createListTool(env: DockerExecutionEnv): AgentTool {
           size,
         })),
       })
-    },
-  }
-}
-
-function bindExecutionTool<TParameters extends TSchema, TDetails>(
-  tool: AgentHarnessTool<ExecutionToolContext, TParameters, TDetails>,
-  context: ExecutionToolContext,
-): AgentTool<TParameters, TDetails> {
-  return {
-    ...tool,
-    execute(toolCallId, params, signal, onUpdate) {
-      return tool.execute(toolCallId, params, signal, onUpdate, context)
-    },
-  }
-}
-
-function bindDynamicExecutionTool<TParameters extends TSchema, TDetails>(
-  tool: AgentHarnessTool<ExecutionToolContext, TParameters, TDetails>,
-  context: () => ExecutionToolContext,
-): AgentTool<TParameters, TDetails> {
-  return {
-    ...tool,
-    execute(toolCallId, params, signal, onUpdate) {
-      return tool.execute(toolCallId, params, signal, onUpdate, context())
     },
   }
 }

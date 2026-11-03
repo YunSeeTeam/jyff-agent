@@ -1,14 +1,14 @@
 import {
   type Api,
   type AssistantMessage,
-  type Context,
   createAssistantMessageEventStream,
   type Model,
+  normalizeContext,
 } from "@earendil-works/pi-ai"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { gateProviderStream, ProviderRequestGate } from "../src/domain/provider-request-gate.ts"
 
-const context = { systemPrompt: "test", messages: [], tools: [] } satisfies Context
+const context = normalizeContext({ systemPrompt: "test", messages: [], tools: [] })
 
 afterEach(() => {
   vi.useRealTimers()

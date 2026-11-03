@@ -15,12 +15,12 @@ import { streamSimple as streamOpenAiCompletions } from "@earendil-works/pi-ai/a
 import { streamSimple as streamOpenAiResponses } from "@earendil-works/pi-ai/api/openai-responses"
 import {
   type Api,
-  type Context,
   clampThinkingLevel,
   getModel,
   getSupportedThinkingLevels,
   type Model,
   type SimpleStreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai/compat"
 import type {
   AgentModelBindings,
@@ -418,7 +418,7 @@ class PersistentModelConfiguration implements AgentModelConfiguration {
       const native = entries.every(({ entry }) => this.hasProviderCredential(entry))
       const upstream: ProviderStream = (
         model: Model<Api>,
-        context: Context,
+        context: TranscriptContext,
         streamOptions?: SimpleStreamOptions,
       ) =>
         native && this.options.authentication
@@ -788,7 +788,7 @@ function resolveModel(
 /** Keep Pi's reasoning/provider mapping, but never send a client token budget. */
 function streamWithoutOutputTokenLimit(
   model: Model<"openai-completions">,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ) {
   const upstreamOnPayload = options?.onPayload
@@ -801,7 +801,11 @@ function streamWithoutOutputTokenLimit(
   })
 }
 
-function streamCustomModel(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+function streamCustomModel(
+  model: Model<Api>,
+  context: TranscriptContext,
+  options?: SimpleStreamOptions,
+) {
   if (model.api === "openai-responses") {
     return streamOpenAiResponses(model as Model<"openai-responses">, context, options)
   }

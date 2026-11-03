@@ -45,9 +45,9 @@ describe("collectSample", () => {
     })
 
     await writeSession(join(state, "runs", "run-1", "session.jsonl"), async (session) => {
-      await session.appendModelChange("openai", "gpt-x")
-      await session.appendMessage(user("solve web-1"))
-      await session.appendMessage(
+      session.appendModelChange("openai", "gpt-x")
+      session.appendMessage(user("solve web-1"))
+      session.appendMessage(
         assistant("analysis", {
           provider: "openai",
           model: "gpt-x",
@@ -55,9 +55,9 @@ describe("collectSample", () => {
         }),
       )
       // Compaction usage carries no model; it belongs to the active model.
-      await session.appendCompaction(
+      session.appendCompaction(
         "summary",
-        undefined,
+        null,
         1_000,
         undefined,
         false,
@@ -67,7 +67,7 @@ describe("collectSample", () => {
     await writeSession(
       join(state, "runs", "run-1", "subagents", "sa-1", "session.jsonl"),
       async (session) => {
-        await session.appendMessage(
+        session.appendMessage(
           assistant("subagent report", {
             provider: "anthropic",
             model: "claude-x",
@@ -79,7 +79,7 @@ describe("collectSample", () => {
     await writeSession(
       join(state, "challenges", "key", "workspace", "tldr", "session.jsonl"),
       async (session) => {
-        await session.appendMessage(
+        session.appendMessage(
           assistant("tldr", {
             provider: "local",
             model: "free",
@@ -198,7 +198,7 @@ describe("collectSample", () => {
   it("counts a request that reported no usage as unknown rather than free", async () => {
     const state = await tempDir("no-usage")
     await writeSession(join(state, "runs", "run-1", "session.jsonl"), async (session) => {
-      await session.appendMessage(
+      session.appendMessage(
         assistant("streamed without usage", {
           provider: "openai",
           model: "gpt-x",

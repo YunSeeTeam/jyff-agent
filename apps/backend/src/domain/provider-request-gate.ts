@@ -3,10 +3,10 @@ import {
   type Api,
   type AssistantMessage,
   type AssistantMessageEventStream,
-  type Context,
   createAssistantMessageEventStream,
   type Model,
   type SimpleStreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai"
 
 export const DEFAULT_PROVIDER_REQUEST_INTERVAL_MS = 2_000
@@ -19,7 +19,7 @@ export interface ProviderRequestGateOptions {
 
 export type ProviderStream = (
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream
 

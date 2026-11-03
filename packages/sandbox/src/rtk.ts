@@ -1,5 +1,14 @@
-import type { BashPrepare } from "@earendil-works/pi-agent-core"
 import type { DockerExecutionEnv } from "./docker-execution-env.ts"
+
+/** Mutable bash invocation handed to a prepare hook before the command runs. */
+export interface BashExecution {
+  command: string
+  cwd: string
+  env: Record<string, string>
+  inheritEnv: boolean
+}
+
+export type BashPrepare = (execution: BashExecution, signal?: AbortSignal) => Promise<void>
 
 export type RtkStatus = "unknown" | "enabled" | "unavailable" | "disabled"
 
@@ -40,8 +49,8 @@ export class RtkRewriter {
       : command
   }
 
-  prepare(): BashPrepare<{ env: DockerExecutionEnv }> {
-    return async (execution, _context, signal) => {
+  prepare(): BashPrepare {
+    return async (execution, signal) => {
       execution.command = await this.rewrite(execution.command, signal)
     }
   }
