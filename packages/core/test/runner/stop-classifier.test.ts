@@ -87,6 +87,52 @@ describe("classifySolverStop", () => {
   })
 
   it.each([
+    // OpenAI/Anthropic SDK connection failures reach the scheduler as text only;
+    // `Connection error.` is what a DeepSeek socket reset produced in evaluation.
+    [{ stopReason: "error", error: "Connection error." }],
+    [{ stopReason: "error", error: "Request timed out." }],
+    [{ stopReason: "error", error: "terminated" }],
+    [{ error: "socket hang up" }],
+    [{ error: "other side closed" }],
+  ] as const)(
+    "retries SDK connection failures with backoff instead of scoring them %#",
+    (input) => {
+      expect(classifySolverStop(input)).toMatchObject({
+        kind: "network_transient",
+        blockDelta: 0,
+        retryable: true,
+      })
+    },
+  )
+
+  it("reads network codes from the error cause chain", () => {
+    const socket = Object.assign(new Error("socket disconnected before TLS"), {
+      code: "ECONNRESET",
+    })
+    expect(
+      classifySolverStop({ error: new Error("Connection error.", { cause: socket }) }),
+    ).toMatchObject({ kind: "network_transient", blockDelta: 0 })
+    expect(
+      classifySolverStop({
+        error: new Error("stream failed", {
+          cause: new Error("fetch", {
+            cause: Object.assign(new Error("x"), { code: "UND_ERR_SOCKET" }),
+          }),
+        }),
+      }),
+    ).toMatchObject({ kind: "network_transient", blockDelta: 0 })
+  })
+
+  it("does not treat messages that merely mention termination as network failures", () => {
+    expect(
+      classifySolverStop({
+        stopReason: "error",
+        error: "tool process terminated with exit code 1",
+      }),
+    ).toMatchObject({ kind: "protocol_or_non_transient", blockDelta: 1 })
+  })
+
+  it.each([
     [{ stopReason: "stop" }, "model_stop"],
     [{ stopReason: "length" }, "length"],
     [{ stopReason: "error", error: new Error("invalid frame") }, "protocol_or_non_transient"],

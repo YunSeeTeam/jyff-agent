@@ -716,6 +716,53 @@ describe("ContestScheduler", () => {
     }
   })
 
+  // 评测中 DeepSeek 连接被重置时，OpenAI SDK 只留下 "Connection error."；
+  // 它曾被当作不可重试错误立即续跑，数秒内耗尽会话中断阈值而把题目判为 blocked。
+  it("SDK 的 Connection error. 按网络瞬断退避重试，不计入阻塞与会话中断", async () => {
+    const item = challenge(93)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: "sdk-connection-error" })
+    faux.setResponses(
+      Array.from({ length: 4 }, () =>
+        fauxAssistantMessage("connection dropped", {
+          stopReason: "error",
+          errorMessage: "Connection error.",
+        }),
+      ),
+    )
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 1,
+      transientRetryDelaysMs: [0, 0, 0],
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => scheduler.snapshot().active.length === 0)
+
+      const [run] = project.runs({ challengeId: item.id })
+      expect(run?.status).not.toBe("blocked")
+      const failures = project
+        .runEvents(run?.id ?? "")
+        .filter((event) => event.type === "run_transient_failure")
+      expect(failures.map((event) => event.data)).toEqual([
+        expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
+        expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
+        expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
+        expect.objectContaining({ reason: "network_transient", retryScheduled: false }),
+      ])
+      expect(project.challengeBlockEvents(item.id)).toHaveLength(0)
+      expect(project.isChallengeBlocked(item.id)).toBe(false)
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
   it("瞬时 Provider 故障耗尽后仍受 attempt 预算限制，不会无限创建新 Run", async () => {
     const item = challenge(95)
     const tracker = new SandboxTracker()

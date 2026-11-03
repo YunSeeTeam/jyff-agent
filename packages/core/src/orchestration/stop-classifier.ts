@@ -30,11 +30,17 @@ export interface ClassifySolverStopInput {
 const NETWORK_CODES = new Set([
   "ECONNRESET",
   "ECONNREFUSED",
+  "ECONNABORTED",
+  "EPIPE",
   "EHOSTUNREACH",
   "ENETUNREACH",
   "ENOTFOUND",
   "EAI_AGAIN",
   "ETIMEDOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
 ])
 
 export function classifySolverStop(input: ClassifySolverStopInput): SolverStopClassification {
@@ -66,10 +72,14 @@ export function classifySolverStop(input: ClassifySolverStopInput): SolverStopCl
   }
 
   // Compatibility fallback for providers that have not exposed structured codes.
+  // The OpenAI and Anthropic SDKs report dropped connections as `Connection error.` /
+  // `Request timed out.`, and Pi keeps only that message text; undici reports a body
+  // stream cut mid-response as a bare `terminated`.
   if (
-    /\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b|websocket disconnected|socket disconnected|network error|fetch failed/i.test(
+    /\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b|websocket disconnected|socket disconnected|network error|fetch failed|connection error|request timed out|socket hang up|other side closed/i.test(
       facts.detail ?? "",
-    )
+    ) ||
+    /^\s*terminated\s*$/i.test(facts.detail ?? "")
   ) {
     return classification("network_transient", 0, true, facts.detail)
   }
@@ -118,13 +128,25 @@ function errorFacts(error: unknown): {
   if (typeof error !== "object") return { detail: safeString(error) }
   const value = error as Record<string, unknown>
   const statusValue = value.status ?? value.statusCode
+  const code = errorCode(error)
   return {
-    ...(typeof value.code === "string" ? { code: value.code.toUpperCase() } : {}),
+    ...(code ? { code } : {}),
     ...(typeof value.type === "string" ? { type: value.type.toUpperCase() } : {}),
     ...(typeof statusValue === "number" ? { status: statusValue } : {}),
     ...(typeof value.retryable === "boolean" ? { retryable: value.retryable } : {}),
     detail: error instanceof Error ? error.message : safeString(error),
   }
+}
+
+/** First string `code` on the error or its `cause` chain (SDKs wrap socket errors). */
+function errorCode(error: object): string | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth += 1) {
+    const { code, cause } = current as { code?: unknown; cause?: unknown }
+    if (typeof code === "string") return code.toUpperCase()
+    current = cause
+  }
+  return undefined
 }
 
 function isConfigurationType(type: string | undefined): boolean {
