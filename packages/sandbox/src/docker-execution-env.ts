@@ -20,6 +20,9 @@ const MAX_TIMER_MS = 2_147_483_647
 const BASH_CAPTURE_FLUSH_BYTES = 512 * 1024
 const FILE_HELPER_MAX_ATTEMPTS = 3
 const COMMAND_TIMEOUT_MARKER = "__CTF_AGENT_COMMAND_TIMED_OUT__"
+// The marker is control-plane plumbing; strip it (and the line break the shell
+// printed after it) from the stream the model sees.
+const COMMAND_TIMEOUT_MARKER_PATTERN = /__CTF_AGENT_COMMAND_TIMED_OUT__(?:\r?\n|[\\/]n)?/g
 const COMMAND_TIMEOUT_GRACE_MS = 5_000
 // V8 字符串最长 0x1fffffe8（536,870,888）字符，base64 膨胀 4/3：一次性给超过
 // ~384 MiB 的内容做 toString("base64") 会抛 "Cannot create a string longer than
@@ -216,7 +219,7 @@ export class DockerExecutionEnv implements ExecutionEnv {
           ? {}
           : { timeoutMs: timeoutSeconds * 1000 + COMMAND_TIMEOUT_GRACE_MS }),
         onStdout: options.onStdout,
-        onStderr: options.onStderr,
+        onStderr: options.onStderr ? withoutTimeoutMarker(options.onStderr) : undefined,
       })
       if (result.stderr.includes(COMMAND_TIMEOUT_MARKER)) {
         return err(
@@ -614,6 +617,13 @@ export class DockerBashExecutionEnv extends DockerExecutionEnv {
       await Promise.resolve()
       await Promise.allSettled(this.pendingOperations)
     } while (this.pendingOperations.size > 0)
+  }
+}
+
+function withoutTimeoutMarker(onStderr: (chunk: string) => void): (chunk: string) => void {
+  return (chunk) => {
+    const cleaned = chunk.replace(COMMAND_TIMEOUT_MARKER_PATTERN, "")
+    if (cleaned) onStderr(cleaned)
   }
 }
 

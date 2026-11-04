@@ -111,6 +111,32 @@ describe("DockerExecutionEnv", () => {
     if (!result.ok) expect(result.error.code).toBe("timeout")
   })
 
+  it("超时标记只用于识别超时，不出现在推送给模型的 stderr 中", async () => {
+    const chunks: string[] = []
+    const sandbox: Sandbox = {
+      id: "streaming",
+      async exec(_args, options) {
+        options?.onStderr?.("partial output\n")
+        options?.onStderr?.("__CTF_AGENT_COMMAND_TIMED_OUT__/n")
+        return {
+          code: 124,
+          stdout: "",
+          stderr: "partial output\n__CTF_AGENT_COMMAND_TIMED_OUT__/n",
+        }
+      },
+      async close() {},
+    }
+
+    const result = await new DockerExecutionEnv(sandbox).exec("sleep 3600", {
+      timeout: 1,
+      onStderr: (chunk) => chunks.push(chunk),
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.code).toBe("timeout")
+    expect(chunks).toEqual(["partial output\n"])
+  })
+
   it("Windows 原生进程初始化失败时有限重试文件 helper", async () => {
     const sandbox = new FakeSandbox()
     sandbox.nativeFailuresRemaining = 2
