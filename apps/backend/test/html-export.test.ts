@@ -158,6 +158,48 @@ describe("exportPiSessionHtml", () => {
     await expect(piSessionHasConversation(sessionPath)).resolves.toBe(false)
   })
 
+  it("Pi 1.x 记录的 system 提示词消息不出现在对话视图中", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ctf-pi-conversation-system-"))
+    roots.push(root)
+    const sessionPath = join(root, "session.jsonl")
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "system-run",
+          timestamp: "2026-11-01T00:00:00.000Z",
+          cwd: root,
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "prompt",
+          parentId: null,
+          timestamp: "2026-11-01T00:00:01.000Z",
+          message: {
+            role: "system",
+            content: "",
+            sections: { preamble: "Solve the current CTF challenge." },
+            timestamp: 1,
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "task",
+          parentId: "prompt",
+          timestamp: "2026-11-01T00:00:02.000Z",
+          message: { role: "user", content: "start", timestamp: 2 },
+        }),
+      ].join("\n"),
+    )
+
+    expect(
+      readPiSessionConversation(sessionPath).messages.map((message) => message.entryId),
+    ).toEqual(["task"])
+    expect((await exportPiSessionHtml(sessionPath)).toString("utf8")).toContain("<!DOCTYPE html>")
+  })
+
   it("结构化对话只返回当前分支，不混入已放弃分支", async () => {
     const root = await mkdtemp(join(tmpdir(), "ctf-pi-conversation-"))
     roots.push(root)
