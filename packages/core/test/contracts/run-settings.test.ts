@@ -35,6 +35,22 @@ describe("run settings merge", () => {
     expect(next.skills.subagents.roles).toEqual({ crypto: "all" })
   })
 
+  it("merges budget fields one by one; null clears a cost limit, omission keeps it", () => {
+    const current = mergeRunSettings(defaultRunSettings(), {
+      budgetPolicy: { wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: 2_000_000 },
+    })
+    expect(current.budgetPolicy).toMatchObject({
+      enabled: false,
+      wallClockMs: 3_600_000,
+      currency: "CNY",
+      maxCostMicros: 2_000_000,
+      postprocessMs: 360_000,
+    })
+    expect(mergeRunSettings(current, { budgetPolicy: {} })).toEqual(current)
+    const cleared = mergeRunSettings(current, { budgetPolicy: { maxCostMicros: null } })
+    expect(cleared.budgetPolicy).toEqual({ ...current.budgetPolicy, maxCostMicros: null })
+  })
+
   it("clears overrides with an empty role table and deduplicates names", () => {
     const current = mergeRunSettings(defaultRunSettings(), {
       skills: { subagents: { roles: { web: ["x"] } } },

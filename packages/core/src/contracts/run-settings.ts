@@ -34,10 +34,29 @@ export interface OptimizationSettings {
   review: ReviewSettings
 }
 
-/** Placeholder until the solve budget (P3) lands; only `enabled: false` is valid today. */
+/** How the solve budget's wall clock runs; strict counts queueing and every wait (design 11.1). */
+export type BudgetClockMode = "strict_wall_clock"
+
+/**
+ * Solve budget policy (design 11.1). The shape is frozen before the budget
+ * itself lands (P3), so stage 4 only adds behavior; `enabled` stays off until
+ * the build provides the budget-policy capability.
+ */
 export interface BudgetPolicySettings {
   schemaVersion: 1
   enabled: boolean
+  clockMode: BudgetClockMode
+  /** Wall-clock limit for one solve goal, across all of its Runs and retries. */
+  wallClockMs: number
+  /** ISO 4217 code the cost limits are expressed in. */
+  currency: string
+  /** Soft cost limit in millionths of `currency`; null means no cost limit. */
+  maxCostMicros: number | null
+  maxConcurrentModelRequests: number
+  /** Time after acceptance for writeup and cleanup, shared by every writeup round. */
+  postprocessMs: number
+  /** Cost limit for the postprocess phase in millionths of `currency`; null means no limit. */
+  postprocessMaxCostMicros: number | null
 }
 
 export interface RunSettings {
@@ -67,6 +86,12 @@ export interface RunSettingsPatch {
 export const REVIEW_MAX_PER_BUDGET_LIMIT = 16
 export const REVIEW_MAX_CONCURRENT_LIMIT = 8
 
+export const BUDGET_WALL_CLOCK_MIN_MS = 60_000
+export const BUDGET_WALL_CLOCK_MAX_MS = 7 * 24 * 60 * 60_000
+export const BUDGET_POSTPROCESS_MIN_MS = 60_000
+export const BUDGET_POSTPROCESS_MAX_MS = 24 * 60 * 60_000
+export const BUDGET_MAX_CONCURRENT_MODEL_REQUESTS_LIMIT = 32
+
 export function defaultRunSettings(): RunSettings {
   return {
     optimization: {
@@ -78,7 +103,21 @@ export function defaultRunSettings(): RunSettings {
       review: { enabled: false, maxPerBudget: 2, maxConcurrent: 1 },
     },
     skills: { version: 1, solver: "all", subagents: { default: "all", roles: {} } },
-    budgetPolicy: { schemaVersion: 1, enabled: false },
+    budgetPolicy: {
+      schemaVersion: 1,
+      enabled: false,
+      clockMode: "strict_wall_clock",
+      // The long end of the design's 1-2 h trial; the evaluation plan sets the real value.
+      wallClockMs: 2 * 60 * 60_000,
+      // Pi's model catalog prices in USD.
+      currency: "USD",
+      maxCostMicros: null,
+      // Today's ceiling: one Solver plus four background SubAgents.
+      maxConcurrentModelRequests: 5,
+      // Today's ceiling: three writeup rounds of at most 120 s each.
+      postprocessMs: 6 * 60_000,
+      postprocessMaxCostMicros: null,
+    },
   }
 }
 
@@ -137,10 +176,31 @@ export function mergeRunSettings(current: RunSettings, patch: RunSettingsPatch):
         roles: cloneRoles(skills?.subagents?.roles ?? current.skills.subagents.roles),
       },
     },
-    budgetPolicy: {
-      schemaVersion: 1,
-      enabled: patch.budgetPolicy?.enabled ?? current.budgetPolicy.enabled,
-    },
+    budgetPolicy: mergeBudgetPolicy(current.budgetPolicy, patch.budgetPolicy),
+  }
+}
+
+function mergeBudgetPolicy(
+  current: BudgetPolicySettings,
+  patch: RunSettingsPatch["budgetPolicy"],
+): BudgetPolicySettings {
+  // null is an explicit "no limit", so only an omitted cost limit keeps its value.
+  const limit = (value: number | null | undefined, fallback: number | null) =>
+    value === undefined ? fallback : value
+  return {
+    schemaVersion: 1,
+    enabled: patch?.enabled ?? current.enabled,
+    clockMode: patch?.clockMode ?? current.clockMode,
+    wallClockMs: patch?.wallClockMs ?? current.wallClockMs,
+    currency: patch?.currency ?? current.currency,
+    maxCostMicros: limit(patch?.maxCostMicros, current.maxCostMicros),
+    maxConcurrentModelRequests:
+      patch?.maxConcurrentModelRequests ?? current.maxConcurrentModelRequests,
+    postprocessMs: patch?.postprocessMs ?? current.postprocessMs,
+    postprocessMaxCostMicros: limit(
+      patch?.postprocessMaxCostMicros,
+      current.postprocessMaxCostMicros,
+    ),
   }
 }
 

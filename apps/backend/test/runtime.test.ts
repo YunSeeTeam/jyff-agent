@@ -151,6 +151,16 @@ describe("ProjectRuntimeConfiguration", () => {
       expect(configuration.snapshot()).toEqual({ ...base, ...defaultRunSettings(), revision: 0 })
     })
 
+    it("fills the budget fields when the file has the earlier placeholder", async () => {
+      const storagePath = await fixture()
+      await writeFile(
+        storagePath,
+        JSON.stringify({ version: 1, ...base, budgetPolicy: { schemaVersion: 1, enabled: false } }),
+      )
+      const configuration = await create(storagePath)
+      expect(configuration.snapshot().budgetPolicy).toEqual(defaultRunSettings().budgetPolicy)
+    })
+
     it("keeps stored settings when an older client omits them", async () => {
       const storagePath = await fixture()
       const capabilities = ["skill-snapshots"]

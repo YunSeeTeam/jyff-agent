@@ -493,6 +493,12 @@ describe("Project 运行配置的优化设置", () => {
       { ...base, optimization: { unknownSwitch: true } },
       { ...base, optimization: null },
       { ...base, skills: { solver: null } },
+      { ...base, budgetPolicy: { unknownLimit: 1 } },
+      { ...base, budgetPolicy: { wallClockMs: null } },
+      { ...base, budgetPolicy: { wallClockMs: 1_000 } },
+      { ...base, budgetPolicy: { currency: "usd" } },
+      { ...base, budgetPolicy: { maxConcurrentModelRequests: 0 } },
+      { ...base, budgetPolicy: { maxCostMicros: 0 } },
     ]) {
       const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", payload)
       expect(response.status).toBe(400)
@@ -500,6 +506,34 @@ describe("Project 运行配置的优化设置", () => {
         error: "invalid_project_runtime_configuration",
       })
     }
+  })
+
+  it("预算字段逐项保存，成本上限的 null 表示不设上限", async () => {
+    const { app } = await appWithFileRuntime()
+    const set = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      budgetPolicy: { wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: 2_000_000 },
+    })
+    expect(set.status).toBe(200)
+    expect(((await jsonOf(set)).runtime as ProjectRuntimeConfigurationView).budgetPolicy).toEqual({
+      schemaVersion: 1,
+      enabled: false,
+      clockMode: "strict_wall_clock",
+      wallClockMs: 3_600_000,
+      currency: "CNY",
+      maxCostMicros: 2_000_000,
+      maxConcurrentModelRequests: 5,
+      postprocessMs: 360_000,
+      postprocessMaxCostMicros: null,
+    })
+    const cleared = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      budgetPolicy: { maxCostMicros: null },
+    })
+    expect(cleared.status).toBe(200)
+    expect(
+      ((await jsonOf(cleared)).runtime as ProjectRuntimeConfigurationView).budgetPolicy,
+    ).toMatchObject({ wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: null })
   })
 
   it("开关依赖不满足时返回原错误码并在 details 中说明", async () => {
