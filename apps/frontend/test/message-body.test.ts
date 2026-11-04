@@ -86,6 +86,38 @@ describe("MessageBody", () => {
     expect(select).toHaveBeenCalledWith("worker-123456789")
   })
 
+  it("从有界结果页的 agentId 识别 SubAgent", () => {
+    const select = vi.fn()
+    render(
+      createElement(MessageBody, {
+        message: {
+          role: "toolResult",
+          toolCallId: "tool-subagent-page",
+          toolName: "Agent",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                schemaVersion: 2,
+                agentId: "worker-paged-1",
+                status: "queued",
+                state: "result_pending",
+                result: "",
+                totalLength: 0,
+                hasMore: false,
+              }),
+            },
+          ],
+          isError: false,
+          timestamp: 1,
+        },
+        onSelectSubagent: select,
+      }),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "打开 SubAgent worker-paged-1 对话" }))
+    expect(select).toHaveBeenCalledWith("worker-paged-1")
+  })
+
   it("把 wait 调用和结构化完成通知显示为 SubAgent 语义", () => {
     const select = vi.fn()
     const { unmount } = render(

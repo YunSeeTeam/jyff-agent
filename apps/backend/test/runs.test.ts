@@ -1,3 +1,4 @@
+import type { SubagentRecord } from "@ctf-agent/core"
 import { describe, expect, it } from "vite-plus/test"
 import { createWebUiApp } from "../src/server.ts"
 import type { DashboardConversation } from "../src/types.ts"
@@ -50,10 +51,15 @@ describe("Run 与 SubAgent 会话路由", () => {
       { message: "先验证泄漏稳定性" },
     )
     expect(steered.status).toBe(200)
-    expect(await jsonOf(steered)).toMatchObject({
+    const summary = await jsonOf(steered)
+    expect(summary).toMatchObject({
       id: "worker-pwn-1",
-      description: expect.stringContaining("先验证泄漏稳定性"),
+      task: expect.stringContaining("先验证泄漏稳定性"),
     })
+    // A bounded summary, not the raw record: no prompt and no host paths.
+    expect(summary).not.toHaveProperty("prompt")
+    expect(summary).not.toHaveProperty("sessionPath")
+    expect(summary).not.toHaveProperty("containerCwd")
 
     expect(
       (
@@ -74,6 +80,71 @@ describe("Run 与 SubAgent 会话路由", () => {
       id: "worker-pwn-1",
       status: "cancelled",
     })
+  })
+
+  it("SubAgent 列表按游标分页，每页不超过 16 KiB 且最终枚举全部（T19）", async () => {
+    const project = new FakeDashboardProject()
+    const records = manySubagents(40)
+    project.subagentValues.set("run-pwn-1", records)
+    const { app } = createWebUiApp({ project, frontendDist: "/nonexistent" })
+
+    const seen: string[] = []
+    let cursor: string | undefined
+    for (let pages = 0; pages < 100; pages++) {
+      const response = await app.request(
+        `/api/runs/run-pwn-1/subagents${cursor ? `?cursor=${cursor}` : ""}`,
+      )
+      expect(response.status).toBe(200)
+      const body = await response.text()
+      expect(Buffer.byteLength(body)).toBeLessThanOrEqual(16 * 1024)
+      expect(body).not.toContain("QQQQ")
+      expect(body).not.toContain("/sessions/")
+      const page = JSON.parse(body) as { items: Array<{ id: string }>; nextCursor?: string }
+      seen.push(...page.items.map((item) => item.id))
+      cursor = page.nextCursor
+      if (!cursor) break
+    }
+    expect(seen).toEqual(records.map((record) => record.id))
+
+    const tampered = await app.request("/api/runs/run-pwn-1/subagents?cursor=bogus")
+    expect(tampered.status).toBe(400)
+    expect(await jsonOf(tampered)).toMatchObject({ error: "invalid_query" })
+    expect((await app.request("/api/runs/run-pwn-1/subagents?limit=33")).status).toBe(400)
+    expect((await app.request("/api/runs/missing/subagents")).status).toBe(404)
+  })
+
+  it("SubAgent 报告按页读取，版本变化返回 409", async () => {
+    const project = new FakeDashboardProject()
+    const [record] = manySubagents(1, "x".repeat(9_000))
+    if (!record) throw new Error("fixture")
+    project.subagentValues.set("run-pwn-1", [record])
+    const { app } = createWebUiApp({ project, frontendDist: "/nonexistent" })
+    const base = `/api/runs/run-pwn-1/subagents/${record.id}/result`
+
+    const first = await jsonOf(await app.request(base))
+    expect(first).toMatchObject({ offset: 0, totalLength: 9_000, nextOffset: 8_000, hasMore: true })
+    const version = String(first.resultVersion)
+    const second = await jsonOf(
+      await app.request(`${base}?offset=8000&expectedResultVersion=${encodeURIComponent(version)}`),
+    )
+    expect(second).toMatchObject({ offset: 8_000, result: "x".repeat(1_000), hasMore: false })
+
+    const stale = await app.request(`${base}?offset=8000&expectedResultVersion=v1%3Astale`)
+    expect(stale.status).toBe(409)
+    expect(await jsonOf(stale)).toMatchObject({
+      error: "result_changed",
+      details: { retryable: true },
+    })
+    expect((await app.request(`${base}?offset=10`)).status).toBe(400)
+    expect(
+      (
+        await app.request(
+          `${base}?offset=9001&expectedResultVersion=${encodeURIComponent(version)}`,
+        )
+      ).status,
+    ).toBe(400)
+    expect((await app.request(`${base}?offset=-1`)).status).toBe(400)
+    expect((await app.request("/api/runs/run-pwn-1/subagents/missing/result")).status).toBe(404)
   })
 
   it("HTML 导出仅接受明确的 Run 或 SubAgent 会话", async () => {
@@ -276,3 +347,27 @@ describe("Run 与 SubAgent 会话路由", () => {
     expect(await response.text()).toContain("<!doctype html>")
   })
 })
+
+function manySubagents(count: number, result = "報".repeat(7_000)): SubagentRecord[] {
+  return Array.from({ length: count }, (_, index) => {
+    const createdAt = new Date(Date.UTC(2026, 10, 4, 0, 0, index)).toISOString()
+    return {
+      id: `worker-${String(index).padStart(3, "0")}`,
+      runId: "run-pwn-1",
+      role: "pwn",
+      displayName: "Pwn",
+      description: "任".repeat(240),
+      status: "completed",
+      background: true,
+      prompt: "Q".repeat(32_000),
+      sessionPath: `/sessions/worker-${index}/session.jsonl`,
+      containerCwd: `/workspace/subagents/worker-${index}`,
+      result,
+      turns: 1,
+      toolUses: 1,
+      totalTokens: 10,
+      createdAt,
+      updatedAt: createdAt,
+    }
+  })
+}

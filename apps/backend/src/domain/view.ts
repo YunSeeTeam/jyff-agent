@@ -1,11 +1,14 @@
-import type {
-  ChallengeSummary,
-  ContestSchedulerSnapshot,
-  RunEvent,
-  RunRecord,
-  SchedulerPhase,
-  SchedulerQueueEntry,
+import {
+  type ChallengeSummary,
+  type ContestSchedulerSnapshot,
+  type RunEvent,
+  type RunRecord,
+  type SchedulerPhase,
+  type SchedulerQueueEntry,
+  type SubagentRecord,
+  subagentListPage,
 } from "@ctf-agent/core"
+import { SUBAGENT_LIST_MAX_LIMIT } from "@ctf-agent/core/contracts"
 import type {
   AgentCacheStats,
   ChallengeDetails,
@@ -13,6 +16,7 @@ import type {
   DashboardChallengeStatus,
   DashboardControlPlane,
   DashboardProject,
+  DashboardRun,
   DashboardScheduler,
   DashboardSnapshot,
   DashboardSolverLogEntry,
@@ -287,14 +291,7 @@ export async function buildChallengeDetails(
     return {
       ...run,
       events: compactTimelineEvents(events),
-      subagents: project.subagents(run.id).map((subagent) => ({
-        ...subagent,
-        hasConversation:
-          subagent.turns > 0 ||
-          subagent.toolUses > 0 ||
-          subagent.totalTokens > 0 ||
-          Boolean(subagent.result),
-      })),
+      ...subagentIndex(run.id, project.subagents(run.id)),
       cache: agentCacheStats(events),
       hasConversation: events.some((event) =>
         ["agent_message", "agent_usage", "tool_started"].includes(event.type),
@@ -314,6 +311,36 @@ export async function buildChallengeDetails(
       ) ?? null,
     writeup: await project.challengeWriteup(challengeId),
     tldr: project.tldr(challengeId) ?? null,
+  }
+}
+
+/**
+ * The SubAgents a Run shows on the challenge page: metadata only, never report
+ * text, so the reload on every dashboard snapshot stays small. The page holds
+ * what fits; the rest stays reachable through the cursor, not silently dropped.
+ */
+function subagentIndex(
+  runId: string,
+  records: readonly SubagentRecord[],
+): Pick<DashboardRun, "subagents" | "subagentCount" | "subagentsNextCursor"> {
+  const page = subagentListPage(
+    runId,
+    records,
+    { limit: SUBAGENT_LIST_MAX_LIMIT },
+    { previewCodePoints: 0 },
+  )
+  if ("error" in page) throw new Error(`SubAgent index refused: ${page.error.code}`)
+  return {
+    subagents: page.items.map((summary) => ({
+      ...summary,
+      hasConversation:
+        summary.usage.turns > 0 ||
+        summary.usage.toolUses > 0 ||
+        summary.usage.totalTokens > 0 ||
+        (summary.totalLength ?? 0) > 0,
+    })),
+    subagentCount: records.length,
+    ...(page.nextCursor ? { subagentsNextCursor: page.nextCursor } : {}),
   }
 }
 

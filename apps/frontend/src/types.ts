@@ -23,7 +23,15 @@ import type {
   TldrRecord,
   WorkspaceArtifactListing,
 } from "@ctf-agent/core"
-import type { RunSettings, RunSettingsPatch } from "@ctf-agent/core/contracts"
+import type {
+  RunSettings,
+  RunSettingsPatch,
+  SubagentListPageDto,
+  SubagentResultPageDto,
+  SubagentSummaryDto,
+} from "@ctf-agent/core/contracts"
+
+export type { SubagentListPageDto, SubagentResultPageDto }
 import type { AgentMessage, AgentOptions } from "@earendil-works/pi-agent-core"
 
 export interface DashboardConversationMessage {
@@ -122,12 +130,16 @@ export interface AgentCacheStats {
 
 export interface DashboardRun extends RunRecord {
   events: RunEvent[]
+  /** First page of the Run's SubAgents in creation order; the rest load on request. */
   subagents: DashboardSubagent[]
+  subagentCount: number
+  subagentsNextCursor?: string
   cache: AgentCacheStats
   hasConversation: boolean
 }
 
-export interface DashboardSubagent extends SubagentRecord {
+/** Bounded metadata only: report text is read on demand, page by page. */
+export interface DashboardSubagent extends SubagentSummaryDto {
   hasConversation: boolean
 }
 

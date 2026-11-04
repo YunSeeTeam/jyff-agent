@@ -32,7 +32,15 @@ import type {
   TldrRecord,
   WorkspaceArtifactListing,
 } from "@ctf-agent/core"
-import type { RunSettings, RunSettingsPatch } from "@ctf-agent/core/contracts"
+import type {
+  RunSettings,
+  RunSettingsPatch,
+  SubagentListPageDto,
+  SubagentResultPageDto,
+  SubagentResultQuery,
+  SubagentSummaryDto,
+  ToolErrorEnvelope,
+} from "@ctf-agent/core/contracts"
 import type { AgentMessage, AgentOptions } from "@earendil-works/pi-agent-core"
 
 export interface DashboardConversationMessage {
@@ -189,12 +197,16 @@ export interface AgentCacheStats {
 
 export interface DashboardRun extends RunRecord {
   events: RunEvent[]
+  /** First page of the Run's SubAgents in creation order; read the rest through `subagentsNextCursor`. */
   subagents: DashboardSubagent[]
+  subagentCount: number
+  subagentsNextCursor?: string
   cache: AgentCacheStats
   hasConversation: boolean
 }
 
-export interface DashboardSubagent extends SubagentRecord {
+/** Bounded metadata only: no prompt, report text, or host paths. */
+export interface DashboardSubagent extends SubagentSummaryDto {
   hasConversation: boolean
 }
 
@@ -248,6 +260,14 @@ export interface DashboardProject {
   runEvents(runId: string): RunEvent[]
   latestRunEvent(runId: string): RunEvent | undefined
   subagents(runId: string): SubagentRecord[]
+  subagentPage(
+    runId: string,
+    query: { cursor?: string; limit?: number },
+  ): SubagentListPageDto | ToolErrorEnvelope
+  subagentResult(
+    runId: string,
+    query: SubagentResultQuery,
+  ): SubagentResultPageDto | ToolErrorEnvelope | undefined
   availableSubagents(): Array<{
     name: string
     displayName: string

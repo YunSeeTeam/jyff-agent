@@ -30,6 +30,7 @@ describe("AttemptHistory", () => {
               },
             ],
             subagents: [],
+            subagentCount: 0,
             cache: {
               inputTokens: 0,
               cacheReadTokens: 0,

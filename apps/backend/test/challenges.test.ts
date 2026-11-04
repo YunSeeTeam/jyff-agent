@@ -139,6 +139,50 @@ describe("题目路由", () => {
     expect((await app.request("/api/challenges/missing")).status).toBe(404)
   })
 
+  it("详情只带 SubAgent 元数据摘要，超出首页的部分保留游标（T19）", async () => {
+    const project = new FakeDashboardProject()
+    const records = Array.from({ length: 40 }, (_, index) => {
+      const createdAt = new Date(Date.UTC(2026, 10, 4, 0, 0, index)).toISOString()
+      return {
+        id: `worker-${String(index).padStart(3, "0")}`,
+        runId: "run-pwn-1",
+        role: "pwn",
+        displayName: "Pwn",
+        description: "检查保护",
+        status: "completed" as const,
+        background: true,
+        prompt: "Q".repeat(32_000),
+        sessionPath: `/sessions/worker-${index}/session.jsonl`,
+        containerCwd: `/workspace/subagents/worker-${index}`,
+        result: "報".repeat(7_000),
+        turns: 1,
+        toolUses: 1,
+        totalTokens: 10,
+        createdAt,
+        updatedAt: createdAt,
+      }
+    })
+    project.subagentValues.set("run-pwn-1", records)
+    const { app } = createWebUiApp({ project, frontendDist: "/nonexistent" })
+    const body = await (await app.request("/api/challenges/pwn-1")).text()
+    // No report text, prompt, or host path reaches the page that reloads on every snapshot.
+    expect(body).not.toContain("報報")
+    expect(body).not.toContain("QQQQ")
+    expect(body).not.toContain("/sessions/")
+    const details = JSON.parse(body) as {
+      runs: Array<{
+        id: string
+        subagents: unknown[]
+        subagentCount: number
+        subagentsNextCursor?: string
+      }>
+    }
+    const run = details.runs.find((candidate) => candidate.id === "run-pwn-1")
+    expect(run?.subagentCount).toBe(40)
+    expect(run?.subagents.length).toBeLessThanOrEqual(32)
+    expect(run?.subagentsNextCursor).toEqual(expect.any(String))
+  })
+
   it("详情兜底路径：带任意后缀的 challenge 路径按题目 ID 解析", async () => {
     const { app } = appWithProject()
     expect((await app.request("/api/challenges/pwn-1/export")).status).toBe(404)

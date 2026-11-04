@@ -6,6 +6,15 @@
  * conversions cannot drift apart.
  */
 
+export type SubagentStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "aborted"
+  | "interrupted"
+
 /** Where a SubAgent report came from. `assistant_final` says nothing about correctness. */
 export type SubagentResultKind = "assistant_final" | "assistant_partial" | "tool_partial" | "legacy"
 
@@ -38,7 +47,7 @@ export interface SubagentSummaryDto {
   runId: string
   role: string
   displayName: string
-  status: string
+  status: SubagentStatus
   createdAt: string
   updatedAt: string
   startedAt?: string
@@ -84,7 +93,7 @@ export interface SubagentResultPageDto {
   agentId: string
   /** Absent for legacy records written before execution identities existed. */
   executionId?: string
-  status: string
+  status: SubagentStatus
   /** Present only when there is no report text yet or at all. */
   state?: SubagentResultState
   resultKind?: SubagentResultKind

@@ -22,19 +22,13 @@ import {
   SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS,
   type SubagentListPageDto,
   type SubagentResultPageDto,
+  type SubagentStatus,
   type ToolErrorEnvelope,
 } from "../contracts/index.ts"
 import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentListPage } from "./subagent-projection.ts"
 import { firstSubagentResultPage, subagentResultPage } from "./subagent-report.ts"
 
-export type SubagentStatus =
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "aborted"
-  | "interrupted"
+export type { SubagentStatus } from "../contracts/index.ts"
 
 export interface SubagentRecord {
   id: string

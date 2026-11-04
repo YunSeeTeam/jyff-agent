@@ -17,17 +17,22 @@ import type {
   DashboardRun,
   DashboardSubagent,
 } from "../../types.ts"
+import { SubagentReport } from "./SubagentReport.tsx"
 
 export function AgentSidebar({
+  projectId,
   details,
   selectedRunId,
   selectedSubagentId,
   onSelectSubagent,
+  onLoadMoreSubagents,
 }: {
+  projectId: string
   details: ChallengeDetails
   selectedRunId: string
   selectedSubagentId: string | null
   onSelectSubagent: (id: string | null) => void
+  onLoadMoreSubagents?: (runId: string) => void
 }) {
   const c = details.challenge
   const run = details.runs.find((r) => r.id === selectedRunId) ?? details.runs[0]
@@ -76,7 +81,7 @@ export function AgentSidebar({
             <Icon icon="lucide:network" width="15" />
             辅助 Agent
           </span>
-          <Badge className="text-[10px]">{run?.subagents.length ?? 0}</Badge>
+          <Badge className="text-[10px]">{run?.subagentCount ?? 0}</Badge>
         </div>
         <div className="flex flex-col gap-0.5 overflow-y-auto p-1.5">
           <AR
@@ -92,14 +97,31 @@ export function AgentSidebar({
               key={s.id}
               icon="lucide:waypoints"
               title={s.displayName}
-              sub={s.activeTool ? toolLabel(s.activeTool) : `${s.turns}t · ${s.totalTokens}tk`}
+              sub={
+                s.activeTool
+                  ? toolLabel(s.activeTool)
+                  : `${s.usage.turns}t · ${s.usage.totalTokens}tk`
+              }
               status={s.status}
               active={selectedSubagentId === s.id}
               onClick={() => onSelectSubagent(s.id)}
             />
           ))}
+          {run?.subagentsNextCursor && onLoadMoreSubagents ? (
+            <button
+              type="button"
+              onClick={() => onLoadMoreSubagents(run.id)}
+              className="rounded-md px-2 py-1.5 text-left text-xs text-primary outline-none transition-colors hover:bg-primary/10 focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              加载其余 {run.subagentCount - run.subagents.length} 个 SubAgent
+            </button>
+          ) : null}
         </div>
       </Card>
+
+      {run && selectedSubagent && (selectedSubagent.totalLength ?? 0) > 0 ? (
+        <SubagentReport projectId={projectId} runId={run.id} subagent={selectedSubagent} />
+      ) : null}
     </aside>
   )
 }
@@ -118,9 +140,9 @@ function selectedAgentCache(
       }
     )
   }
-  const inputTokens = Math.max(0, subagent.inputTokens ?? 0)
-  const cacheReadTokens = Math.max(0, subagent.cacheReadTokens ?? 0)
-  const cacheWriteTokens = Math.max(0, subagent.cacheWriteTokens ?? 0)
+  const inputTokens = Math.max(0, subagent.usage.inputTokens ?? 0)
+  const cacheReadTokens = Math.max(0, subagent.usage.cacheReadTokens ?? 0)
+  const cacheWriteTokens = Math.max(0, subagent.usage.cacheWriteTokens ?? 0)
   const eligibleTokens = inputTokens + cacheReadTokens
   return {
     inputTokens,

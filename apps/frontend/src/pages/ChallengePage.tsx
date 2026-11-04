@@ -52,6 +52,7 @@ export function ChallengePage() {
     target,
     selectRun,
     selectSubagent,
+    loadMoreSubagents,
     challengeAction,
     resetChallenge,
     reload,
@@ -308,7 +309,9 @@ export function ChallengePage() {
         </Card>
 
         <AgentSidebar
+          projectId={projectId}
           details={details}
+          onLoadMoreSubagents={(runId) => void loadMoreSubagents(runId)}
           selectedRunId={rid}
           selectedSubagentId={selectedSubagent?.id ?? null}
           onSelectSubagent={selectSubagent}
@@ -361,7 +364,9 @@ export function ChallengePage() {
               </div>
             </Card>
             <AgentSidebar
+              projectId={projectId}
               details={details}
+              onLoadMoreSubagents={(runId) => void loadMoreSubagents(runId)}
               selectedRunId={rid}
               selectedSubagentId={selectedSubagent?.id ?? null}
               onSelectSubagent={(id) => {

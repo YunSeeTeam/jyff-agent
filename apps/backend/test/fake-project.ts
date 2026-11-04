@@ -1,4 +1,15 @@
-import { ContestSchedulerError } from "@ctf-agent/core"
+import {
+  ContestSchedulerError,
+  SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+  subagentListPage,
+  subagentResultPage,
+} from "@ctf-agent/core"
+import type {
+  SubagentListPageDto,
+  SubagentResultPageDto,
+  SubagentResultQuery,
+  ToolErrorEnvelope,
+} from "@ctf-agent/core/contracts"
 import type {
   AgentStreamListener,
   AgentStreamTarget,
@@ -402,6 +413,24 @@ export class FakeDashboardProject implements DashboardProject {
 
   subagents(runId: string): SubagentRecord[] {
     return this.subagentValues.get(runId) ?? []
+  }
+
+  subagentPage(
+    runId: string,
+    query: { cursor?: string; limit?: number },
+  ): SubagentListPageDto | ToolErrorEnvelope {
+    return subagentListPage(runId, this.subagents(runId), query, {
+      previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+    })
+  }
+
+  subagentResult(
+    runId: string,
+    query: SubagentResultQuery,
+  ): SubagentResultPageDto | ToolErrorEnvelope | undefined {
+    const { agentId, ...page } = query
+    const record = this.subagents(runId).find((item) => item.id === agentId)
+    return record ? subagentResultPage(record, page) : undefined
   }
 
   async steerSubagent(runId: string, subagentId: string, message: string): Promise<SubagentRecord> {

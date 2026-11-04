@@ -1,3 +1,5 @@
+import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentSummary } from "@ctf-agent/core"
+import type { ToolErrorEnvelope } from "@ctf-agent/core/contracts"
 import { Hono } from "hono"
 import { streamSSE } from "hono/streaming"
 import type { App, AppContext, AppEnv } from "../context.ts"
@@ -20,8 +22,13 @@ export function runRoutes(services: Services): App {
       code: "invalid_message",
     })
     try {
+      const record = await project.steerSubagent(
+        c.req.param("runId"),
+        c.req.param("subagentId"),
+        body.message,
+      )
       return c.json(
-        await project.steerSubagent(c.req.param("runId"), c.req.param("subagentId"), body.message),
+        subagentSummary(record, { previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS }),
       )
     } catch (error) {
       if (hasCode(error, "subagent_unavailable")) {
@@ -34,7 +41,10 @@ export function runRoutes(services: Services): App {
   app.post("/runs/:runId/subagents/:subagentId/cancel", async (c) => {
     const project = services.requireProject(projectIdOf(c))
     try {
-      return c.json(await project.cancelSubagent(c.req.param("runId"), c.req.param("subagentId")))
+      const record = await project.cancelSubagent(c.req.param("runId"), c.req.param("subagentId"))
+      return c.json(
+        subagentSummary(record, { previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS }),
+      )
     } catch (error) {
       if (hasCode(error, "subagent_unavailable")) {
         throw new HttpError(409, "subagent_unavailable", errorText(error))
@@ -51,6 +61,40 @@ export function runRoutes(services: Services): App {
     })
     await scheduler.retryAttempt(c.req.param("runId"), body.prompt ? { prompt: body.prompt } : {})
     return c.json(await scopedSnapshot(services, projectIdOf(c)))
+  })
+
+  // Bounded reads: one list page or one report page per request, never every record at once.
+  app.get("/runs/:runId/subagents", (c) => {
+    const project = services.requireProject(projectIdOf(c))
+    const runId = c.req.param("runId")
+    requireRun(project, runId)
+    const cursor = c.req.query("cursor")
+    const limit = optionalInteger(c.req.query("limit"), "limit")
+    const page = project.subagentPage(runId, {
+      ...(cursor === undefined ? {} : { cursor }),
+      ...(limit === undefined ? {} : { limit }),
+    })
+    if ("error" in page) throw envelopeError(page)
+    return c.json(page)
+  })
+
+  app.get("/runs/:runId/subagents/:subagentId/result", (c) => {
+    const project = services.requireProject(projectIdOf(c))
+    const runId = c.req.param("runId")
+    const subagentId = c.req.param("subagentId")
+    requireRunAndSubagent(project, runId, subagentId)
+    const offset = optionalInteger(c.req.query("offset"), "offset")
+    const limit = optionalInteger(c.req.query("limit"), "limit")
+    const expectedResultVersion = c.req.query("expectedResultVersion")
+    const page = project.subagentResult(runId, {
+      agentId: subagentId,
+      ...(offset === undefined ? {} : { offset }),
+      ...(limit === undefined ? {} : { limit }),
+      ...(expectedResultVersion === undefined ? {} : { expectedResultVersion }),
+    })
+    if (!page) throw new HttpError(404, "subagent_not_found", `SubAgent 不存在: ${subagentId}`)
+    if ("error" in page) throw envelopeError(page)
+    return c.json(page)
   })
 
   app.get("/runs/:runId/subagents/:subagentId/export", async (c) => {
@@ -203,14 +247,18 @@ function scopedSnapshot(
   return projectId ? services.sync.refreshProject(projectId) : services.sync.refresh()
 }
 
+function requireRun(project: import("../../types.ts").DashboardProject, runId: string): void {
+  if (!project.runs().some((candidate) => candidate.id === runId)) {
+    throw new HttpError(404, "run_not_found", `Run 不存在: ${runId}`)
+  }
+}
+
 function requireRunAndSubagent(
   project: import("../../types.ts").DashboardProject,
   runId: string,
   subagentId: string,
 ): void {
-  if (!project.runs().some((candidate) => candidate.id === runId)) {
-    throw new HttpError(404, "run_not_found", `Run 不存在: ${runId}`)
-  }
+  requireRun(project, runId)
   if (!project.subagents(runId).some((candidate) => candidate.id === subagentId)) {
     throw new HttpError(404, "subagent_not_found", `SubAgent 不存在: ${subagentId}`)
   }
@@ -265,5 +313,23 @@ function htmlResponse(body: Buffer): Response {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
     },
+  })
+}
+
+function optionalInteger(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined
+  if (!/^\d{1,15}$/.test(value)) {
+    throw new HttpError(400, "invalid_query", `${name} must be a non-negative integer`)
+  }
+  return Number(value)
+}
+
+/** The core error envelope as an HTTP error: the same code, with retry guidance in details. */
+function envelopeError({ error }: ToolErrorEnvelope): HttpError {
+  const status = error.code === "result_changed" || error.code === "execution_changed" ? 409 : 400
+  return new HttpError(status, error.code, error.message, {
+    retryable: error.retryable,
+    nextAction: error.nextAction,
+    ...error.details,
   })
 }

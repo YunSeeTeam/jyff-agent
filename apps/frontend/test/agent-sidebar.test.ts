@@ -29,6 +29,69 @@ describe("AgentSidebar", () => {
     expect(screen.getAllByText("200 tokens")).toHaveLength(2)
   })
 
+  it("首页之外的 SubAgent 按需加载", () => {
+    const onLoadMore = vi.fn()
+    const run = details.runs[0]
+    if (!run) throw new Error("fixture")
+    const paged = {
+      ...details,
+      runs: [{ ...run, subagentCount: 40, subagentsNextCursor: "cursor-1" }],
+    } as ChallengeDetails
+    render(sidebar(null, paged, onLoadMore))
+    expect(screen.getByText("40")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "加载其余 39 个 SubAgent" }))
+    expect(onLoadMore).toHaveBeenCalledWith("run-1")
+  })
+
+  it("SubAgent 报告只在点击后按页读取，版本变化时从首页重读", async () => {
+    const run = details.runs[0]
+    const worker = run?.subagents[0]
+    if (!run || !worker) throw new Error("fixture")
+    const withReport = {
+      ...details,
+      runs: [
+        {
+          ...run,
+          subagents: [{ ...worker, resultVersion: "v1:a", totalLength: 9_000, hasMore: true }],
+        },
+      ],
+    } as ChallengeDetails
+    const page = (body: object, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      })
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        page({ resultVersion: "v1:a", result: "first-page ", nextOffset: 8_000, hasMore: true }),
+      )
+      .mockResolvedValueOnce(page({ error: "result_changed", message: "changed" }, 409))
+      .mockResolvedValueOnce(page({ resultVersion: "v1:b", result: "rewritten", hasMore: false }))
+    vi.stubGlobal("fetch", fetchMock)
+    try {
+      render(sidebar("worker-1", withReport))
+      // Nothing is fetched until the user asks for the report.
+      expect(fetchMock).not.toHaveBeenCalled()
+      fireEvent.click(screen.getByRole("button", { name: "查看报告" }))
+      await waitFor(() => expect(screen.getByText("first-page")).toBeTruthy())
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+        "/api/projects/project-1/runs/run-1/subagents/worker-1/result",
+      )
+
+      fireEvent.click(screen.getByRole("button", { name: "继续读取" }))
+      await waitFor(() => expect(screen.getByText("rewritten")).toBeTruthy())
+      expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
+        "offset=8000&expectedResultVersion=v1%3Aa",
+      )
+      // Pages of two reports are never joined.
+      expect(screen.queryByText(/first-page/)).toBeNull()
+      expect(screen.queryByRole("button", { name: "继续读取" })).toBeNull()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it("截断展示并复制完整环境 URL", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, "clipboard", {
@@ -72,12 +135,18 @@ function renderSidebar(selectedSubagentId: string | null) {
   return render(sidebar(selectedSubagentId))
 }
 
-function sidebar(selectedSubagentId: string | null, challengeDetails: ChallengeDetails = details) {
+function sidebar(
+  selectedSubagentId: string | null,
+  challengeDetails: ChallengeDetails = details,
+  onLoadMoreSubagents = vi.fn(),
+) {
   return createElement(AgentSidebar, {
+    projectId: "project-1",
     details: challengeDetails,
     selectedRunId: "run-1",
     selectedSubagentId,
     onSelectSubagent: vi.fn(),
+    onLoadMoreSubagents,
   })
 }
 
@@ -106,17 +175,21 @@ const details = {
         cacheWriteTokens: 50,
         cacheRate: 0.5,
       },
+      subagentCount: 1,
       subagents: [
         {
           id: "worker-1",
           displayName: "Explorer Worker",
           role: "explorer",
           status: "running",
-          turns: 2,
-          totalTokens: 500,
-          inputTokens: 100,
-          cacheReadTokens: 300,
-          cacheWriteTokens: 20,
+          usage: {
+            turns: 2,
+            toolUses: 0,
+            totalTokens: 500,
+            inputTokens: 100,
+            cacheReadTokens: 300,
+            cacheWriteTokens: 20,
+          },
         },
       ],
     },

@@ -81,7 +81,7 @@ export function AttemptHistory({
 
             <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
               <Metric value={run.events.length} label="事件" />
-              <Metric value={run.subagents.length} label="SubAgents" />
+              <Metric value={run.subagentCount} label="SubAgents" />
               <Metric value={run.cache.inputTokens} label="输入 tokens" />
               <Metric
                 value={

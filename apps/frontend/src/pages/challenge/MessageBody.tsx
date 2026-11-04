@@ -179,7 +179,8 @@ function subagentIdFromTool(toolName: string, args: unknown, output: unknown): s
   if (!SUBAGENT_TOOL_NAMES.has(toolName)) return undefined
   const input = recordOf(args)
   const result = parsedToolOutput(output)
-  const candidate = input?.agent_id ?? input?.resume ?? result?.id ?? result?.agent_id
+  const candidate =
+    input?.agent_id ?? input?.resume ?? result?.id ?? result?.agentId ?? result?.agent_id
   return typeof candidate === "string" && candidate ? candidate : undefined
 }
 

@@ -123,6 +123,69 @@ describe("useChallengeDetails", () => {
     await waitFor(() => expect(FakeEventSource.instances[1]?.url).toBe("/api/projects/two/events"))
   })
 
+  it("按需读取首页之外的 SubAgent，并随后续刷新一起更新", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource)
+    const summary = (id: string, status = "completed") => ({
+      id,
+      runId: "run-1",
+      role: "recon",
+      displayName: id,
+      status,
+      createdAt: "2026-11-04T00:00:00.000Z",
+      updatedAt: "2026-11-04T00:00:00.000Z",
+      usage: { turns: 1, toolUses: 0, totalTokens: 1 },
+      task: "t",
+      taskTruncated: false,
+      hasMore: false,
+    })
+    const withRun = (progress: string) => ({
+      ...details("one", progress),
+      runs: [
+        {
+          id: "run-1",
+          subagents: [{ ...summary("agent-a"), hasConversation: true }],
+          subagentCount: 3,
+          subagentsNextCursor: "c1",
+        },
+      ],
+    })
+    const requested: string[] = []
+    let laterStatus = "running"
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+      requested.push(url)
+      if (url.endsWith("/challenges/web-1")) return jsonResponse(withRun("loaded"))
+      if (url.includes("cursor=c1")) {
+        return jsonResponse({ items: [summary("agent-b")], nextCursor: "c2", omittedCount: 1 })
+      }
+      if (url.includes("cursor=c2")) {
+        return jsonResponse({ items: [summary("agent-c", laterStatus)], omittedCount: 0 })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(createElement(SubagentPagesProbe, { projectId: "one", challengeId: "web-1" }))
+    expect(await screen.findByText("agent-a:completed")).toBeTruthy()
+    // Only the details page is read until the user asks for more.
+    expect(requested).toEqual(["/api/projects/one/challenges/web-1"])
+
+    fireEvent.click(screen.getByRole("button", { name: "more" }))
+    expect(await screen.findByText("agent-c:running")).toBeTruthy()
+    expect(screen.getAllByText(/^agent-/).map((node) => node.textContent)).toEqual([
+      "agent-a:completed",
+      "agent-b:completed",
+      "agent-c:running",
+    ])
+    expect(requested[1]).toBe("/api/projects/one/runs/run-1/subagents?limit=32&cursor=c1")
+
+    laterStatus = "completed"
+    const source = FakeEventSource.instances[0]
+    if (!source) throw new Error("challenge SSE connection was not created")
+    act(() => source.emit("snapshot", "{}"))
+    expect(await screen.findByText("agent-c:completed")).toBeTruthy()
+  })
+
   it("已解出的题目显示强制派发确认，并显式提交 force", async () => {
     vi.stubGlobal("EventSource", FakeEventSource)
     let dispatchBody: unknown
@@ -195,6 +258,29 @@ function ChallengeDetailsProbe({
       "button",
       { type: "button", onClick: () => void challengeAction("dispatch") },
       "dispatch",
+    ),
+  )
+}
+
+function SubagentPagesProbe({
+  projectId,
+  challengeId,
+}: {
+  projectId: string
+  challengeId: string
+}) {
+  const { details, loadMoreSubagents } = useChallengeDetails(projectId, challengeId)
+  const run = details?.runs[0]
+  return createElement(
+    "div",
+    null,
+    ...(run?.subagents ?? []).map((subagent) =>
+      createElement("p", { key: subagent.id }, `${subagent.id}:${subagent.status}`),
+    ),
+    createElement(
+      "button",
+      { type: "button", onClick: () => void loadMoreSubagents("run-1") },
+      "more",
     ),
   )
 }
