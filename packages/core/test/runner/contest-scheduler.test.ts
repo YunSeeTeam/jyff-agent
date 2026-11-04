@@ -21,6 +21,11 @@ import {
   type ContestSchedulerError,
   DEFAULT_TRANSIENT_RETRY_DELAYS_MS,
 } from "../../src/orchestration/contest-scheduler.ts"
+import {
+  defaultRunSettings,
+  mergeRunSettings,
+  type RunSettings,
+} from "../../src/contracts/index.ts"
 import { RunStore } from "../../src/persistence/run-store.ts"
 import { Project } from "../../src/project/project.ts"
 import { type TestChallenge, TestPlatformPlugin } from "../fake-platform.ts"
@@ -133,6 +138,7 @@ async function fixture(
       workspace: string
       workspaceMount: DockerWorkspaceMount
     }) => Promise<void>
+    runSettings?: () => RunSettings
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "ctf-scheduler-"))
@@ -157,6 +163,7 @@ async function fixture(
       ? { removeManagedSandboxes: options.removeManagedSandboxes }
       : {}),
     ...(options.clearWorkspace ? { clearWorkspace: options.clearWorkspace } : {}),
+    ...(options.runSettings ? { runSettings: options.runSettings } : {}),
   })
   return project
 }
@@ -959,6 +966,51 @@ describe("ContestScheduler", () => {
         expect.objectContaining({ attempt: 1, status: "failed" }),
       ])
       expect(scheduler.snapshot().queued).toEqual([])
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("Run 配置被拒绝时暂停调度，不阻塞题目也不消耗尝试；修正配置后继续求解", async () => {
+    const items = [challenge(95), challenge(96)]
+    const byId = new Map(items.map((item) => [item.id, item]))
+    const tracker = new SandboxTracker()
+    let settings = mergeRunSettings(defaultRunSettings(), {
+      optimization: { blackboardReaderV2: true },
+    })
+    const project = await fixture(items, tracker, { runSettings: () => settings })
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 2,
+      retryDelayMs: 0,
+      createAgentOptions: ({ challenge: summary }) =>
+        solvingAgent(requiredChallenge(byId.get(summary.id))),
+    })
+    try {
+      await scheduler.startAuto()
+      await waitUntil(() => project.runs().length > 0 && scheduler.snapshot().active.length === 0)
+      expect(scheduler.snapshot()).toMatchObject({
+        available: false,
+        unavailableReason: expect.stringContaining("Run 配置需要人工处理"),
+      })
+      // Suspended after the first rejection, instead of failing every challenge in turn.
+      const runs = project.runs()
+      expect(runs).toHaveLength(1)
+      const rejected = runs[0]
+      if (!rejected) throw new Error("the rejected Run was not recorded")
+      expect(rejected.status).toBe("failed")
+      for (const item of items) expect(project.isChallengeBlocked(item.id)).toBe(false)
+      expect(tracker.maximum).toBe(0)
+
+      settings = defaultRunSettings()
+      scheduler.resume()
+      await scheduler.reconcile()
+      await waitUntil(() => items.every((item) => project.isChallengeSolved(item.id)), 5_000)
+      // The rejected Run stays on record; it never started, so only the solving Run counts.
+      const history = project.runs({ challengeId: rejected.challengeId })
+      expect(history.find((run) => run.id === rejected.id)?.status).toBe("failed")
+      expect(project.schedulerAttemptCount(rejected.challengeId)).toBe(1)
     } finally {
       await scheduler.shutdown()
       await project.close()

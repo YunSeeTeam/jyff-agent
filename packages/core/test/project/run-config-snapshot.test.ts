@@ -113,6 +113,7 @@ describe("Run configuration freeze", () => {
         schemaVersion: 1,
         runId: solver.runId,
         challengeId: "warmup-flag",
+        origin: "new_run",
         settings: defaultRunSettings(),
         skills: { solver: ["reverse"], subagentDefault: ["reverse"], subagentRoles: {} },
         model: {
@@ -148,7 +149,7 @@ describe("Run configuration freeze", () => {
     }
   })
 
-  it("keeps the original snapshot on resume and marks Runs without one as legacy", async () => {
+  it("keeps the original snapshot on resume", async () => {
     const root = await fixture()
     const { project } = await openProject(root)
     try {
@@ -160,34 +161,86 @@ describe("Run configuration freeze", () => {
       expect(project.runEvents(first.runId).map((event) => event.type)).toContain(
         "run_configuration_restored",
       )
-      await resumed.close("failed", "stopped again")
-
-      await rm(join(root, ".ctf-agent", "runs", first.runId, "run-config.json"))
-      const legacy = await project.resumeSolver(first.runId, { agent })
-      expect(
-        project
-          .runEvents(first.runId)
-          .find((event) => event.type === "run_configuration_legacy_resume")?.data,
-      ).toEqual({ reason: "snapshot_missing" })
-      await legacy.close("manual")
+      await resumed.close("manual")
     } finally {
       await project.close()
     }
   })
 
-  it("refuses to start a Run whose settings this build cannot honor, before any sandbox exists", async () => {
+  it("resumes a Run that started before snapshots existed with every switch off", async () => {
     const root = await fixture()
-    const settings = mergeRunSettings(defaultRunSettings(), {
+    let settings = defaultRunSettings()
+    const { project } = await openProject(root, { runSettings: () => settings })
+    try {
+      const first = await project.createSolver("warmup-flag", { agent })
+      await first.close("failed", "stopped for the test")
+      // A Run from before stage 2 has run, but has no snapshot. Today's settings
+      // would not even pass the dependency check; the legacy Run must not see them.
+      await rm(join(root, ".ctf-agent", "runs", first.runId, "run-config.json"))
+      settings = mergeRunSettings(defaultRunSettings(), {
+        optimization: { blackboardReaderV2: true },
+      })
+
+      const legacy = await project.resumeSolver(first.runId, { agent })
+      const snapshot = await snapshotOf(root, first.runId)
+      expect(snapshot).toMatchObject({ origin: "legacy_resume", settings: defaultRunSettings() })
+      expect(snapshot.runtimeProfile.sessionFormat).toBe("pi-session-v3")
+      expect(
+        project
+          .runEvents(first.runId)
+          .find((event) => event.type === "run_configuration_legacy_resume")?.data,
+      ).toMatchObject({ reason: "snapshot_missing", configHash: runConfigHash(snapshot) })
+      await legacy.close("failed", "stopped again")
+
+      // From now on the legacy Run has a snapshot like any other.
+      const again = await project.resumeSolver(first.runId, { agent })
+      expect(await snapshotOf(root, first.runId)).toEqual(snapshot)
+      const types = project.runEvents(first.runId).map((event) => event.type)
+      expect(types.filter((type) => type === "run_configuration_legacy_resume")).toHaveLength(1)
+      expect(types.lastIndexOf("run_configuration_restored")).toBeGreaterThan(
+        types.indexOf("run_configuration_legacy_resume"),
+      )
+      await again.close("manual")
+    } finally {
+      await project.close()
+    }
+  })
+
+  it("refuses a Run this build cannot honor without blocking the challenge, and freezes it once fixed", async () => {
+    const root = await fixture()
+    let settings = mergeRunSettings(defaultRunSettings(), {
       optimization: { blackboardReaderV2: true },
     })
     const { project, sandboxes } = await openProject(root, { runSettings: () => settings })
     try {
-      await expect(project.createSolver("warmup-flag", { agent })).rejects.toThrow(
-        "blackboard-reader-v2",
-      )
+      await expect(project.createSolver("warmup-flag", { agent })).rejects.toMatchObject({
+        message: expect.stringContaining("blackboard-reader-v2"),
+        blocked: false,
+        retryable: false,
+        requiresConfiguration: true,
+      })
       expect(sandboxes()).toBe(0)
       const [run] = project.runs({ challengeId: "warmup-flag" })
+      expect(run).toMatchObject({ status: "failed", closeReason: "failed" })
       expect(run?.error).toContain("optimization.blackboardReaderV2")
+      expect(project.isChallengeBlocked("warmup-flag")).toBe(false)
+      if (!run) throw new Error("the rejected Run was not recorded")
+
+      // The Run never started, so resuming it is checked like a new Run.
+      await expect(project.resumeSolver(run.id, { agent })).rejects.toMatchObject({
+        requiresConfiguration: true,
+      })
+
+      settings = defaultRunSettings()
+      const solver = await project.resumeSolver(run.id, { agent })
+      expect(await snapshotOf(root, run.id)).toMatchObject({
+        origin: "new_run",
+        settings: defaultRunSettings(),
+      })
+      const types = project.runEvents(run.id).map((event) => event.type)
+      expect(types).toContain("run_configuration_frozen")
+      expect(types).not.toContain("run_configuration_legacy_resume")
+      await solver.close("manual")
     } finally {
       await project.close()
     }

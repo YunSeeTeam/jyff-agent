@@ -11,6 +11,7 @@ import {
   runSolverPrompt,
   sessionInterruptionMessage,
 } from "./solver-attempt.ts"
+import { requiresConfiguration } from "./stop-classifier.ts"
 
 export { ChallengeTimeoutError, ContestRunnerCancelledError } from "./solver-attempt.ts"
 
@@ -47,7 +48,14 @@ export interface ChallengeRunResult {
   attempts: number
   runIds: string[]
   error?: string
-  reason?: "platform_solved" | "store_solved" | "filtered" | "attempts_exhausted" | "blocked"
+  reason?:
+    | "platform_solved"
+    | "store_solved"
+    | "filtered"
+    | "attempts_exhausted"
+    | "blocked"
+    /** The Run configuration was rejected; this says nothing about the challenge. */
+    | "configuration"
 }
 
 export interface ContestRunSummary {
@@ -343,6 +351,17 @@ export class ContestRunner {
               status: "cancelled",
               attempts,
               runIds,
+              error: lastError,
+            }
+          }
+          if (requiresConfiguration(error)) {
+            // Every further attempt would be rejected the same way.
+            return {
+              challengeId: challenge.id,
+              status: "failed",
+              attempts,
+              runIds,
+              reason: "configuration",
               error: lastError,
             }
           }

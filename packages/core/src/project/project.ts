@@ -63,6 +63,7 @@ import {
   BUILD_OPTIMIZATION_CAPABILITIES,
   buildRunConfigSnapshot,
   RUN_CONFIG_SNAPSHOT_FILE,
+  type RunConfigOrigin,
   type RunConfigSnapshot,
   RunConfigurationError,
   readRunConfigSnapshot,
@@ -241,6 +242,14 @@ export interface CreateSolverOptions {
   executionGate?: RemoteEnvironmentExecutionGate
 }
 
+interface FreezeRunConfigurationInput {
+  runId: string
+  challengeId: string
+  runDirectory: string
+  resumed: RunRecord | undefined
+  options: CreateSolverOptions
+}
+
 export class SolverCreationError extends Error {
   readonly code = "SOLVER_CREATION_FAILED"
 
@@ -250,6 +259,8 @@ export class SolverCreationError extends Error {
     readonly blocked: boolean,
     readonly retryable: boolean,
     cause: unknown,
+    /** The Run configuration was rejected; an operator has to fix the Project settings. */
+    readonly requiresConfiguration = false,
   ) {
     super(`无法创建 Solver ${runId}: ${errorText(cause)}`, { cause })
     this.name = "SolverCreationError"
@@ -1593,7 +1604,10 @@ export class Project {
       }
       const failures: unknown[] = [error, ...cleanupErrors.map((message) => new Error(message))]
       const attachmentFailure = error instanceof ChallengeAttachmentError
-      const blockImmediately = !resumed && attempt === 1 && !attachmentFailure
+      // A rejected Run configuration is the operator's to fix, not the challenge's fault.
+      const configurationFailure = error instanceof RunConfigurationError
+      const blockImmediately =
+        !resumed && attempt === 1 && !attachmentFailure && !configurationFailure
       const retryable = attachmentFailure
         ? !resumed && attempt === 1
         : !blockImmediately && isRetryablePlatformError(error)
@@ -1616,6 +1630,7 @@ export class Project {
             cleanupErrors,
             retryable,
             attachmentFailure,
+            configurationFailure,
           },
         )
         await this.persistRecord(updated, runDirectory)
@@ -1624,35 +1639,42 @@ export class Project {
       }
       const cause =
         failures.length > 1 ? new AggregateError(failures, `无法创建 Solver ${runId}`) : error
-      throw new SolverCreationError(runId, attachmentFailure, blockImmediately, retryable, cause)
+      throw new SolverCreationError(
+        runId,
+        attachmentFailure,
+        blockImmediately,
+        retryable,
+        cause,
+        configurationFailure,
+      )
     }
   }
 
   /**
    * New Runs freeze the Project settings, effective skills, role definitions,
    * model, and runtime profile into `run-config.json`; resumed Runs keep theirs.
-   * Runs created before snapshots existed resume as legacy, with history unknown.
+   * Every Run that gets past this point has a snapshot.
    */
-  private async freezeRunConfiguration(input: {
-    runId: string
-    challengeId: string
-    runDirectory: string
-    resumed: RunRecord | undefined
-    options: CreateSolverOptions
-  }): Promise<RunConfigSnapshot | undefined> {
+  private async freezeRunConfiguration(
+    input: FreezeRunConfigurationInput,
+  ): Promise<RunConfigSnapshot> {
     if (input.resumed) {
       const snapshot = await readRunConfigSnapshot(input.runDirectory)
-      if (!snapshot) {
-        this.runStore.appendEvent(input.runId, "run_configuration_legacy_resume", {
-          reason: "snapshot_missing",
+      if (snapshot) {
+        assertResumableRuntime(snapshot)
+        this.runStore.appendEvent(input.runId, "run_configuration_restored", {
+          configHash: runConfigHash(snapshot),
         })
-        return undefined
+        return snapshot
       }
-      assertResumableRuntime(snapshot)
-      this.runStore.appendEvent(input.runId, "run_configuration_restored", {
-        configHash: runConfigHash(snapshot),
-      })
-      return snapshot
+      if (this.runHasStarted(input.runId)) {
+        // Started before snapshots existed, so it ran with every switch off. It
+        // keeps running that way rather than switching to today's settings halfway.
+        return this.publishRunConfiguration(input, defaultRunSettings(), "legacy_resume")
+      }
+      // Creation failed before the Run ever started (for example on a rejected
+      // configuration), so there is no history to keep: freeze it as a new Run,
+      // dependency checks included.
     }
     const settings = this.runSettings()
     const issues = configurationDependencyIssues(settings, BUILD_OPTIMIZATION_CAPABILITIES)
@@ -1662,6 +1684,20 @@ export class Project {
         issues.map((issue) => issue.message).join("; "),
       )
     }
+    return this.publishRunConfiguration(input, settings, "new_run")
+  }
+
+  private runHasStarted(runId: string): boolean {
+    return this.runStore
+      .events(runId)
+      .some((event) => event.type === "run_started" || event.type === "run_resumed")
+  }
+
+  private async publishRunConfiguration(
+    input: FreezeRunConfigurationInput,
+    settings: RunSettings,
+    origin: RunConfigOrigin,
+  ): Promise<RunConfigSnapshot> {
     const model = input.options.agent.initialState?.model
     const requested =
       input.options.agent.initialState?.thinkingLevel ?? DEFAULT_SOLVER_THINKING_LEVEL
@@ -1677,16 +1713,23 @@ export class Project {
         privileged: this.config.sandbox.privileged,
         networkMode: solverSandboxNetworkMode(this.platform, this.config.sandbox.networkMode),
       },
+      origin,
     })
     const { configHash } = await writeRunConfigSnapshot(input.runDirectory, snapshot)
-    this.runStore.appendEvent(input.runId, "run_configuration_frozen", {
-      configHash,
-      path: `runs/${input.runId}/${RUN_CONFIG_SNAPSHOT_FILE}`,
-      adapterId: snapshot.runtimeProfile.adapterId,
-      sessionFormat: snapshot.runtimeProfile.sessionFormat,
-      packages: snapshot.runtimeProfile.packages,
-      lockfileSha256: snapshot.runtimeProfile.lockfileSha256,
-    })
+    const legacy = origin === "legacy_resume"
+    this.runStore.appendEvent(
+      input.runId,
+      legacy ? "run_configuration_legacy_resume" : "run_configuration_frozen",
+      {
+        ...(legacy ? { reason: "snapshot_missing" } : {}),
+        configHash,
+        path: `runs/${input.runId}/${RUN_CONFIG_SNAPSHOT_FILE}`,
+        adapterId: snapshot.runtimeProfile.adapterId,
+        sessionFormat: snapshot.runtimeProfile.sessionFormat,
+        packages: snapshot.runtimeProfile.packages,
+        lockfileSha256: snapshot.runtimeProfile.lockfileSha256,
+      },
+    )
     return snapshot
   }
 

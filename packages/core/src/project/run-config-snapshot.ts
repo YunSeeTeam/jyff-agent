@@ -36,11 +36,20 @@ export interface RuntimeProfile extends AgentRuntimeProfile {
   optimizationCapabilities: string[]
 }
 
+/**
+ * `new_run`: frozen from the Project settings before the Run first started.
+ * `legacy_resume`: the Run started before snapshots existed. It ran with every
+ * switch off and keeps doing so; the runtime profile is the one resuming it,
+ * since from then on that runtime writes its session.
+ */
+export type RunConfigOrigin = "new_run" | "legacy_resume"
+
 export interface RunConfigSnapshot {
   schemaVersion: 1
   runId: string
   challengeId: string
   frozenAt: string
+  origin: RunConfigOrigin
   settings: RunSettings
   /** Skill names each agent may see after expanding `all` against the discovered skills. */
   skills: {
@@ -79,6 +88,9 @@ export interface RunConfigSnapshot {
 
 /** Raised before a Run starts when its frozen configuration cannot be honored. */
 export class RunConfigurationError extends Error {
+  /** Only an operator can fix the Project settings; schedulers must not retry or block on it. */
+  readonly requiresConfiguration = true
+
   constructor(
     readonly code: "configuration_dependency_error" | "capability_unavailable",
     message: string,
@@ -165,6 +177,8 @@ export interface BuildRunConfigSnapshotInput {
   model: Model<Api> | undefined
   thinkingLevel: ThinkingLevel
   sandbox: { privileged: boolean; networkMode: string }
+  /** Defaults to `new_run`. */
+  origin?: RunConfigOrigin
 }
 
 /** Freeze the configuration a new Run starts with. Unknown skill names fail the Run before it starts. */
@@ -198,6 +212,7 @@ export async function buildRunConfigSnapshot(
     runId: input.runId,
     challengeId: input.challengeId,
     frozenAt: new Date().toISOString(),
+    origin: input.origin ?? "new_run",
     settings: structuredClone(input.settings),
     skills: { solver: solver.names, subagentDefault: subagentDefault.names, subagentRoles },
     subagentRoles: [...input.subagentRoles.values()]

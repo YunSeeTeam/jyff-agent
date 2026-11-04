@@ -10,6 +10,7 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux"
 import { afterEach, describe, expect, it } from "vite-plus/test"
+import { defaultRunSettings, mergeRunSettings } from "../../src/contracts/index.ts"
 import { ContestRunner } from "../../src/orchestration/contest-runner.js"
 import { Project } from "../../src/project/project.js"
 import { type TestChallenge, TestPlatformPlugin } from "../fake-platform.ts"
@@ -52,7 +53,11 @@ class SandboxTracker {
   }
 }
 
-async function projectFixture(challenges: TestChallenge[], tracker: SandboxTracker) {
+async function projectFixture(
+  challenges: TestChallenge[],
+  tracker: SandboxTracker,
+  options: Partial<Parameters<typeof Project.open>[0]> = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "ctf-runner-"))
   roots.push(root)
   await mkdir(join(root, ".pi"), { recursive: true })
@@ -70,6 +75,7 @@ async function projectFixture(challenges: TestChallenge[], tracker: SandboxTrack
     root,
     platforms: [plugin],
     sandboxFactory: tracker.create,
+    ...options,
   })
   return { project, plugin }
 }
@@ -171,6 +177,37 @@ describe("ContestRunner", () => {
       expect(runs.filter((run) => run.status === "blocked")).toHaveLength(1)
       expect(runs.filter((run) => run.status === "interrupted")).toHaveLength(0)
       expect(runs.every((run) => !["preparing", "running"].includes(run.status))).toBe(true)
+    } finally {
+      await project.close()
+    }
+  })
+
+  it("Run 配置被拒绝时立即结束该题，不重试、不阻塞，也不算作未解出", async () => {
+    const items = [challenge(150), challenge(151)]
+    const byId = new Map(items.map((item) => [item.id, item]))
+    const tracker = new SandboxTracker()
+    const settings = mergeRunSettings(defaultRunSettings(), {
+      optimization: { blackboardReaderV2: true },
+    })
+    const { project } = await projectFixture(items, tracker, { runSettings: () => settings })
+    try {
+      const runner = new ContestRunner(project, {
+        maxConcurrent: 1,
+        maxAttempts: 3,
+        retryDelayMs: 1,
+        createAgentOptions: ({ challenge: summary, attempt }) =>
+          solvingAgent(requiredChallenge(byId.get(summary.id)), attempt),
+      })
+      const summary = await runner.run()
+
+      expect(summary.results).toHaveLength(2)
+      for (const result of summary.results) {
+        expect(result).toMatchObject({ status: "failed", reason: "configuration", attempts: 1 })
+        expect(result.error).toContain("blackboard-reader-v2")
+        expect(project.isChallengeBlocked(result.challengeId)).toBe(false)
+      }
+      expect(project.runs()).toHaveLength(2)
+      expect(tracker.created).toBe(0)
     } finally {
       await project.close()
     }

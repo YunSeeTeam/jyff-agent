@@ -1,7 +1,34 @@
 import { describe, expect, it } from "vite-plus/test"
 import { classifySolverStop } from "../../src/orchestration/stop-classifier.ts"
+import { SolverCreationError } from "../../src/project/project.ts"
+import { RunConfigurationError } from "../../src/project/run-config-snapshot.ts"
 
 describe("classifySolverStop", () => {
+  it("被拒绝的 Run 配置交给操作者处理，不重试也不计入阻塞", () => {
+    const rejected = new RunConfigurationError(
+      "configuration_dependency_error",
+      "optimization.blackboardReaderV2 requires the blackboard-reader-v2 capability",
+    )
+    const expected = {
+      kind: "run_configuration",
+      blockDelta: 0,
+      retryable: false,
+      requiresConfiguration: true,
+    }
+    expect(classifySolverStop({ error: rejected })).toMatchObject(expected)
+    // Project wraps it; the wrapper carries its own error code.
+    expect(
+      classifySolverStop({
+        error: new SolverCreationError("run-1", false, false, false, rejected, true),
+      }),
+    ).toMatchObject(expected)
+    expect(
+      classifySolverStop({
+        error: new SolverCreationError("run-1", false, false, false, new Error("bind failed")),
+      }),
+    ).toMatchObject({ kind: "protocol_or_non_transient", requiresConfiguration: false })
+  })
+
   it("区分同为 429 的临时限流和免费额度耗尽", () => {
     expect(
       classifySolverStop({

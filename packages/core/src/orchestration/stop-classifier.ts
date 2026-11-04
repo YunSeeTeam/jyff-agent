@@ -2,6 +2,7 @@ export type SolverStopKind =
   | "network_transient"
   | "provider_transient"
   | "authentication_or_configuration"
+  | "run_configuration"
   | "model_stop"
   | "length"
   | "protocol_or_non_transient"
@@ -50,6 +51,10 @@ export function classifySolverStop(input: ClassifySolverStopInput): SolverStopCl
   if (input.timedOut) return classification("timeout", 1, false)
 
   const facts = errorFacts(input.error)
+  // 被拒绝的 Run 配置只能由操作者修正；重试或计入阻塞都只会让每道题以同样方式失败。
+  if (requiresConfiguration(input.error)) {
+    return classification("run_configuration", 0, false, facts.detail, true)
+  }
   // 配额/账单耗尽不会自行恢复。必须在将 HTTP 429 视作短暂限流前识别它们，
   // 但不能仅凭状态码判断：普通速率限制同样使用 429，仍应有限退避重试。
   if (
@@ -115,6 +120,15 @@ function classification(
     requiresConfiguration,
     ...(detail ? { detail } : {}),
   }
+}
+
+/** Errors that only an operator can fix carry `requiresConfiguration: true`. */
+export function requiresConfiguration(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { requiresConfiguration?: unknown }).requiresConfiguration === true
+  )
 }
 
 function errorFacts(error: unknown): {

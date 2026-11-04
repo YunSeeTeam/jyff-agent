@@ -1290,7 +1290,11 @@ export class ContestScheduler {
             : "failed"
         failureMessage = classification.detail ?? errorText(error)
         if (classification.requiresConfiguration) {
-          this.suspend(`LLM 服务需要人工处理: ${failureMessage}`)
+          this.suspend(
+            classification.kind === "run_configuration"
+              ? `Run 配置需要人工处理: ${failureMessage}`
+              : `LLM 服务需要人工处理: ${failureMessage}`,
+          )
         }
         if (
           solver &&

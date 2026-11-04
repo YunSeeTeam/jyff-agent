@@ -1743,7 +1743,11 @@ export class RunStore {
                 ) = 0
               )
             )
-            AND json_extract(run_events.data_json, '$.retryable') = 1
+            AND (
+              json_extract(run_events.data_json, '$.retryable') = 1
+              -- A Run rejected by its configuration never started; it is not an attempt.
+              OR json_extract(run_events.data_json, '$.configurationFailure') = 1
+            )
         )
     `)
       .get(challengeId) as { attempts: number }
