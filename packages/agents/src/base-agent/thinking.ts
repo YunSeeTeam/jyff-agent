@@ -1,5 +1,10 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core"
-import { type Api, clampThinkingLevel, type Model } from "@earendil-works/pi-ai"
+import {
+  type Api,
+  clampThinkingLevel,
+  getSupportedThinkingLevels,
+  type Model,
+} from "@earendil-works/pi-ai"
 
 /** Solver 的产品级默认值；具体模型仍由 Pi clamp 到其支持的档位。 */
 export const DEFAULT_SOLVER_THINKING_LEVEL = "medium" satisfies ThinkingLevel
@@ -22,4 +27,9 @@ export function isThinkingLevel(value: unknown): value is ThinkingLevel {
 /** Apply Pi's model-specific thinking-level support and mapping rules. */
 export function resolveThinkingLevel(model: Model<Api>, requested: ThinkingLevel): ThinkingLevel {
   return clampThinkingLevel(model, requested)
+}
+
+/** Thinking levels the model actually supports after Pi's mapping rules. */
+export function supportedThinkingLevels(model: Model<Api>): ThinkingLevel[] {
+  return getSupportedThinkingLevels(model) as ThinkingLevel[]
 }

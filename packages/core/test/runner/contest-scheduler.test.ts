@@ -385,7 +385,11 @@ describe("ContestScheduler", () => {
       expect(faux.state.callCount).toBe(1)
       await expect(scheduler.dispatch(item.id)).rejects.toMatchObject({ code: "already_solved" })
     } finally {
-      await scheduler.shutdown()
+      // Every sandbox in this test fails to close, so shutdown may report that
+      // cleanup failure again; the checks below still catch any second attempt.
+      await scheduler.shutdown().catch(() => undefined)
+      expect(project.runs({ challengeId: item.id })).toHaveLength(1)
+      expect(faux.state.callCount).toBe(1)
       await project.close()
     }
   })

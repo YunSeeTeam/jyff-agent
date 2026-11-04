@@ -6,6 +6,7 @@ import {
   type BaseAgentEvent,
   CtfSolverAgent,
   CtfTldrAgent,
+  DEFAULT_SOLVER_THINKING_LEVEL,
   type DiscoveredSubagentRoles,
   discoverProjectSkillsWithDiagnostics,
   discoverSubagentRoles,
@@ -52,6 +53,22 @@ import type {
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core"
 import { extractAssistantText, extractThinkingText } from "../agent/thinking.ts"
+import {
+  configurationDependencyIssues,
+  defaultRunSettings,
+  type RunSettings,
+} from "../contracts/index.ts"
+import {
+  assertResumableRuntime,
+  BUILD_OPTIMIZATION_CAPABILITIES,
+  buildRunConfigSnapshot,
+  RUN_CONFIG_SNAPSHOT_FILE,
+  type RunConfigSnapshot,
+  RunConfigurationError,
+  readRunConfigSnapshot,
+  runConfigHash,
+  writeRunConfigSnapshot,
+} from "./run-config-snapshot.ts"
 import {
   BLACKBOARD_INJECTION_MAX_CHARACTERS,
   createBlackboardTools,
@@ -175,6 +192,8 @@ export interface OpenProjectOptions {
     relativeWorkspace: string
   }) => DockerWorkspaceMount
   telemetry?: ProjectTelemetryOptions
+  /** Current Project run settings; each new Run freezes them before it starts. */
+  runSettings?: () => RunSettings
   subagents?: {
     maxConcurrent?: number
     /** WebUI 的模型池可在创建新 Run 时覆盖 role frontmatter 中的 model。 */
@@ -289,6 +308,7 @@ export class Project {
     },
     private readonly localOnly: boolean,
     diagnostics: readonly ProjectDiagnostic[],
+    private readonly runSettings: () => RunSettings,
   ) {
     this.root = root
     this.config = config
@@ -408,6 +428,7 @@ export class Project {
             createdAt: new Date().toISOString(),
           })),
         ],
+        options.runSettings ?? defaultRunSettings,
       )
     } catch (error) {
       const failures: unknown[] = [error]
@@ -1201,6 +1222,7 @@ export class Project {
     // 提升到 try 之外，使创建失败路径的 catch 也能回收会话（闭包经 onBeforeCleanup 使用）。
     let shellpoopSession: ShellPoopSession | undefined
     try {
+      await this.freezeRunConfiguration({ runId, challengeId, runDirectory, resumed, options })
       capability = await this.platform.bindChallenge(challengeId)
       const challenge = await capability.getInfo()
       this.challengeSchedulingHints.set(challengeId, {
@@ -1604,6 +1626,68 @@ export class Project {
         failures.length > 1 ? new AggregateError(failures, `无法创建 Solver ${runId}`) : error
       throw new SolverCreationError(runId, attachmentFailure, blockImmediately, retryable, cause)
     }
+  }
+
+  /**
+   * New Runs freeze the Project settings, effective skills, role definitions,
+   * model, and runtime profile into `run-config.json`; resumed Runs keep theirs.
+   * Runs created before snapshots existed resume as legacy, with history unknown.
+   */
+  private async freezeRunConfiguration(input: {
+    runId: string
+    challengeId: string
+    runDirectory: string
+    resumed: RunRecord | undefined
+    options: CreateSolverOptions
+  }): Promise<RunConfigSnapshot | undefined> {
+    if (input.resumed) {
+      const snapshot = await readRunConfigSnapshot(input.runDirectory)
+      if (!snapshot) {
+        this.runStore.appendEvent(input.runId, "run_configuration_legacy_resume", {
+          reason: "snapshot_missing",
+        })
+        return undefined
+      }
+      assertResumableRuntime(snapshot)
+      this.runStore.appendEvent(input.runId, "run_configuration_restored", {
+        configHash: runConfigHash(snapshot),
+      })
+      return snapshot
+    }
+    const settings = this.runSettings()
+    const issues = configurationDependencyIssues(settings, BUILD_OPTIMIZATION_CAPABILITIES)
+    if (issues.length > 0) {
+      throw new RunConfigurationError(
+        "configuration_dependency_error",
+        issues.map((issue) => issue.message).join("; "),
+      )
+    }
+    const model = input.options.agent.initialState?.model
+    const requested =
+      input.options.agent.initialState?.thinkingLevel ?? DEFAULT_SOLVER_THINKING_LEVEL
+    const snapshot = await buildRunConfigSnapshot({
+      runId: input.runId,
+      challengeId: input.challengeId,
+      settings,
+      skills: this.skills,
+      subagentRoles: this.configuredSubagentRoles(),
+      model,
+      thinkingLevel: model ? resolveThinkingLevel(model, requested) : requested,
+      sandbox: {
+        privileged: this.config.sandbox.privileged,
+        networkMode: solverSandboxNetworkMode(this.platform, this.config.sandbox.networkMode),
+      },
+    })
+    const { configHash } = await writeRunConfigSnapshot(input.runDirectory, snapshot)
+    this.runStore.appendEvent(input.runId, "run_configuration_frozen", {
+      configHash,
+      path: `runs/${input.runId}/${RUN_CONFIG_SNAPSHOT_FILE}`,
+      adapterId: snapshot.runtimeProfile.adapterId,
+      sessionFormat: snapshot.runtimeProfile.sessionFormat,
+      packages: snapshot.runtimeProfile.packages,
+      lockfileSha256: snapshot.runtimeProfile.lockfileSha256,
+    })
+    return snapshot
   }
 
   private relativeWorkspace(challengeId: string): string {

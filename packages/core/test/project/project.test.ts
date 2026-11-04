@@ -440,6 +440,7 @@ describe("Project", () => {
     ).resolves.toBeUndefined()
     expect(project.runEvents(solver.runId).map((event) => event.type)).toEqual([
       "run_created",
+      "run_configuration_frozen",
       "run_started",
       "run_finished",
     ])
