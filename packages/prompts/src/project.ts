@@ -57,8 +57,9 @@ export function challengeAnnouncementsPrompt(
   ].join("\n")
 }
 
-export function activeSubagentsPrompt(records: readonly unknown[]): string {
-  const payload = JSON.stringify(records)
+/** A bounded SubAgent snapshot as JSON; callers pass a projection, never raw records. */
+export function activeSubagentsPrompt(snapshot: unknown): string {
+  const payload = JSON.stringify(snapshot)
     .replaceAll("&", "\\u0026")
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
@@ -74,13 +75,27 @@ export function subagentCompletionNotificationPrompt(notification: {
   role: string
   status: string
   output: string
+  /** Set when `output` is the first page of a longer report. */
+  resultVersion?: string
+  totalLength?: number
+  nextOffset?: number
 }): string {
+  const paging =
+    notification.nextOffset === undefined
+      ? []
+      : [
+          `  <result_version>${xml(notification.resultVersion ?? "")}</result_version>`,
+          `  <total_length>${notification.totalLength ?? ""}</total_length>`,
+          `  <next_offset>${notification.nextOffset}</next_offset>`,
+          "  <continue>Read the rest with get_subagent_result, passing offset=next_offset and expected_result_version=result_version.</continue>",
+        ]
   return [
     "<subagent_notification>",
     `  <id>${xml(notification.id)}</id>`,
     `  <role>${xml(notification.role)}</role>`,
     `  <status>${xml(notification.status)}</status>`,
     `  <output>${xml(notification.output)}</output>`,
+    ...paging,
     "</subagent_notification>",
   ].join("\n")
 }

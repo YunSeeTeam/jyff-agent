@@ -1,12 +1,16 @@
 import type { CtfSolverAgent, SolverCloseReason } from "@ctf-agent/agents"
 import type { ChallengeSummary } from "@ctf-agent/platform"
 import {
-  activeSubagentsPrompt,
   BLOCKED_FINALIZATION_PROMPT,
   INCOMPLETE_CONTINUATION_PROMPT,
   WRITEUP_PROMPT,
 } from "@ctf-agent/prompts"
 import type { AgentOptions } from "@earendil-works/pi-agent-core"
+import {
+  SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+  subagentSnapshot,
+  subagentSnapshotPrompt,
+} from "../collaboration/subagent-projection.ts"
 import type {
   RunRecord,
   RunSource,
@@ -1543,7 +1547,11 @@ export class ContestScheduler {
         // 否则 WebUI 会把整条消息误识别为 active_subagents 卡片。
         prompt: [
           "<blocked_finalization>",
-          activeSubagentsPrompt(records),
+          subagentSnapshotPrompt(
+            subagentSnapshot(solver.runId, records, {
+              previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+            }),
+          ),
           BLOCKED_FINALIZATION_PROMPT,
           "</blocked_finalization>",
         ].join("\n\n"),

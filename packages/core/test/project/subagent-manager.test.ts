@@ -9,7 +9,7 @@ import {
   type Sandbox,
 } from "@ctf-agent/agents"
 import type { CommandResult, SandboxExecOptions } from "@ctf-agent/sandbox"
-import type { AgentOptions } from "@earendil-works/pi-agent-core"
+import type { AgentOptions, AgentToolResult } from "@earendil-works/pi-agent-core"
 import {
   createFauxCore,
   fauxAssistantMessage,
@@ -98,6 +98,128 @@ describe("CtfSubagentManager", () => {
     expect(parent.steered[0]).toContain(`<id>${created.id}</id>`)
     expect(parent.steered[0]).toContain("verified offset &lt; 0x40")
     expect(parent.followedUp).toEqual([])
+    await manager.close()
+  })
+
+  it("单结果出口保留旧 8000 前缀尾部的候选，封套有界且不带 prompt（T18）", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ctf-subagent-prefix-"))
+    roots.push(root)
+    const report = `${"界".repeat(7_980)}FLAG{tail-candidate}`
+    expect(report.length).toBe(8_000)
+    const faux = createFauxCore({ provider: "subagent-prefix" })
+    faux.setResponses([fauxAssistantMessage(report)])
+    const discovered = await discoverSubagentRoles(root)
+    const parent = fakeParent()
+    const manager = new CtfSubagentManager({
+      projectId: "test",
+      runId: "run-prefix",
+      runDirectory: root,
+      challenge,
+      sandbox: new MemorySandbox(),
+      agent: {
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      },
+      roles: discovered.roles,
+    })
+    manager.attachParent(parent.agent)
+    const tools = createSubagentManagerTools(manager)
+    const launch = tools.find((tool) => tool.name === "Agent")
+    const get = tools.find((tool) => tool.name === "get_subagent_result")
+    if (!launch || !get) throw new Error("SubAgent 工具未创建")
+    const prompt = `${"P".repeat(31_990)}END-PROMPT`
+
+    const launched = await launch.execute("launch", {
+      subagent_type: "general-purpose",
+      prompt,
+      description: "prefix check",
+      run_in_background: true,
+    })
+    const id = launched.details.id
+    if (typeof id !== "string") throw new Error("SubAgent ID 缺失")
+    expect(textOf(launched)).not.toContain("END-PROMPT")
+    await manager.wait(id)
+    await waitFor(() => parent.steered.length === 1)
+
+    const notification = parent.steered[0] ?? ""
+    expect(notification).toContain("FLAG{tail-candidate}")
+    expect(notification).not.toContain("<next_offset>")
+    expect(Buffer.byteLength(notification)).toBeLessThanOrEqual(96 * 1024)
+
+    const read = await get.execute("read", { agent_id: id })
+    const body = textOf(read)
+    expect(JSON.parse(body)).toMatchObject({
+      agentId: id,
+      status: "completed",
+      result: report,
+      hasMore: false,
+    })
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(96 * 1024)
+    expect(body).not.toContain("END-PROMPT")
+    // details are kept in the session and shown by the WebUI: identifiers and counts only.
+    expect(JSON.stringify(read.details)).not.toContain("界")
+    expect(read.details).toMatchObject({ id, totalLength: 8_000, hasMore: false })
+
+    const refused = await get.execute("refused", { agent_id: id, offset: 10 })
+    expect(refused.isError).toBe(true)
+    expect(JSON.parse(textOf(refused))).toMatchObject({ error: { code: "invalid_query" } })
+    await manager.close()
+  })
+
+  it("list_subagents 按页枚举全部子任务，每页不超过 16 KiB（T19）", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ctf-subagent-list-"))
+    roots.push(root)
+    const faux = createFauxCore({ provider: "subagent-list" })
+    faux.setResponses(
+      Array.from({ length: 40 }, (_, index) =>
+        fauxAssistantMessage(`${index}:${"報".repeat(7_000)}`),
+      ),
+    )
+    const discovered = await discoverSubagentRoles(root)
+    const manager = new CtfSubagentManager({
+      projectId: "test",
+      runId: "run-list",
+      runDirectory: root,
+      challenge,
+      sandbox: new MemorySandbox(),
+      agent: {
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      },
+      roles: discovered.roles,
+    })
+    const created = []
+    for (let index = 0; index < 40; index++) {
+      created.push(
+        manager.spawn({
+          role: "general-purpose",
+          prompt: `${"Q".repeat(31_000)} worker ${index}`,
+          description: `${"任".repeat(240)}`,
+          background: true,
+        }),
+      )
+      // Distinct creation times keep the expected order unambiguous.
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    await Promise.all(created.map((record) => manager.wait(record.id)))
+    const list = createSubagentManagerTools(manager).find((tool) => tool.name === "list_subagents")
+    if (!list) throw new Error("list_subagents 未创建")
+
+    const seen: string[] = []
+    let cursor: string | undefined
+    for (let pages = 0; pages < 100; pages++) {
+      const result = await list.execute(`list-${pages}`, cursor ? { cursor } : {})
+      const body = textOf(result)
+      expect(Buffer.byteLength(body)).toBeLessThanOrEqual(16 * 1024)
+      expect(body).not.toContain("QQQQ")
+      const page = JSON.parse(body) as { items: Array<{ id: string }>; nextCursor?: string }
+      expect(page.items.length).toBeGreaterThan(0)
+      expect(result.details.ids).toEqual(page.items.map((item) => item.id))
+      seen.push(...page.items.map((item) => item.id))
+      cursor = page.nextCursor
+      if (!cursor) break
+    }
+    expect(seen).toEqual(created.map((record) => record.id))
     await manager.close()
   })
 
@@ -507,6 +629,11 @@ describe("CtfSubagentManager", () => {
     ).toThrow("正在收尾或关闭")
   })
 })
+
+function textOf(result: AgentToolResult<unknown>): string {
+  const [first] = result.content
+  return first?.type === "text" ? first.text : ""
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs

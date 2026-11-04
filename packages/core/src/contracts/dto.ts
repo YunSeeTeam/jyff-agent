@@ -14,6 +14,11 @@ export const SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS = 8_000
 export const SUBAGENT_RESULT_ENVELOPE_MAX_BYTES = 96 * 1024
 /** Per-item preview in lists, snapshots, and blocked finalization. */
 export const SUBAGENT_LIST_PREVIEW_MAX_CODE_POINTS = 1_200
+/** Fields around the report are cut first, so they never squeeze the promised first page. */
+export const SUBAGENT_TASK_MAX_CODE_POINTS = 240
+export const SUBAGENT_PAGE_ERROR_MAX_CODE_POINTS = 2_000
+export const SUBAGENT_LIST_ERROR_MAX_CODE_POINTS = 200
+export const SUBAGENT_ACTIVE_TOOL_MAX_CODE_POINTS = 64
 export const SUBAGENT_LIST_MAX_BYTES = 16 * 1024
 export const SUBAGENT_LIST_DEFAULT_LIMIT = 16
 export const SUBAGENT_LIST_MAX_LIMIT = 32
@@ -38,10 +43,21 @@ export interface SubagentSummaryDto {
   updatedAt: string
   startedAt?: string
   completedAt?: string
-  usage: { turns: number; toolUses: number; totalTokens: number }
+  usage: {
+    turns: number
+    toolUses: number
+    totalTokens: number
+    inputTokens?: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+  }
   /** Task description, cut to a bounded number of code points. */
   task: string
   taskTruncated: boolean
+  /** Tool running right now, if any. */
+  activeTool?: string
+  /** Failure text, cut short; the report page carries a longer form. */
+  errorMessage?: string
   resultPreview?: string
   resultKind?: SubagentResultKind
   resultVersion?: string
@@ -60,12 +76,17 @@ export interface SubagentListPageDto {
   omittedCount: number
 }
 
+/** Why a page has no report text: still working, or ended without one. */
+export type SubagentResultState = "result_pending" | "result_unavailable"
+
 export interface SubagentResultPageDto {
   schemaVersion: 2
   agentId: string
   /** Absent for legacy records written before execution identities existed. */
   executionId?: string
   status: string
+  /** Present only when there is no report text yet or at all. */
+  state?: SubagentResultState
   resultKind?: SubagentResultKind
   resultVersion: string
   /** Code point offset of this page. */
@@ -74,6 +95,8 @@ export interface SubagentResultPageDto {
   totalLength: number
   nextOffset?: number
   hasMore: boolean
+  /** Failure text, bounded separately from the report. Not named `error`: that key marks an error envelope. */
+  errorMessage?: string
 }
 
 export interface SubagentResultQuery {

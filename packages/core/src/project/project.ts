@@ -26,7 +26,6 @@ import {
   type RemoteEnvironment,
 } from "@ctf-agent/platform"
 import {
-  activeSubagentsPrompt,
   blackboardSnapshotPrompt,
   challengeAnnouncementsPrompt,
   challengeContextPrompt,
@@ -57,6 +56,10 @@ import {
   configurationDependencyIssues,
   defaultRunSettings,
   type RunSettings,
+  type SubagentListPageDto,
+  type SubagentResultPageDto,
+  type SubagentResultQuery,
+  type ToolErrorEnvelope,
 } from "../contracts/index.ts"
 import {
   assertResumableRuntime,
@@ -80,6 +83,13 @@ import {
   createSubagentManagerTools,
   type SubagentRecord,
 } from "../collaboration/subagent-manager.ts"
+import {
+  SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+  subagentListPage,
+  subagentSnapshot,
+  subagentSnapshotPrompt,
+} from "../collaboration/subagent-projection.ts"
+import { subagentResultPage } from "../collaboration/subagent-report.ts"
 import {
   announcementRevision,
   classifyAnnouncement,
@@ -902,6 +912,24 @@ export class Project {
   subagents(runId: string): SubagentRecord[] {
     return this.runStore.subagents(runId)
   }
+  /** One bounded page of a Run's SubAgents, the same projection the model reads. */
+  subagentPage(
+    runId: string,
+    query: { cursor?: string; limit?: number },
+  ): SubagentListPageDto | ToolErrorEnvelope {
+    return subagentListPage(runId, this.runStore.subagents(runId), query, {
+      previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+    })
+  }
+  /** One page of a SubAgent report, or undefined when the Run has no such SubAgent. */
+  subagentResult(
+    runId: string,
+    query: SubagentResultQuery,
+  ): SubagentResultPageDto | ToolErrorEnvelope | undefined {
+    const { agentId, ...page } = query
+    const record = this.runStore.subagents(runId).find((candidate) => candidate.id === agentId)
+    return record ? subagentResultPage(record, page) : undefined
+  }
   compactRecoveryPrompt(challengeId: string, runId: string): string {
     const challengeContext = this.runChallengeContexts.get(runId)
     if (!challengeContext) {
@@ -920,7 +948,11 @@ export class Project {
         : []),
       ...(blackboard ? [blackboard] : []),
       challengeAnnouncementsPrompt(announcements),
-      activeSubagentsPrompt(subagents),
+      subagentSnapshotPrompt(
+        subagentSnapshot(runId, subagents, {
+          previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+        }),
+      ),
     ].join("\n\n")
   }
   availableSubagents(): SubagentRole[] {

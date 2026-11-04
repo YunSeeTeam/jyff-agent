@@ -17,6 +17,15 @@ import { DockerExecutionEnv } from "@ctf-agent/sandbox"
 import type { AgentOptions, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
 import { extractAssistantText } from "../agent/thinking.ts"
+import {
+  SUBAGENT_LIST_MAX_LIMIT,
+  SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS,
+  type SubagentListPageDto,
+  type SubagentResultPageDto,
+  type ToolErrorEnvelope,
+} from "../contracts/index.ts"
+import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentListPage } from "./subagent-projection.ts"
+import { firstSubagentResultPage, subagentResultPage } from "./subagent-report.ts"
 
 export type SubagentStatus =
   | "queued"
@@ -268,6 +277,13 @@ export class CtfSubagentManager {
     return [...this.records.values()]
       .map(({ record }) => snapshot(record))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  }
+
+  /** One bounded page of this Run's SubAgents, as the model sees it. */
+  listPage(query: { cursor?: string; limit?: number }): SubagentListPageDto | ToolErrorEnvelope {
+    return subagentListPage(this.options.runId, this.list(), query, {
+      previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
+    })
   }
 
   async wait(id: string, signal?: AbortSignal): Promise<SubagentRecord> {
@@ -601,11 +617,19 @@ export class CtfSubagentManager {
   private async notifyParent(record: SubagentRecord): Promise<void> {
     const parent = this.parent
     if (!parent || parent.isClosed) return
+    const page = firstSubagentResultPage(record)
     const notification = {
       id: record.id,
       role: record.role,
       status: record.status,
-      output: (record.result ?? record.error ?? "No output").slice(0, 16_000),
+      output: page.result || page.errorMessage || "No output",
+      ...(page.nextOffset === undefined
+        ? {}
+        : {
+            resultVersion: page.resultVersion,
+            totalLength: page.totalLength,
+            nextOffset: page.nextOffset,
+          }),
     }
     await parent.promptOrSteer(subagentCompletionNotificationPrompt(notification))
   }
@@ -668,9 +692,10 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           resume?: string
         }
         const background = params.run_in_background === true
+        const extra: Record<string, boolean> = background ? { background: true } : {}
         if (params.resume) {
           const record = await manager.resume(params.resume, params.prompt, background)
-          return toolResult(record)
+          return pageToolResult(firstSubagentResultPage(record), extra)
         }
         const record = manager.spawn({
           role: params.subagent_type,
@@ -678,24 +703,41 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           description: params.description,
           background,
         })
-        return toolResult(background ? record : await manager.wait(record.id, signal))
+        return pageToolResult(
+          firstSubagentResultPage(background ? record : await manager.wait(record.id, signal)),
+          extra,
+        )
       },
     },
     {
       name: "get_subagent_result",
       label: "Get SubAgent Result",
-      description:
-        "Read or wait for a background SubAgent result. Waiting stops when the parent receives a steer unless interrupt_on_steer is false; the worker keeps running.",
+      description: `Read or wait for a background SubAgent result, one page of at most ${SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS} code points. When hasMore is true, call again with offset=nextOffset and expected_result_version=resultVersion; a result_changed error means the report changed, so read again from offset 0. Waiting stops when the parent receives a steer unless interrupt_on_steer is false; the worker keeps running.`,
       parameters: Type.Object({
         agent_id: Type.String(),
         wait: Type.Optional(Type.Boolean()),
         interrupt_on_steer: Type.Optional(Type.Boolean()),
+        offset: Type.Optional(Type.Integer({ minimum: 0 })),
+        limit: Type.Optional(
+          Type.Integer({ minimum: 1, maximum: SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS }),
+        ),
+        expected_result_version: Type.Optional(Type.String({ maxLength: 128 })),
       }),
       async execute(_id, raw, signal) {
         const params = raw as {
           agent_id: string
           wait?: boolean
           interrupt_on_steer?: boolean
+          offset?: number
+          limit?: number
+          expected_result_version?: string
+        }
+        const query = {
+          ...(params.offset === undefined ? {} : { offset: params.offset }),
+          ...(params.limit === undefined ? {} : { limit: params.limit }),
+          ...(params.expected_result_version === undefined
+            ? {}
+            : { expectedResultVersion: params.expected_result_version }),
         }
         if (params.wait) {
           const waited = await manager.waitForTool(
@@ -703,15 +745,17 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
             signal,
             params.interrupt_on_steer !== false,
           )
-          return toolResult({
-            ...waited.record,
+          const page = subagentResultPage(waited.record, query)
+          if ("error" in page) return errorToolResult(page)
+          return pageToolResult(page, {
             waitInterrupted: waited.waitInterrupted,
             ...(waited.waitInterrupted ? { waitInterruptedReason: "parent_steer_queued" } : {}),
           })
         }
         const record = manager.get(params.agent_id)
         if (!record) throw new Error(`SubAgent 不存在: ${params.agent_id}`)
-        return toolResult(record)
+        const page = subagentResultPage(record, query)
+        return "error" in page ? errorToolResult(page) : pageToolResult(page)
       },
     },
     {
@@ -725,7 +769,9 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
       }),
       async execute(_id, raw) {
         const params = raw as { agent_id: string; message: string }
-        return toolResult(await manager.steer(params.agent_id, params.message))
+        return pageToolResult(
+          firstSubagentResultPage(await manager.steer(params.agent_id, params.message)),
+        )
       },
     },
     {
@@ -734,26 +780,77 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
       description: "Cancel a queued or running SubAgent.",
       parameters: Type.Object({ agent_id: Type.String() }),
       async execute(_id, raw) {
-        return toolResult(await manager.cancel((raw as { agent_id: string }).agent_id))
+        return pageToolResult(
+          firstSubagentResultPage(await manager.cancel((raw as { agent_id: string }).agent_id)),
+        )
       },
     },
     {
       name: "list_subagents",
       label: "List SubAgents",
-      description: "List this run's queued, running and completed SubAgents.",
-      parameters: Type.Object({}),
-      async execute() {
-        return toolResult({ agents: manager.list() })
+      description:
+        "List this run's SubAgents in creation order with short report previews. A page holds what fits in 16 KiB, so it can hold fewer than limit; pass nextCursor back as cursor until it is absent. Read a full report with get_subagent_result.",
+      parameters: Type.Object({
+        cursor: Type.Optional(Type.String({ maxLength: 1_024 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_LIST_MAX_LIMIT })),
+      }),
+      async execute(_id, raw) {
+        const params = raw as { cursor?: string; limit?: number }
+        const page = manager.listPage({
+          ...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+          ...(params.limit === undefined ? {} : { limit: params.limit }),
+        })
+        return "error" in page ? errorToolResult(page) : listToolResult(page)
       },
     },
   ]
 }
 
-function toolResult(details: object): AgentToolResult<Record<string, unknown>> {
-  const value = details as Record<string, unknown>
+/**
+ * The model reads the page itself; `details` (kept in the session and shown by
+ * the WebUI) hold only identifiers, versions, and counts, never report text.
+ * `id` stays for WebUI cards that link a tool call to its SubAgent.
+ */
+function pageToolResult(
+  page: SubagentResultPageDto,
+  extra: Record<string, string | boolean> = {},
+): AgentToolResult<Record<string, unknown>> {
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
-    details: value,
+    content: [{ type: "text", text: JSON.stringify({ ...page, ...extra }) }],
+    details: {
+      schemaVersion: page.schemaVersion,
+      id: page.agentId,
+      agentId: page.agentId,
+      status: page.status,
+      ...(page.state ? { state: page.state } : {}),
+      resultVersion: page.resultVersion,
+      offset: page.offset,
+      totalLength: page.totalLength,
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+      hasMore: page.hasMore,
+      ...extra,
+    },
+  }
+}
+
+function listToolResult(page: SubagentListPageDto): AgentToolResult<Record<string, unknown>> {
+  return {
+    content: [{ type: "text", text: JSON.stringify(page) }],
+    details: {
+      schemaVersion: page.schemaVersion,
+      runId: page.runId,
+      ids: page.items.map((item) => item.id),
+      omittedCount: page.omittedCount,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    },
+  }
+}
+
+function errorToolResult(envelope: ToolErrorEnvelope): AgentToolResult<Record<string, unknown>> {
+  return {
+    content: [{ type: "text", text: JSON.stringify(envelope) }],
+    details: { ...envelope.error },
+    isError: true,
   }
 }
 
