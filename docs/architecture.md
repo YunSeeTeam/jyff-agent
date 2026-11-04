@@ -142,6 +142,15 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 
 `Project.createSolver()` 为每次尝试生成 Run ID、workspace 和 `runs/<runId>/session.jsonl`，并创建 `CtfSolverAgent`。Solver 使用 `BaseAgent` 打开 Pi 原生 JSONL session，加载系统提示词、skills、Pi tools、题目能力和可选 Web Access。
 
+创建 Solver 前，`Project` 先冻结 Run 配置（`packages/core/src/project/run-config-snapshot.ts`），写入 `runs/<runId>/run-config.json`，并记录 `run_configuration_frozen` 事件。快照包括：
+
+- 优化开关与 Skills 选择；
+- SubAgent 角色，含系统提示词 hash；
+- 模型与限额；
+- runtimeProfile：适配器 ID、会话格式、Pi 包版本和锁文件 hash。
+
+开关依赖不满足时拒绝创建 Run。续跑同一 Run 时使用原快照，不读当前配置。当前运行时无法恢复快照中的会话格式时，拒绝续跑。没有快照的旧 Run 记录 `run_configuration_legacy_resume` 事件后，按原行为续跑。
+
 Solver 的关闭顺序在 `packages/agents/src/solver/agent/solver-agent.ts`：
 
 1. 中止 Agent 并等待空闲。
@@ -187,7 +196,7 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 <root>/.ctf-agent/
 ├── project-registry.json
 ├── project-config.json / runtime-config.json / runs.sqlite  # 根 Project
-├── runs/<run-id>/session.jsonl
+├── runs/<run-id>/session.jsonl / run-config.json
 ├── challenges/<challenge-key>/
 ├── projects/<sha256(projectId)[0:32]>/                    # 其他 Project
 │   ├── project-config.json
@@ -203,6 +212,8 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 ```
 
 `directory` 只接受 `.` 或 `projects/<32 位小写十六进制>`，由 Project ID 的 SHA-256 前缀派生。JSON 使用临时文件加 rename 写入，避免写入一半时留下有效但不完整的配置。
+
+`runtime-config.json` 带递增的 `revision`。更新请求可以携带 `expectedRevision`，与当前值不一致时返回 409。旧客户端省略的字段保留服务端现值。
 
 ### 5.2 RunStore
 
