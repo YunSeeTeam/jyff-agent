@@ -8,6 +8,8 @@ export class HttpError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /** Bounded machine-readable context, serialized next to the code. */
+    readonly details?: Record<string, unknown>,
   ) {
     super(message)
     this.name = "HttpError"
@@ -26,7 +28,7 @@ export function errorText(error: unknown): string {
 /** 全局错误处理：HttpError / ContestSchedulerError 映射为既有错误契约，其余归为 500。 */
 export function errorHandler(error: Error, c: Context<AppEnv>): Response {
   if (error instanceof HttpError) {
-    return errorResponse(c, error.status, error.code, error.message)
+    return errorResponse(c, error.status, error.code, error.message, error.details)
   }
   if (error instanceof ContestSchedulerError) {
     const status =
@@ -51,8 +53,9 @@ function errorResponse(
   status: number,
   code: string,
   message: string,
+  details?: Record<string, unknown>,
 ): Response {
-  return new Response(JSON.stringify({ error: code, message }), {
+  return new Response(JSON.stringify({ error: code, message, ...(details ? { details } : {}) }), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   })

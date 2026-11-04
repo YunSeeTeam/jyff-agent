@@ -32,6 +32,7 @@ import type {
   TldrRecord,
   WorkspaceArtifactListing,
 } from "@ctf-agent/core"
+import type { RunSettings, RunSettingsPatch } from "@ctf-agent/core/contracts"
 import type { AgentMessage, AgentOptions } from "@earendil-works/pi-agent-core"
 
 export interface DashboardConversationMessage {
@@ -421,14 +422,24 @@ export interface AgentModelBindings {
   subagentModels: Record<string, string>
 }
 
-export interface ProjectRuntimeConfigurationView extends AgentModelBindings {
+export interface ProjectRuntimeConfigurationView extends AgentModelBindings, RunSettings {
   maxConcurrent: number
   maxRemoteEnvironments: number
+  /** Increments with every saved update; send it back as `expectedRevision`. */
+  revision: number
+}
+
+/** Older clients omit the run settings and the revision; omitted values are kept. */
+export interface ProjectRuntimeConfigurationUpdate extends AgentModelBindings, RunSettingsPatch {
+  maxConcurrent: number
+  maxRemoteEnvironments: number
+  /** Rejects the update when the stored configuration has changed since this revision. */
+  expectedRevision?: number
 }
 
 export interface DashboardProjectRuntimeConfiguration {
   snapshot(): ProjectRuntimeConfigurationView
-  update(configuration: ProjectRuntimeConfigurationView): Promise<ProjectRuntimeConfigurationView>
+  update(configuration: ProjectRuntimeConfigurationUpdate): Promise<ProjectRuntimeConfigurationView>
 }
 
 export interface ModelConfigurationUpdate {

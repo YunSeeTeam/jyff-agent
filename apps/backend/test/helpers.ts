@@ -4,8 +4,43 @@ import { join } from "node:path"
 import type { App } from "../src/http/context.ts"
 import type { WebUiOptions } from "../src/server.ts"
 import { createWebUiApp, startWebUi, type WebUiServer } from "../src/server.ts"
-import type { DashboardControlPlane } from "../src/types.ts"
+import { defaultRunSettings, mergeRunSettings } from "@ctf-agent/core/contracts"
+import type {
+  DashboardControlPlane,
+  DashboardProjectRuntimeConfiguration,
+  ProjectRuntimeConfigurationView,
+} from "../src/types.ts"
 import { FakeDashboardProject } from "./fake-project.ts"
+
+/** In-memory runtime configuration with the same merge semantics as the file store. */
+export function fakeRuntimeConfiguration(
+  initial: Omit<
+    ProjectRuntimeConfigurationView,
+    "revision" | "optimization" | "skills" | "budgetPolicy"
+  >,
+): DashboardProjectRuntimeConfiguration & { current(): ProjectRuntimeConfigurationView } {
+  let current: ProjectRuntimeConfigurationView = {
+    ...initial,
+    ...defaultRunSettings(),
+    revision: 0,
+  }
+  return {
+    current: () => structuredClone(current),
+    snapshot: () => structuredClone(current),
+    update: async ({ expectedRevision: _expectedRevision, ...configuration }) => {
+      current = {
+        solverModelId: configuration.solverModelId,
+        tldrModelId: configuration.tldrModelId,
+        subagentModels: { ...configuration.subagentModels },
+        maxConcurrent: configuration.maxConcurrent,
+        maxRemoteEnvironments: configuration.maxRemoteEnvironments,
+        ...mergeRunSettings(current, configuration),
+        revision: current.revision + 1,
+      }
+      return structuredClone(current)
+    },
+  }
+}
 
 /** 测试装配：临时目录 + 内存 app，返回可供 request 的实例。 */
 export async function createTestApp(options: Partial<WebUiOptions> = {}) {

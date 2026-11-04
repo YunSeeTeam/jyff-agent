@@ -1,14 +1,22 @@
 import type { ProjectActivation } from "@ctf-agent/core"
-import { describe, expect, it } from "vite-plus/test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterEach, describe, expect, it } from "vite-plus/test"
+import { createFileProjectRuntimeConfiguration } from "../src/domain/runtime.ts"
 import {
   type BuiltInPluginConfiguration,
   type BuiltInPluginId,
   TOKEN_USAGE_PLUGIN_ID,
 } from "../src/domain/built-in-plugin-config.ts"
 import { createWebUiApp } from "../src/server.ts"
-import type { DashboardControlPlane } from "../src/types.ts"
+import type {
+  DashboardControlPlane,
+  DashboardProjectRuntimeConfiguration,
+  ProjectRuntimeConfigurationView,
+} from "../src/types.ts"
 import { FakeDashboardProject, FakeModelConfiguration } from "./fake-project.ts"
-import { jsonOf, jsonRequest } from "./helpers.ts"
+import { fakeRuntimeConfiguration, jsonOf, jsonRequest } from "./helpers.ts"
 
 /** 内存版动态控制面：unconfigured → ready 两阶段。 */
 function createControlPlane(projectName = "Demo CTF") {
@@ -148,15 +156,18 @@ const DEMO_CONFIG = {
   },
 }
 
-function appWithControlPlane() {
-  const plane = createControlPlane()
-  let runtimeConfiguration = {
+function appWithControlPlane(
+  runtimeConfiguration: DashboardProjectRuntimeConfiguration & {
+    current(): ProjectRuntimeConfigurationView
+  } = fakeRuntimeConfiguration({
     solverModelId: "",
     tldrModelId: "",
     subagentModels: {},
     maxConcurrent: 8,
     maxRemoteEnvironments: 1,
-  }
+  }),
+) {
+  const plane = createControlPlane()
   let tokenUsageEnabled = true
   const builtInPluginConfiguration: BuiltInPluginConfiguration = {
     snapshot: () => ({
@@ -182,21 +193,13 @@ function appWithControlPlane() {
     modelConfiguration: new FakeModelConfiguration(),
     builtInPluginConfiguration,
     projectRuntimeConfiguration: (projectId) =>
-      projectId === "demo"
-        ? {
-            snapshot: () => structuredClone(runtimeConfiguration),
-            update: async (configuration) => {
-              runtimeConfiguration = structuredClone(configuration)
-              return structuredClone(runtimeConfiguration)
-            },
-          }
-        : undefined,
+      projectId === "demo" ? runtimeConfiguration : undefined,
     onProjectDeleted: (projectId) => {
       plane.deletedProjects.push(`cache:${projectId}`)
     },
     frontendDist: "/nonexistent",
   })
-  return { app: app.app, plane, runtime: () => runtimeConfiguration }
+  return { app: app.app, plane, runtime: () => runtimeConfiguration.current() }
 }
 
 describe("动态控制面与项目管理", () => {
@@ -439,5 +442,103 @@ describe("动态控制面与项目管理", () => {
       const response = await jsonRequest(app, "/api/projects/test", "POST", body)
       expect(response.status).toBe(400)
     }
+  })
+})
+
+describe("Project 运行配置的优化设置", () => {
+  const roots: string[] = []
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  })
+  const base = {
+    solverModelId: "",
+    tldrModelId: "",
+    subagentModels: {},
+    maxConcurrent: 8,
+    maxRemoteEnvironments: 1,
+  }
+
+  async function appWithFileRuntime() {
+    const root = await mkdtemp(join(tmpdir(), "ctf-runtime-http-"))
+    roots.push(root)
+    const configuration = await createFileProjectRuntimeConfiguration({
+      storagePath: join(root, "runtime-config.json"),
+      fallback: base,
+      availableModelIds: () => new Set(),
+    })
+    return appWithControlPlane({ ...configuration, current: () => configuration.snapshot() })
+  }
+
+  it("返回默认关闭的设置与版本号，回传完整快照不改变设置", async () => {
+    const { app } = await appWithFileRuntime()
+    const initial = await jsonOf(await app.request("/api/projects/demo/runtime-config"))
+    const runtime = initial.runtime as ProjectRuntimeConfigurationView
+    expect(runtime).toMatchObject({
+      optimization: { blackboardReaderV2: false, review: { enabled: false } },
+      skills: { solver: "all", subagents: { default: "all", roles: {} } },
+      budgetPolicy: { enabled: false },
+      revision: 0,
+    })
+    const echoed = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...runtime,
+      expectedRevision: runtime.revision,
+    })
+    expect(echoed.status).toBe(200)
+    expect((await jsonOf(echoed)).runtime).toEqual({ ...runtime, revision: 1 })
+  })
+
+  it("拒绝未知字段与 null，而不是静默忽略", async () => {
+    const { app } = await appWithFileRuntime()
+    for (const payload of [
+      { ...base, optimization: { unknownSwitch: true } },
+      { ...base, optimization: null },
+      { ...base, skills: { solver: null } },
+    ]) {
+      const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", payload)
+      expect(response.status).toBe(400)
+      expect(await jsonOf(response)).toMatchObject({
+        error: "invalid_project_runtime_configuration",
+      })
+    }
+  })
+
+  it("开关依赖不满足时返回原错误码并在 details 中说明", async () => {
+    const { app } = await appWithFileRuntime()
+    const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      optimization: { localProcesses: true },
+    })
+    expect(response.status).toBe(400)
+    expect(await jsonOf(response)).toMatchObject({
+      error: "invalid_project_runtime_configuration",
+      details: {
+        reason: "configuration_dependency_error",
+        issues: [
+          expect.objectContaining({ setting: "optimization.localProcesses" }),
+          expect.objectContaining({ requires: "budgetPolicy.enabled" }),
+        ],
+      },
+    })
+  })
+
+  it("基于过期版本的提交返回 409，不覆盖较新的修改", async () => {
+    const { app, runtime } = await appWithFileRuntime()
+    const first = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      maxConcurrent: 4,
+      expectedRevision: 0,
+    })
+    expect(first.status).toBe(200)
+    const stale = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      maxConcurrent: 2,
+      expectedRevision: 0,
+    })
+    expect(stale.status).toBe(409)
+    expect(await jsonOf(stale)).toMatchObject({
+      error: "runtime_configuration_conflict",
+      details: { currentRevision: 1 },
+    })
+    expect(runtime().maxConcurrent).toBe(4)
   })
 })

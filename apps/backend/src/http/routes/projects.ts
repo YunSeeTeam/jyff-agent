@@ -3,6 +3,10 @@ import {
   defaultBuiltInPluginConfigurationView,
   TOKEN_USAGE_PLUGIN_ID,
 } from "../../domain/built-in-plugin-config.ts"
+import {
+  ConfigurationDependencyError,
+  RuntimeConfigurationConflictError,
+} from "../../domain/runtime.ts"
 import type { App, AppContext, AppEnv, ProjectScope } from "../context.ts"
 import { errorText, HttpError } from "../errors.ts"
 import {
@@ -241,7 +245,20 @@ export function scopedProjectRoutes(services: Services): App {
     try {
       configuration = await runtime.update(body)
     } catch (error) {
-      throw new HttpError(400, "invalid_project_runtime_configuration", errorText(error))
+      if (error instanceof RuntimeConfigurationConflictError) {
+        throw new HttpError(409, error.code, error.message, {
+          currentRevision: error.currentRevision,
+        })
+      }
+      // 既有端点保持原错误码，依赖问题放在 details 中供调用方区分。
+      throw new HttpError(
+        400,
+        "invalid_project_runtime_configuration",
+        errorText(error),
+        error instanceof ConfigurationDependencyError
+          ? { reason: error.code, issues: error.issues.map((issue) => ({ ...issue })) }
+          : undefined,
+      )
     }
     const scheduler = services.currentScheduler(projectId)
     await scheduler?.setMaxConcurrent(configuration.maxConcurrent)

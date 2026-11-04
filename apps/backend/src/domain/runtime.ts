@@ -1,34 +1,97 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
+import {
+  type ConfigurationDependencyIssue,
+  configurationDependencyIssues,
+  defaultRunSettings,
+  mergeRunSettings,
+  type OptimizationCapability,
+  type RunSettings,
+  type RunSettingsPatch,
+} from "@ctf-agent/core/contracts"
 import type {
   AgentModelBindings,
   DashboardProjectRuntimeConfiguration,
+  ProjectRuntimeConfigurationUpdate,
   ProjectRuntimeConfigurationView,
 } from "../types.ts"
+import { parseStoredRunSettings } from "./run-settings-schema.ts"
 
-interface StoredProjectRuntimeConfiguration extends AgentModelBindings {
+/**
+ * Version 1 files written before the run settings existed lack them and the
+ * revision; they read as defaults. Older binaries ignore the added fields.
+ */
+interface StoredProjectRuntimeConfiguration extends AgentModelBindings, RunSettings {
   version: 1
   maxConcurrent: number
   maxRemoteEnvironments: number
+  revision: number
 }
+
+/** The update was based on a stale snapshot. */
+export class RuntimeConfigurationConflictError extends Error {
+  readonly code = "runtime_configuration_conflict"
+  constructor(
+    readonly expectedRevision: number,
+    readonly currentRevision: number,
+  ) {
+    super(
+      `Project 运行配置已被其他修改更新（当前版本 ${currentRevision}，提交基于 ${expectedRevision}），请刷新后重试`,
+    )
+    this.name = "RuntimeConfigurationConflictError"
+  }
+}
+
+/** A switch cannot be enabled in this build or without its prerequisites. */
+export class ConfigurationDependencyError extends Error {
+  readonly code = "configuration_dependency_error"
+  constructor(readonly issues: readonly ConfigurationDependencyIssue[]) {
+    super(issues.map((issue) => issue.message).join("; "))
+    this.name = "ConfigurationDependencyError"
+  }
+}
+
+type RuntimeConfigurationFallback = Omit<
+  ProjectRuntimeConfigurationView,
+  "revision" | keyof RunSettings
+>
 
 export async function createFileProjectRuntimeConfiguration(options: {
   storagePath: string
-  fallback: ProjectRuntimeConfigurationView
+  fallback: RuntimeConfigurationFallback
   availableModelIds: () => ReadonlySet<string>
+  /** Optimization capabilities this build provides; none until stage 3 ships them. */
+  availableCapabilities?: () => ReadonlySet<OptimizationCapability>
 }): Promise<DashboardProjectRuntimeConfiguration> {
+  const capabilities = options.availableCapabilities ?? (() => new Set<OptimizationCapability>())
   const stored = await readConfiguration(options.storagePath, options.fallback)
   validateConfiguration(stored, options.availableModelIds())
   let current = stored
   return {
     snapshot: () => publicView(current),
     update: async (configuration) => {
+      if (
+        configuration.expectedRevision !== undefined &&
+        configuration.expectedRevision !== current.revision
+      ) {
+        throw new RuntimeConfigurationConflictError(
+          configuration.expectedRevision,
+          current.revision,
+        )
+      }
       const next: StoredProjectRuntimeConfiguration = {
         version: 1,
-        ...configuration,
+        solverModelId: configuration.solverModelId,
+        tldrModelId: configuration.tldrModelId,
         subagentModels: { ...configuration.subagentModels },
+        maxConcurrent: configuration.maxConcurrent,
+        maxRemoteEnvironments: configuration.maxRemoteEnvironments,
+        ...mergeRunSettings(current, runSettingsPatch(configuration)),
+        revision: current.revision + 1,
       }
       validateConfiguration(next, options.availableModelIds())
+      const issues = configurationDependencyIssues(next, capabilities())
+      if (issues.length > 0) throw new ConfigurationDependencyError(issues)
       await persist(options.storagePath, next)
       current = next
       return publicView(current)
@@ -36,15 +99,25 @@ export async function createFileProjectRuntimeConfiguration(options: {
   }
 }
 
+function runSettingsPatch(update: ProjectRuntimeConfigurationUpdate): RunSettingsPatch {
+  return {
+    ...(update.optimization ? { optimization: update.optimization } : {}),
+    ...(update.skills ? { skills: update.skills } : {}),
+    ...(update.budgetPolicy ? { budgetPolicy: update.budgetPolicy } : {}),
+  }
+}
+
 async function readConfiguration(
   path: string,
-  fallback: ProjectRuntimeConfigurationView,
+  fallback: RuntimeConfigurationFallback,
 ): Promise<StoredProjectRuntimeConfiguration> {
   let parsed: unknown
   try {
     parsed = JSON.parse(await readFile(path, "utf8"))
   } catch (error) {
-    if (hasCode(error, "ENOENT")) return { version: 1, ...fallback }
+    if (hasCode(error, "ENOENT")) {
+      return { version: 1, ...fallback, ...defaultRunSettings(), revision: 0 }
+    }
     throw new Error(`无法读取 Project 运行配置: ${path}`, { cause: error })
   }
   if (!isRecord(parsed) || parsed.version !== 1) {
@@ -60,7 +133,20 @@ async function readConfiguration(
       parsed.maxRemoteEnvironments === undefined
         ? fallback.maxRemoteEnvironments
         : Number(parsed.maxRemoteEnvironments),
+    ...storedRunSettings(parsed, path),
+    revision: parsed.revision === undefined ? 0 : Number(parsed.revision),
   }
+}
+
+/** Read stored run settings through the same merge as updates; unknown keys are ignored. */
+function storedRunSettings(parsed: Record<string, unknown>, path: string): RunSettings {
+  const patch = parseStoredRunSettings({
+    optimization: parsed.optimization,
+    skills: parsed.skills,
+    budgetPolicy: parsed.budgetPolicy,
+  })
+  if (!patch) throw new Error(`Project 运行配置中的优化设置无效: ${path}`)
+  return mergeRunSettings(defaultRunSettings(), patch)
 }
 
 function validateConfiguration(
@@ -80,6 +166,9 @@ function validateConfiguration(
     configuration.maxRemoteEnvironments > 64
   ) {
     throw new Error("maxRemoteEnvironments 必须是 1–64 的整数")
+  }
+  if (!Number.isInteger(configuration.revision) || configuration.revision < 0) {
+    throw new Error("Project 运行配置版本号无效")
   }
   if (modelIds.size === 0) {
     if (
@@ -125,12 +214,17 @@ async function persist(
 function publicView(
   configuration: StoredProjectRuntimeConfiguration,
 ): ProjectRuntimeConfigurationView {
+  const settings = mergeRunSettings(configuration, {})
   return {
     solverModelId: configuration.solverModelId,
     tldrModelId: configuration.tldrModelId,
     subagentModels: { ...configuration.subagentModels },
     maxConcurrent: configuration.maxConcurrent,
     maxRemoteEnvironments: configuration.maxRemoteEnvironments,
+    optimization: settings.optimization,
+    skills: settings.skills,
+    budgetPolicy: settings.budgetPolicy,
+    revision: configuration.revision,
   }
 }
 

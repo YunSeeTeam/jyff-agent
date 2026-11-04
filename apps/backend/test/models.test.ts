@@ -10,7 +10,7 @@ import {
   FakeDashboardScheduler,
   FakeModelConfiguration,
 } from "./fake-project.ts"
-import { jsonOf, jsonRequest } from "./helpers.ts"
+import { fakeRuntimeConfiguration, jsonOf, jsonRequest } from "./helpers.ts"
 
 describe("模型配置与模型鉴权路由", () => {
   const roots: string[] = []
@@ -105,13 +105,13 @@ describe("模型配置与模型鉴权路由", () => {
       supportedThinkingLevels: ["off"],
       configured: true,
     }
-    let runtime = {
+    const runtime = fakeRuntimeConfiguration({
       solverModelId: "old-model",
       tldrModelId: "new-model",
       subagentModels: { helper: "old-model" },
       maxConcurrent: 2,
       maxRemoteEnvironments: 1,
-    }
+    })
     const projectSnapshot = {
       id: "training",
       name: "训练赛",
@@ -142,13 +142,7 @@ describe("模型配置与模型鉴权路由", () => {
     const { app } = createWebUiApp({
       controlPlane,
       modelConfiguration,
-      projectRuntimeConfiguration: (projectId) =>
-        projectId === "training"
-          ? {
-              snapshot: () => structuredClone(runtime),
-              update: async (configuration) => configuration,
-            }
-          : undefined,
+      projectRuntimeConfiguration: (projectId) => (projectId === "training" ? runtime : undefined),
       frontendDist: "/nonexistent",
     })
     const payload = {
@@ -178,11 +172,11 @@ describe("模型配置与模型鉴权路由", () => {
       ),
     })
 
-    runtime = {
-      ...runtime,
+    await runtime.update({
+      ...runtime.current(),
       solverModelId: "new-model",
       subagentModels: { helper: "new-model" },
-    }
+    })
     const saved = await jsonRequest(app, "/api/model-config", "POST", payload)
     expect(saved.status).toBe(200)
   })

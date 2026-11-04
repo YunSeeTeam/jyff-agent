@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url"
 import { discoverProjectSkillsWithDiagnostics } from "@ctf-agent/agents"
 import {
   AuditStore,
+  BUILD_OPTIMIZATION_CAPABILITIES,
   ContestScheduler,
   ControlPlane,
   FatherSessionManager,
@@ -179,6 +180,7 @@ async function projectRuntimeConfiguration(context: { projectId: string; stateDi
       maxRemoteEnvironments: 1,
     },
     availableModelIds: () => new Set(modelConfiguration.snapshot().models.map((model) => model.id)),
+    availableCapabilities: () => BUILD_OPTIMIZATION_CAPABILITIES,
   })
   projectRuntimeConfigurations.set(context.projectId, configuration)
   return configuration
@@ -243,6 +245,10 @@ const controlPlane = await ControlPlane.create({
       },
       subagents: {
         modelForRole: (role) => modelConfiguration.modelForSubagent(role, runtime.snapshot()),
+      },
+      runSettings: () => {
+        const { optimization, skills, budgetPolicy } = runtime.snapshot()
+        return { optimization, skills, budgetPolicy }
       },
     }
   },

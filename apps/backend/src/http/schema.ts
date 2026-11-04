@@ -1,6 +1,7 @@
 import { parseProjectConfig, type ProjectStartOptions } from "@ctf-agent/core"
 import type { Context } from "hono"
 import { z } from "zod"
+import { runSettingsUpdateSchema } from "../domain/run-settings-schema.ts"
 import type { AppEnv } from "./context.ts"
 import { errorText, HttpError } from "./errors.ts"
 
@@ -258,6 +259,9 @@ export const projectRuntimeConfigurationSchema = z
     subagentModels: subagentModelsSchema,
     maxConcurrent: z.number({ message: "调度并发量必须是整数" }).int().min(1).max(64),
     maxRemoteEnvironments: z.number({ message: "远程环境并发量必须是整数" }).int().min(1).max(64),
+    // 旧客户端不发送以下字段，省略时保留服务端现值。
+    ...runSettingsUpdateSchema.shape,
+    expectedRevision: z.number({ message: "配置版本号必须是整数" }).int().min(0).optional(),
   })
   .transform((value) => ({
     ...value,

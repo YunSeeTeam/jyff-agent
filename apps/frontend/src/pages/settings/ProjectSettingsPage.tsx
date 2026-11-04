@@ -91,7 +91,11 @@ export function ProjectSettingsPage() {
     setBusy("runtime")
     setErr("")
     try {
-      const n = await apiMutation<RT>(projectApi(projectId, "/api/runtime-config"), "POST", runtime)
+      // 带上读取时的版本号：期间若有其他修改，服务端返回 409 而不是覆盖。
+      const n = await apiMutation<RT>(projectApi(projectId, "/api/runtime-config"), "POST", {
+        ...runtime,
+        expectedRevision: runtime.revision,
+      })
       setRt(n)
       setRuntime(n.runtime)
     } catch (e) {
