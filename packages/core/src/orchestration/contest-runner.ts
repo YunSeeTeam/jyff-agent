@@ -292,13 +292,7 @@ export class ContestRunner {
 
           if (outcome.kind === "submitted" || hasTerminalSubmission(solver)) {
             // agent_end listener 已执行 close；显式 await 保证清理和持久化完全结算。
-            await solver.close("submitted")
-            return {
-              challengeId: challenge.id,
-              status: "solved",
-              attempts,
-              runIds,
-            }
+            return await solvedResult(challenge.id, solver, attempts, runIds)
           }
 
           const interruptionCount = this.project.sessionInterruptionCount(challenge.id) + 1
@@ -326,6 +320,10 @@ export class ContestRunner {
           resumeAttempt = attempt
           continuation = true
         } catch (error) {
+          // 平台已接受时，后续异常只是清理或收尾失败，不能改判为未解出或再次求解。
+          if (solver && hasTerminalSubmission(solver)) {
+            return await solvedResult(challenge.id, solver, attempts, runIds)
+          }
           const reason = closeReason(error, signal)
           lastError = errorText(error)
           if (solver && !solver.isClosed) {
@@ -464,4 +462,34 @@ function nonNegativeInteger(value: number, label: string): void {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Flatten AggregateError so the caller sees every individual cleanup failure. */
+function detailedErrorText(error: unknown): string {
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    return [error.message, ...error.errors.map(detailedErrorText)].join("; ")
+  }
+  return errorText(error)
+}
+
+/** 成功事实优先：清理失败作为独立错误随 solved 结果返回。 */
+async function solvedResult(
+  challengeId: string,
+  solver: CtfSolverAgent,
+  attempts: number,
+  runIds: string[],
+): Promise<ChallengeRunResult> {
+  let cleanupError: string | undefined
+  try {
+    await solver.close("submitted")
+  } catch (error) {
+    cleanupError = detailedErrorText(error)
+  }
+  return {
+    challengeId,
+    status: "solved",
+    attempts,
+    runIds,
+    ...(cleanupError ? { error: cleanupError } : {}),
+  }
 }

@@ -21,6 +21,7 @@ import {
   type ContestSchedulerError,
   DEFAULT_TRANSIENT_RETRY_DELAYS_MS,
 } from "../../src/orchestration/contest-scheduler.ts"
+import { RunStore } from "../../src/persistence/run-store.ts"
 import { Project } from "../../src/project/project.ts"
 import { type TestChallenge, TestPlatformPlugin } from "../fake-platform.ts"
 
@@ -335,6 +336,105 @@ describe("ContestScheduler", () => {
       expect(project.isChallengeSolved(item.id)).toBe(true)
       await expect(scheduler.dispatch(item.id)).rejects.toMatchObject({ code: "already_solved" })
     } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("accepted 后清理失败仍记成功事实与独立清理错误，不会重新求解（T02）", async () => {
+    const item = challenge(93)
+    const tracker = new SandboxTracker()
+    const create = tracker.create
+    tracker.create = async (options) => {
+      const sandbox = await create(options)
+      return {
+        ...sandbox,
+        close: async () => {
+          await sandbox.close()
+          throw new Error("sandbox close failed")
+        },
+      }
+    }
+    const project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: `cleanup-failure-${item.id}` })
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("ctf_submit_flag", { flag: item.flag }, { id: "submit-cleanup-failure" }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("The flag was submitted.", { stopReason: "stop" }),
+    ])
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 2,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => scheduler.snapshot().active.length === 0)
+
+      const runs = project.runs({ challengeId: item.id })
+      expect(runs).toHaveLength(1)
+      expect(runs[0]).toMatchObject({ solveOutcome: "accepted" })
+      expect(runs[0]?.cleanupError).toContain("sandbox close failed")
+      expect(project.isChallengeSolved(item.id)).toBe(true)
+      expect(faux.state.callCount).toBe(1)
+      await expect(scheduler.dispatch(item.id)).rejects.toMatchObject({ code: "already_solved" })
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("平台已接受但本地写库失败时报告 accepted_persistence_failed，且不重复提交（T03）", async () => {
+    const item = challenge(94)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const recordSolveOutcome = vi
+      .spyOn(RunStore.prototype, "recordSolveOutcome")
+      .mockImplementationOnce(() => {
+        throw new Error("database is locked")
+      })
+    const faux = createFauxCore({ provider: `persistence-failure-${item.id}` })
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("ctf_submit_flag", { flag: item.flag }, { id: "submit-persistence-failure" }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        fauxToolCall("ctf_submit_flag", { flag: item.flag }, { id: "submit-again" }),
+        { stopReason: "toolUse" },
+      ),
+    ])
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 2,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => scheduler.snapshot().active.length === 0)
+
+      expect(recordSolveOutcome).toHaveBeenCalledOnce()
+      const runs = project.runs({ challengeId: item.id })
+      expect(runs).toHaveLength(1)
+      expect(runs[0]).toMatchObject({ status: "solved" })
+      const result = project
+        .runEvents(runs[0]?.id ?? "")
+        .find((event) => event.type === "tool_finished")
+      expect(JSON.stringify(result?.data)).toContain("accepted_persistence_failed")
+      expect(faux.state.callCount).toBe(1)
+      expect(project.isChallengeSolved(item.id)).toBe(true)
+    } finally {
+      recordSolveOutcome.mockRestore()
       await scheduler.shutdown()
       await project.close()
     }

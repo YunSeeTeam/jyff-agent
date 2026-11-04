@@ -269,6 +269,45 @@ describe("ContestRunner", () => {
     }
   })
 
+  it("accepted 后清理失败仍报告成功事实，并单独报告清理错误（T02）", async () => {
+    const item = challenge(31)
+    const tracker = new SandboxTracker()
+    const create = tracker.create
+    tracker.create = async (options: DockerSandboxOptions): Promise<Sandbox> => {
+      const sandbox = await create(options)
+      return {
+        ...sandbox,
+        close: async () => {
+          await sandbox.close()
+          throw new Error("sandbox close failed")
+        },
+      }
+    }
+    const { project, plugin } = await projectFixture([item], tracker)
+
+    try {
+      const runner = new ContestRunner(project, {
+        maxConcurrent: 1,
+        maxAttempts: 2,
+        challengeTimeoutMs: 2_000,
+        retryDelayMs: 1,
+        createAgentOptions: ({ attempt }) => solvingAgent(item, attempt),
+      })
+      const summary = await runner.run()
+
+      expect(summary).toMatchObject({ total: 1, solved: 1, failed: 0, attempts: 1 })
+      expect(summary.results[0]).toMatchObject({ status: "solved" })
+      expect(summary.results[0]?.error).toContain("sandbox close failed")
+      expect(plugin.diagnostics().submissions[item.id]).toBe(1)
+      const [run] = project.runs({ challengeId: item.id })
+      expect(run).toMatchObject({ solveOutcome: "accepted" })
+      expect(run?.cleanupError).toContain("sandbox close failed")
+      expect(project.isChallengeSolved(item.id)).toBe(true)
+    } finally {
+      await project.close()
+    }
+  })
+
   it("stop 会取消活跃 Agent，并等待远程实例与 Sandbox 完成清理", async () => {
     const remote = challenge(0, { remote: true })
     const tracker = new SandboxTracker()

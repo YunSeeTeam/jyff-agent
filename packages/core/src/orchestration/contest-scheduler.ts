@@ -1261,6 +1261,21 @@ export class ContestScheduler {
         continuation = true
         active.phase = "running"
       } catch (error) {
+        if (solver && this.hasRecordedSolveOutcome(active.challenge.id, solver.runId)) {
+          // 平台已接受：此后的异常只来自 writeup 或清理，错误已随 Run 持久化。
+          // 不能把它当作求解失败去继续、重试或计入阻塞。
+          this.lastError = `${active.challenge.title}: ${errorText(error)}`
+          if (!solver.isClosed) {
+            try {
+              await solver.close("submitted")
+            } catch {
+              // close 的清理错误由 onClosed 写入 Run，这里不再重复上报。
+            }
+          }
+          solver = undefined
+          active.solver = undefined
+          return
+        }
         const classification = classifySolverStop({
           error,
           ...(active.cancelRequested ? { operatorCancel: true } : {}),
@@ -1438,6 +1453,12 @@ export class ContestScheduler {
     } else if (failureMessage && failureReason !== "cancelled") {
       this.lastError = `${active.challenge.title}: ${failureMessage}`
     }
+  }
+
+  private hasRecordedSolveOutcome(challengeId: string, runId: string): boolean {
+    return this.project
+      .runs({ challengeId })
+      .some((run) => run.id === runId && run.solveOutcome !== undefined)
   }
 
   private async writeupAfterSubmission(
