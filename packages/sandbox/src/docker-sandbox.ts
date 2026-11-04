@@ -1,4 +1,8 @@
-import { type SpawnOptionsWithoutStdio, spawn } from "node:child_process"
+import {
+  type ChildProcessWithoutNullStreams,
+  type SpawnOptionsWithoutStdio,
+  spawn,
+} from "node:child_process"
 import { randomUUID } from "node:crypto"
 
 export interface CommandResult {
@@ -74,7 +78,22 @@ export type DockerWorkspaceMount =
 
 const OUTPUT_LIMIT = 8 * 1024 * 1024
 
-/** Execute Docker directly without involving a host shell. */
+/** The Docker CLI invocation for this host: Docker inside WSL on Windows, otherwise the local CLI. */
+export function dockerInvocation(args: readonly string[]): { command: string; args: string[] } {
+  return process.platform === "win32"
+    ? { command: "wsl.exe", args: ["-e", "docker", ...toWslDockerArgs(args)] }
+    : { command: "docker", args: [...args] }
+}
+
+/**
+ * Spawn a Docker CLI process with all three pipes left open, for callers that
+ * stream raw bytes or keep stdin attached. No output is buffered here.
+ */
+export function spawnDockerProcess(args: readonly string[]): ChildProcessWithoutNullStreams {
+  const invocation = dockerInvocation(args)
+  return spawn(invocation.command, invocation.args, { stdio: ["pipe", "pipe", "pipe"] })
+}
+
 /** Execute a Docker CLI command without a host shell. Intended for tightly scoped runners. */
 export async function executeDockerCommand(
   args: string[],
@@ -87,10 +106,8 @@ export async function executeDockerCommand(
     const spawnOptions: SpawnOptionsWithoutStdio = {
       stdio: ["pipe", "pipe", "pipe"],
     }
-    const command = process.platform === "win32" ? "wsl.exe" : "docker"
-    const commandArgs =
-      process.platform === "win32" ? ["-e", "docker", ...toWslDockerArgs(args)] : args
-    const child = spawn(command, commandArgs, spawnOptions)
+    const invocation = dockerInvocation(args)
+    const child = spawn(invocation.command, invocation.args, spawnOptions)
     let stdout = ""
     let stderr = ""
     let stdoutTruncated = false
