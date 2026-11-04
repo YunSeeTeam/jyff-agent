@@ -149,7 +149,12 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 - 模型与限额；
 - runtimeProfile：适配器 ID、会话格式、Pi 包版本和锁文件 hash。
 
-开关依赖不满足时拒绝创建 Run。续跑同一 Run 时使用原快照，不读当前配置。当前运行时无法恢复快照中的会话格式时，拒绝续跑。没有快照的旧 Run 记录 `run_configuration_legacy_resume` 事件后，按原行为续跑。
+开关依赖不满足、或选择了不存在的 Skill/角色时，拒绝创建 Run。这类拒绝是项目级配置问题：题目不会被阻塞，被拒绝的 Run 不计入尝试次数，调度器暂停并提示“Run 配置需要人工处理”，保存运行配置后恢复；ContestRunner 以 `reason: "configuration"` 结束该题，不重试。
+
+续跑同一 Run 时使用原快照，不读当前配置；当前运行时无法恢复快照中的会话格式时，拒绝续跑。没有快照时分两种情况：
+
+- Run 从未启动（在冻结时就被拒绝）：按新 Run 冻结，依赖检查照常进行；
+- Run 在有快照之前就已运行：固定为全部开关关闭，写入 `origin: "legacy_resume"` 的快照并记录 `run_configuration_legacy_resume` 事件，之后的续跑与其他 Run 一样恢复该快照。
 
 Solver 的关闭顺序在 `packages/agents/src/solver/agent/solver-agent.ts`：
 
@@ -180,6 +185,7 @@ Flag 被平台接受后会记录 terminal submission。生产调度会进入 Wri
 - 远程槽满时跳过无附件环境题，但允许纯本地题和有附件可本地分析的题越过它。
 - 历史 Run 参与 attempt 预算；`interrupted` 和 `blocked` 不消耗普通重试预算。调度来源的非 `blocked` 终态 Run 恢复时复用原 attempt/session，并发送默认 continuation prompt，不创建新的 attempt。
 - 网络/限流/服务端错误按可重试分类处理；Session 连续异常超过阈值后将题目设为 blocked。
+- 鉴权、余额不足和 Run 配置被拒绝都需要人工处理：调度器暂停，不计入阻塞分。
 - 平台暂不可用时停止领取，但不删除持久化队列和自动调度意图；恢复后继续 reconcile。
 - 空闲整队排序使用 `idleVersion`，执行队列排序校验条目版本；冲突时拒绝陈旧拖拽请求，前端重新读取服务端快照。
 - `AnnouncementPoller` 定期拉取公告；`announcement-matcher.ts` 按 ID、标题、内容和关键词生成题目候选，候选先由 WebUI 审核，之后才写入 Run 的上下文。
