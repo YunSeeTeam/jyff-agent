@@ -297,14 +297,24 @@ export function newRunId(): string {
   return randomUUID()
 }
 
+/** A `--mount` spec whose source is a Windows drive path, e.g. `type=bind,src=C:\work,...`. */
+const WINDOWS_MOUNT_SOURCE = /(^|,)src=[A-Za-z]:[\\/]/
+
+/**
+ * Translate host paths for Docker running inside WSL. Only mount specs carry
+ * host paths; every other argument (notably `docker exec` commands and their
+ * scripts) must reach the container byte-for-byte, backslashes included.
+ */
 function toWslDockerArgs(args: readonly string[]): string[] {
   return args.map((argument) =>
-    argument
-      .replaceAll("\\", "/")
-      .replace(
-        /(src=)([A-Za-z]):/g,
-        (_match, prefix, drive) => `${prefix}/mnt/${String(drive).toLowerCase()}`,
-      ),
+    WINDOWS_MOUNT_SOURCE.test(argument)
+      ? argument
+          .replaceAll("\\", "/")
+          .replace(
+            /(src=)([A-Za-z]):/g,
+            (_match, prefix, drive) => `${prefix}/mnt/${String(drive).toLowerCase()}`,
+          )
+      : argument,
   )
 }
 

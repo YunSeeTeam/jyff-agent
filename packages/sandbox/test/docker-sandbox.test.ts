@@ -81,6 +81,19 @@ describe("Docker command execution", () => {
       { stdio: ["pipe", "pipe", "pipe"] },
     )
   })
+
+  it("passes container commands through WSL without rewriting backslashes", async () => {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
+    spawnMock.mockImplementationOnce(successfulChildProcess)
+    const script = String.raw`printf '%s\n' "a\tb" | grep -E '\d+' && python3 -c "print('x\ny')"`
+
+    await executeDockerCommand(["exec", "-i", "container", "bash", "-lc", script])
+    expect(spawnMock).toHaveBeenCalledWith(
+      "wsl.exe",
+      ["-e", "docker", "exec", "-i", "container", "bash", "-lc", script],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    )
+  })
 })
 
 function successfulChildProcess(): ChildProcessWithoutNullStreams {
