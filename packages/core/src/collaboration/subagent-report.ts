@@ -29,7 +29,7 @@ const ACTIVE = new Set(["queued", "running"])
  * exist are `legacy`: whether their text is complete is unknown.
  */
 export function subagentResultKind(record: SubagentRecord): SubagentResultKind | undefined {
-  return record.result ? "legacy" : undefined
+  return record.result ? (record.resultKind ?? "legacy") : undefined
 }
 
 /**
@@ -41,7 +41,7 @@ export function subagentResultVersion(record: SubagentRecord): string {
     SUBAGENT_REPORT_SCHEMA_VERSION,
     record.runId,
     record.id,
-    "legacy",
+    record.executionId ?? "legacy",
     subagentResultKind(record) ?? null,
     record.result ?? "",
   ]
@@ -102,6 +102,7 @@ export function subagentResultPage(
   const page: SubagentResultPageDto = {
     schemaVersion: 2,
     agentId: record.id,
+    ...(record.executionId ? { executionId: record.executionId } : {}),
     status: record.status,
     ...(text ? {} : { state: ACTIVE.has(record.status) ? "result_pending" : "result_unavailable" }),
     ...(kind ? { resultKind: kind } : {}),

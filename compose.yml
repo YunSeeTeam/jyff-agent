@@ -34,6 +34,8 @@ services:
     volumes:
       - ctf-agent-data:/data/.ctf-agent
       - /var/run/docker.sock:/var/run/docker.sock
+      # Optional trusted skill sources; restart/reopen Project to discover newly published packages.
+      # - ./ctf-skills:/data/.pi/skills:ro
     restart: unless-stopped
 
   # 可选：默认只启动 WebUI，不会读取或构建外部 ShellPoop 仓库。

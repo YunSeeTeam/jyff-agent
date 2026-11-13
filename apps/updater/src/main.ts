@@ -15,6 +15,7 @@ import {
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
+import { assertDataCompatible, DataCompatibilityError } from "./data-compatibility.ts"
 
 const execFile = promisify(execFileCallback)
 const execTimeoutMs = 2 * 60 * 60 * 1_000
@@ -35,6 +36,8 @@ export interface UpdateWorkerOptions {
   healthUrl: string
   allowApply: boolean
   runSandboxBuild: boolean
+  /** Must match the backend --root; required for apply and rollback. */
+  dataRoot?: string
   githubToken?: string
   fetch?: typeof globalThis.fetch
 }
@@ -196,6 +199,7 @@ export class SourceUpdateWorker {
           409,
         )
       }
+      await assertDataCompatible(operation.stagingDirectory, this.options.dataRoot)
       const previousTarget = await switchCurrentTo(
         operation.stagingDirectory,
         this.options.currentPath,
@@ -220,6 +224,8 @@ export class SourceUpdateWorker {
         operation.message = "新版本健康检查失败，正在恢复旧版本"
         operation.updatedAt = now()
         await this.persist()
+        // The new backend may already have migrated the DB. Check again before rollback.
+        if (previousTarget) await this.checkRecoveryTarget(previousTarget, operation)
         await restorePrevious(
           previousTarget,
           this.options.currentPath,
@@ -252,6 +258,7 @@ export class SourceUpdateWorker {
         )
       }
       const currentTarget = await readLinkTarget(this.options.currentPath)
+      await assertDataCompatible(operation.previousTarget, this.options.dataRoot)
       await replaceLink(this.options.currentPath, operation.previousTarget)
       await replaceLink(this.options.previousPath, currentTarget)
       try {
@@ -263,6 +270,7 @@ export class SourceUpdateWorker {
         await this.persist()
         return { message: operation.message }
       } catch (error) {
+        if (currentTarget) await this.checkRecoveryTarget(currentTarget, operation)
         await replaceLink(this.options.currentPath, currentTarget).catch(() => undefined)
         await replaceLink(this.options.previousPath, operation.previousTarget).catch(
           () => undefined,
@@ -275,6 +283,18 @@ export class SourceUpdateWorker {
         throw normalizeWorkerError(error, "source_update_worker_rollback_failed", 503)
       }
     })
+  }
+
+  private async checkRecoveryTarget(target: string, operation: WorkerOperation): Promise<void> {
+    try {
+      await assertDataCompatible(target, this.options.dataRoot)
+    } catch (error) {
+      operation.status = "failed"
+      operation.message = `自动恢复已停止，部署链接保持当前目标：${workerErrorText(error)}`
+      operation.updatedAt = now()
+      await this.persist()
+      throw normalizeWorkerError(error, "source_update_data_incompatible", 409)
+    }
   }
 
   async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -428,6 +448,9 @@ export async function createUpdateWorkerFromEnvironment(
     healthUrl,
     allowApply: env.CTF_AGENT_UPDATE_ALLOW_APPLY === "1",
     runSandboxBuild: env.CTF_AGENT_UPDATE_BUILD_SANDBOX === "1",
+    ...(env.CTF_AGENT_UPDATE_DATA_ROOT
+      ? { dataRoot: requiredPath(env.CTF_AGENT_UPDATE_DATA_ROOT, "CTF_AGENT_UPDATE_DATA_ROOT") }
+      : {}),
     ...(env.CTF_GITHUB_UPDATER_TOKEN ? { githubToken: env.CTF_GITHUB_UPDATER_TOKEN } : {}),
   }
   return { worker: await SourceUpdateWorker.open(options), options }
@@ -653,6 +676,9 @@ function normalizeWorkerError(
   status = 400,
 ): UpdateWorkerError {
   if (error instanceof UpdateWorkerError) return error
+  if (error instanceof DataCompatibilityError) {
+    return new UpdateWorkerError(error.code, error.message, error.status)
+  }
   return new UpdateWorkerError(fallbackCode, "Update Worker 操作失败", status)
 }
 

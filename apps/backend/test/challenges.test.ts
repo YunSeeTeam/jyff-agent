@@ -1,5 +1,5 @@
 import type { AgentOptions } from "@earendil-works/pi-agent-core"
-import { describe, expect, it } from "vite-plus/test"
+import { describe, expect, it, vi } from "vite-plus/test"
 import { createWebUiApp } from "../src/server.ts"
 import {
   FakeDashboardProject,
@@ -15,6 +15,44 @@ function appWithProject() {
 }
 
 describe("题目路由", () => {
+  it("blackboard reader parses repeated IDs and rejects unsafe/ambiguous queries", async () => {
+    const { app, project } = appWithProject()
+    const blackboardPage = vi.fn(() => ({
+      schemaVersion: 2 as const,
+      kind: "evidence" as const,
+      view: "index" as const,
+      readAt: "now",
+      entries: [],
+      missingIds: [],
+      omittedIds: [],
+      hasMore: false,
+    }))
+    Object.assign(project, { blackboardPage })
+    const response = await app.request("/api/challenges/pwn-1/blackboard?view=full&ids=17&ids=23")
+    expect(response.status).toBe(200)
+    expect(blackboardPage).toHaveBeenCalledWith("pwn-1", { view: "full", ids: [17, 23] })
+    for (const query of [
+      "ids=1,2",
+      "ids=[1]",
+      "ids=1&limit=8",
+      "afterId=-1",
+      "afterId=1.5",
+      "ids=9007199254740992",
+      "limit=1&limit=2",
+      "challengeId=elsewhere",
+      "kind=other",
+      "ids=0",
+    ]) {
+      expect((await app.request(`/api/challenges/pwn-1/blackboard?${query}`)).status).toBe(400)
+    }
+    expect((await app.request("/api/challenges/unknown/blackboard")).status).toBe(404)
+    const details = await jsonOf(await app.request("/api/challenges/pwn-1"))
+    expect(details).toMatchObject({
+      blackboardPaged: true,
+      blackboard: { evidence: [], opportunities: [] },
+    })
+  })
+
   it("设置不调度或人工已解状态并移出队列", async () => {
     const project = new FakeDashboardProject()
     const scheduler = new FakeDashboardScheduler()

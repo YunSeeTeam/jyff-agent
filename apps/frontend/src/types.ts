@@ -159,6 +159,7 @@ export interface ChallengeDetails {
   challenge: DashboardChallenge
   runs: DashboardRun[]
   blackboard: BlackboardSummary
+  blackboardPaged?: boolean
   environment: RemoteEnvironment | null
   writeup: ChallengeWriteup
   tldr: TldrRecord | null

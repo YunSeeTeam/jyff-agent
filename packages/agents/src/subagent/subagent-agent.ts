@@ -1,6 +1,11 @@
 import { join } from "node:path"
 import type { ChallengeCapability, ChallengeInfo } from "@ctf-agent/platform"
-import { SUBAGENT_COMPACTION_PROMPT, subagentTaskContextPrompt } from "@ctf-agent/prompts"
+import {
+  BLACKBOARD_READER_V2_PROMPT,
+  SUBAGENT_COMPACTION_PROMPT,
+  SUBAGENT_READER_COMPACTION_PROMPT,
+  subagentTaskContextPrompt,
+} from "@ctf-agent/prompts"
 import type { Sandbox } from "@ctf-agent/sandbox"
 import type { AgentMessage, AgentOptions, AgentTool } from "@earendil-works/pi-agent-core"
 import type { Api, Model } from "@earendil-works/pi-ai"
@@ -26,6 +31,8 @@ export interface CreateCtfSubagentOptions {
   agent: AgentOptions
   role: SubagentRole
   skills?: readonly AgentSkill[]
+  /** Challenge-bound read-only capability; never exposes a writable blackboard tool. */
+  blackboardReadTool?: AgentTool
   /** 可选注入 web-access 工具；role.tools 白名单未包含时不会启用。 */
   webAccessTools?: readonly AgentTool[]
   /** 可选注入 ShellPoop 反弹 shell 工具；role.tools 白名单未包含时不会启用。 */
@@ -45,7 +52,9 @@ export class CtfSubagent extends BaseAgent {
       compaction: options.compaction !== false,
       // The Solver's prompt promises snapshots the control plane only re-injects for
       // the Solver; a SubAgent must keep its own facts.
-      compactionInstructions: SUBAGENT_COMPACTION_PROMPT,
+      compactionInstructions: options.blackboardReadTool
+        ? SUBAGENT_READER_COMPACTION_PROMPT
+        : SUBAGENT_COMPACTION_PROMPT,
     })
     this.id = options.subagentId
     this.runId = options.runId
@@ -54,11 +63,24 @@ export class CtfSubagent extends BaseAgent {
   }
 
   static async create(options: CreateCtfSubagentOptions): Promise<CtfSubagent> {
+    if (
+      options.blackboardReadTool &&
+      options.role.tools &&
+      !options.role.tools.includes("blackboard_read")
+    ) {
+      throw Object.assign(
+        new Error(
+          `SubAgent ${options.role.name} must explicitly allow blackboard_read when reader v2 is enabled`,
+        ),
+        { code: "configuration_dependency_error" },
+      )
+    }
     const fallbackModel = options.agent.initialState?.model
     if (!fallbackModel) throw new Error("SubAgent 缺少可用模型")
     const models = modelsFromAgentOptions(options.agent, fallbackModel)
     const model = resolveRoleModel(models, fallbackModel, options.role.model)
     const allTools = [
+      ...(options.blackboardReadTool ? [options.blackboardReadTool] : []),
       ...(options.webAccessTools ?? []),
       ...(options.shellpoopTools ?? []),
       ...createSubagentTools({
@@ -94,6 +116,7 @@ export class CtfSubagent extends BaseAgent {
       model,
       systemPrompt: [
         options.role.systemPrompt,
+        ...(options.blackboardReadTool ? [BLACKBOARD_READER_V2_PROMPT] : []),
         subagentTaskContextPrompt({
           title: options.challenge.title,
           id: options.challenge.id,

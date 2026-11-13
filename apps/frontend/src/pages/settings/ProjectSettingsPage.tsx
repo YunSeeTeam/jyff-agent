@@ -24,6 +24,7 @@ import {
 import { apiMutation, apiRequest, projectApi } from "../../lib/api.ts"
 import { errorMessage } from "../../lib/format.ts"
 import type { ModelConfigurationView, ProjectRuntimeConfigurationView } from "../../types.ts"
+import { InformationSettings } from "./InformationSettings.tsx"
 
 interface RT {
   runtime: ProjectRuntimeConfigurationView
@@ -240,6 +241,23 @@ export function ProjectSettingsPage() {
               <div className="flex justify-end">
                 <Button onClick={() => void saveRt()} disabled={busy !== null} size="sm">
                   <Icon icon="lucide:save" width="13" /> 保存
+                </Button>
+              </div>
+            </Card>
+          </SettingsSection>
+          <SettingsSection title="证据、报告与技能" description="配置任务间的信息共享和技能选择。">
+            <Card className="space-y-4 p-4">
+              <InformationSettings
+                value={runtime}
+                roles={rt.models.subagentRoles ?? []}
+                disabled={busy !== null}
+                onChange={(settings) =>
+                  setRuntime((current) => (current ? { ...current, ...settings } : current))
+                }
+              />
+              <div className="flex justify-end">
+                <Button onClick={() => void saveRt()} disabled={busy !== null} size="sm">
+                  保存信息与技能配置
                 </Button>
               </div>
             </Card>

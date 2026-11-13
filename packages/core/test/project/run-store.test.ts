@@ -1356,7 +1356,10 @@ describe("RunStore", () => {
     expect(migrated.getRun("legacy-solved")?.observedAcceptedAt).toBeUndefined()
     expect(migrated.getRun("legacy-failed")?.solveOutcome).toBeUndefined()
     expect(migrated.isSolved("web-1")).toBe(true)
-    expect(migrated.dataCapabilities()).toEqual({ "accepted-fact": 1 })
+    expect(migrated.dataCapabilities()).toEqual({
+      "accepted-fact": 1,
+      "bounded-subagent-reports": 1,
+    })
     migrated.createRun({ id: "new-run", challengeId: "web-3", workspace: "w", attempt: 1 })
     migrated.updateRun("new-run", { status: "solved", closeReason: "submitted" })
     migrated.close()

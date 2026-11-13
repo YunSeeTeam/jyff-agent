@@ -235,6 +235,7 @@ export function ChallengePage() {
                 challengeId={challengeId}
                 tldr={details.tldr}
                 blackboard={details.blackboard}
+                blackboardPaged={details.blackboardPaged}
                 onChanged={reload}
               />
             </TabsContent>

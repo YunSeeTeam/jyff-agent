@@ -1,5 +1,7 @@
 import { basename } from "node:path"
 import { Hono } from "hono"
+import { validateBlackboardReadInput } from "@ctf-agent/core"
+import type { BlackboardReadInput } from "@ctf-agent/core/contracts"
 import { buildChallengeDetails } from "../../domain/view.ts"
 import type { DashboardProject } from "../../types.ts"
 import type { App, AppContext, AppEnv } from "../context.ts"
@@ -29,6 +31,50 @@ export function challengeRoutes(services: Services): App {
     const projectId = projectIdOf(c)
     return projectId ? services.sync.refreshProject(projectId) : services.sync.refresh()
   }
+
+  app.get("/challenges/:challengeId/blackboard", async (c) => {
+    const project = services.requireProject(projectIdOf(c))
+    const challengeId = c.req.param("challengeId")
+    if (!(await project.challenges()).some((challenge) => challenge.id === challengeId)) {
+      throw new HttpError(404, "challenge_not_found", "题目不存在")
+    }
+    if (!project.blackboardPage)
+      throw new HttpError(422, "capability_unavailable", "Blackboard reader v2 is unavailable")
+    const query = c.req.queries()
+    const input: BlackboardReadInput = {}
+    const integer = (value: string) => {
+      if (!/^(0|[1-9][0-9]*)$/.test(value) || !Number.isSafeInteger(Number(value))) {
+        throw new HttpError(400, "invalid_query", "Expected a safe integer")
+      }
+      return Number(value)
+    }
+    for (const [key, values] of Object.entries(query)) {
+      if (
+        !["kind", "view", "ids", "afterId", "limit"].includes(key) ||
+        (key !== "ids" && values.length !== 1)
+      ) {
+        throw new HttpError(400, "invalid_query", "Unknown or repeated query field")
+      }
+      if (key === "ids") input.ids = values.map(integer)
+      else if (key === "afterId" || key === "limit") input[key] = integer(values[0]!)
+      else if (key === "kind") input.kind = values[0] as BlackboardReadInput["kind"]
+      else if (key === "view") input.view = values[0] as BlackboardReadInput["view"]
+    }
+    const validation = validateBlackboardReadInput(input)
+    const page = validation ?? project.blackboardPage(challengeId, input)
+    if ("error" in page)
+      throw new HttpError(
+        page.error.code === "invalid_query" ? 400 : 422,
+        page.error.code,
+        page.error.message,
+        {
+          ...page.error.details,
+          retryable: page.error.retryable,
+          nextAction: page.error.nextAction,
+        },
+      )
+    return c.json(page)
+  })
 
   app.post("/challenges/:challengeId/dispatch", async (c) => {
     const body = await parseJsonBody(c, dispatchSchema, {

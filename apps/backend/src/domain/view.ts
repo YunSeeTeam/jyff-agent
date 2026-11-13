@@ -303,7 +303,10 @@ export async function buildChallengeDetails(
     solverAvailable: scheduler !== undefined,
     challenge,
     runs: [...runs].reverse(),
-    blackboard: project.blackboard(challengeId),
+    blackboard: project.blackboardPage
+      ? { evidence: [], opportunities: [] }
+      : project.blackboard(challengeId),
+    ...(project.blackboardPage ? { blackboardPaged: true } : {}),
     environment:
       snapshot.environments.find(
         (environment) =>

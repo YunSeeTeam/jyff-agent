@@ -33,6 +33,8 @@ import type {
   WorkspaceArtifactListing,
 } from "@ctf-agent/core"
 import type {
+  BlackboardReadInput,
+  BlackboardReadResult,
   RunSettings,
   RunSettingsPatch,
   SubagentListPageDto,
@@ -226,6 +228,7 @@ export interface ChallengeDetails {
   challenge: DashboardChallenge
   runs: DashboardRun[]
   blackboard: BlackboardSummary
+  blackboardPaged?: boolean
   environment: RemoteEnvironment | null
   writeup: ChallengeWriteup
   tldr: TldrRecord | null
@@ -274,6 +277,10 @@ export interface DashboardProject {
     model?: string
   }>
   blackboard(challengeId: string): BlackboardSummary
+  blackboardPage?(
+    challengeId: string,
+    input?: BlackboardReadInput,
+  ): BlackboardReadResult | ToolErrorEnvelope
   blackboardStats(): BlackboardStats[]
   challengeWriteup(challengeId: string): Promise<ChallengeWriteup>
   challengeWorkspaceFiles(challengeId: string): Promise<WorkspaceArtifactListing>

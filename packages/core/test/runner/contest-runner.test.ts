@@ -187,7 +187,7 @@ describe("ContestRunner", () => {
     const byId = new Map(items.map((item) => [item.id, item]))
     const tracker = new SandboxTracker()
     const settings = mergeRunSettings(defaultRunSettings(), {
-      optimization: { blackboardReaderV2: true },
+      budgetPolicy: { enabled: true },
     })
     const { project } = await projectFixture(items, tracker, { runSettings: () => settings })
     try {
@@ -203,7 +203,7 @@ describe("ContestRunner", () => {
       expect(summary.results).toHaveLength(2)
       for (const result of summary.results) {
         expect(result).toMatchObject({ status: "failed", reason: "configuration", attempts: 1 })
-        expect(result.error).toContain("blackboard-reader-v2")
+        expect(result.error).toContain("budget-policy")
         expect(project.isChallengeBlocked(result.challengeId)).toBe(false)
       }
       expect(project.runs()).toHaveLength(2)

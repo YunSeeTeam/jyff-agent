@@ -27,6 +27,8 @@ import {
 } from "@ctf-agent/platform"
 import {
   blackboardSnapshotPrompt,
+  BLACKBOARD_READER_V2_PROMPT,
+  SOLVER_SYSTEM_PROMPT,
   challengeAnnouncementsPrompt,
   challengeContextPrompt,
 } from "@ctf-agent/prompts"
@@ -53,6 +55,7 @@ import type {
 } from "@earendil-works/pi-agent-core"
 import { extractAssistantText, extractThinkingText } from "../agent/thinking.ts"
 import {
+  type BlackboardReadInput,
   configurationDependencyIssues,
   defaultRunSettings,
   type RunSettings,
@@ -60,11 +63,13 @@ import {
   type SubagentResultPageDto,
   type SubagentResultQuery,
   type ToolErrorEnvelope,
+  toolError,
 } from "../contracts/index.ts"
 import {
   assertResumableRuntime,
   BUILD_OPTIMIZATION_CAPABILITIES,
   buildRunConfigSnapshot,
+  frozenSubagentRoles,
   RUN_CONFIG_SNAPSHOT_FILE,
   type RunConfigOrigin,
   type RunConfigSnapshot,
@@ -73,6 +78,12 @@ import {
   runConfigHash,
   writeRunConfigSnapshot,
 } from "./run-config-snapshot.ts"
+import { openRunSkills, SkillSnapshotError } from "./run-skill-snapshot.ts"
+import {
+  readBlackboard,
+  createBlackboardReadTool,
+  blackboardIndexSnapshot,
+} from "../collaboration/blackboard-reader.ts"
 import {
   BLACKBOARD_INJECTION_MAX_CHARACTERS,
   createBlackboardTools,
@@ -286,6 +297,7 @@ export class Project {
   readonly agentDirectory: string
   private readonly solvers = new Set<CtfSolverAgent>()
   private readonly subagentManagers = new Map<string, CtfSubagentManager>()
+  private readonly frozenRunSettings = new Map<string, RunSettings>()
   private readonly runChallengeContexts = new Map<string, string>()
   private readonly challengeSchedulingHints = new Map<
     string,
@@ -927,15 +939,34 @@ export class Project {
     query: SubagentResultQuery,
   ): SubagentResultPageDto | ToolErrorEnvelope | undefined {
     const { agentId, ...page } = query
-    const record = this.runStore.subagents(runId).find((candidate) => candidate.id === agentId)
-    return record ? subagentResultPage(record, page) : undefined
+    try {
+      const record =
+        this.subagentManagers.get(runId)?.get(agentId) ??
+        this.runStore.subagents(runId).find((candidate) => candidate.id === agentId)
+      return record ? subagentResultPage(record, page) : undefined
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "report_persistence_failed") {
+        return toolError("report_persistence_failed", error.message, {
+          retryable: false,
+          nextAction: "Inspect storage diagnostics and recover this execution before resuming.",
+        })
+      }
+      throw error
+    }
+  }
+  blackboardPage(challengeId: string, input: BlackboardReadInput = {}) {
+    return readBlackboard(this.runStore, challengeId, input)
   }
   compactRecoveryPrompt(challengeId: string, runId: string): string {
     const challengeContext = this.runChallengeContexts.get(runId)
     if (!challengeContext) {
       throw new Error(`Run ${runId} 缺少 compact 恢复所需的题目上下文`)
     }
-    const blackboard = injectBlackboard(this.runStore, challengeId)
+    const blackboard = injectBlackboard(
+      this.runStore,
+      challengeId,
+      this.frozenRunSettings.get(runId)?.optimization.blackboardReaderV2,
+    )
     const subagents = this.subagentManagers.get(runId)?.list() ?? this.runStore.subagents(runId)
     const announcements = this.runStore.challengeAnnouncements(challengeId)
     const environment = this.remoteEnvironments.environmentForRun(runId)
@@ -1047,6 +1078,7 @@ export class Project {
     for (const run of deletedRuns) {
       this.subagentManagers.delete(run.id)
       this.runChallengeContexts.delete(run.id)
+      this.frozenRunSettings.delete(run.id)
       for (const key of this.agentStreamSequences.keys()) {
         if (key.startsWith(`${run.id} `)) this.agentStreamSequences.delete(key)
       }
@@ -1265,7 +1297,26 @@ export class Project {
     // 提升到 try 之外，使创建失败路径的 catch 也能回收会话（闭包经 onBeforeCleanup 使用）。
     let shellpoopSession: ShellPoopSession | undefined
     try {
-      await this.freezeRunConfiguration({ runId, challengeId, runDirectory, resumed, options })
+      const configuration = await this.freezeRunConfiguration({
+        runId,
+        challengeId,
+        runDirectory,
+        resumed,
+        options,
+      })
+      this.frozenRunSettings.set(runId, configuration.settings)
+      const roles = frozenSubagentRoles(configuration, this.configuredSubagentRoles())
+      const readerV2 = configuration.settings.optimization.blackboardReaderV2
+      if (readerV2) {
+        for (const role of roles.values()) {
+          if (role.enabled && role.tools && !role.tools.includes("blackboard_read")) {
+            throw new RunConfigurationError(
+              "configuration_dependency_error",
+              `SubAgent role ${role.name} must explicitly allow blackboard_read`,
+            )
+          }
+        }
+      }
       capability = await this.platform.bindChallenge(challengeId)
       const challenge = await capability.getInfo()
       this.challengeSchedulingHints.set(challengeId, {
@@ -1294,7 +1345,7 @@ export class Project {
         },
       })
 
-      const blackboardInject = injectBlackboard(this.runStore, challengeId)
+      const blackboardInject = injectBlackboard(this.runStore, challengeId, readerV2)
       const blackboardMessages: AgentMessage[] =
         !resumed && blackboardInject
           ? [{ role: "user", content: blackboardInject, timestamp: Date.now() }]
@@ -1312,7 +1363,30 @@ export class Project {
           : []
 
       // skills 的脚本/参考资料必须在容器内可见，不能把宿主机路径注入给 Agent。
-      const skills = await materializeSkills(this.skills, workspace)
+      const runSkills = configuration.settings.optimization.skillSnapshots
+        ? await openRunSkills({
+            runDirectory,
+            workspace,
+            configuration,
+            discovered: this.skills,
+            hasStarted: this.runHasStarted(runId),
+            onPublished: (manifest) => {
+              if (
+                !this.runStore.events(runId).some((event) => event.type === "run_skill_snapshot")
+              ) {
+                this.runStore.appendEvent(runId, "run_skill_snapshot", {
+                  manifestHash: manifest.manifestHash,
+                  path: `runs/${runId}/skills/manifest.json`,
+                })
+              }
+            },
+            onRepaired: (name) =>
+              this.runStore.appendEvent(runId, "run_skill_workspace_repaired", { name }),
+          })
+        : undefined
+      const skills = runSkills
+        ? await runSkills.forSolver()
+        : await materializeSkills(this.skills, workspace)
       sandbox = await this.sandboxFactory({
         projectId: this.config.project.id,
         runId,
@@ -1376,8 +1450,19 @@ export class Project {
         capability,
         sandbox,
         agent: options.agent,
-        roles: this.configuredSubagentRoles(),
+        roles,
         skills,
+        ...(runSkills ? { skillsForRole: (role: string) => runSkills.forRole(role) } : {}),
+        ...(readerV2
+          ? { blackboardReadTool: createBlackboardReadTool(this.runStore, challengeId) }
+          : {}),
+        fullSubagentReports: configuration.settings.optimization.fullSubagentReports,
+        persistence: {
+          beginExecution: (record, previousExecutionId) =>
+            this.runStore.beginSubagentExecution(record, previousExecutionId),
+          commitResult: (record) => this.runStore.commitSubagentResult(record),
+          recordProgress: (record) => this.runStore.recordSubagentProgress(record),
+        },
         webAccessTools,
         shellpoopTools,
         maxConcurrent: this.subagentRuntime.maxConcurrent,
@@ -1408,7 +1493,6 @@ export class Project {
         },
         onRecord: (subagent, event) => {
           try {
-            this.runStore.upsertSubagent(subagent)
             this.runStore.appendEvent(runId, `subagent_${event}`, {
               subagentId: subagent.id,
               role: subagent.role,
@@ -1448,13 +1532,19 @@ export class Project {
               ...webAccessTools,
               ...shellpoopTools,
               ...createBlackboardTools({
+                readerV2,
                 runStore: this.runStore,
                 challengeId,
                 runId,
               }),
               ...createSubagentManagerTools(subagentManager),
             ],
-            systemPrompt: [options.agent.initialState?.systemPrompt].filter(Boolean).join("\n\n"),
+            systemPrompt: [
+              options.agent.initialState?.systemPrompt || SOLVER_SYSTEM_PROMPT,
+              ...(readerV2 ? [BLACKBOARD_READER_V2_PROMPT] : []),
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
             messages: [
               ...(options.agent.initialState?.messages ?? []),
               ...challengeMessages,
@@ -1489,6 +1579,7 @@ export class Project {
           this.solvers.delete(solver)
           this.subagentManagers.delete(runId)
           this.runChallengeContexts.delete(runId)
+          this.frozenRunSettings.delete(runId)
           const eventType =
             details.reason === "interrupted"
               ? "run_interrupted"
@@ -1605,6 +1696,7 @@ export class Project {
       return solver
     } catch (error) {
       this.runChallengeContexts.delete(runId)
+      this.frozenRunSettings.delete(runId)
       const cleanupErrors: string[] = []
       if (subagentManager) {
         try {
@@ -1637,7 +1729,8 @@ export class Project {
       const failures: unknown[] = [error, ...cleanupErrors.map((message) => new Error(message))]
       const attachmentFailure = error instanceof ChallengeAttachmentError
       // A rejected Run configuration is the operator's to fix, not the challenge's fault.
-      const configurationFailure = error instanceof RunConfigurationError
+      const configurationFailure =
+        error instanceof RunConfigurationError || error instanceof SkillSnapshotError
       const blockImmediately =
         !resumed && attempt === 1 && !attachmentFailure && !configurationFailure
       const retryable = attachmentFailure
@@ -2098,7 +2191,8 @@ function announcementCandidateNotFound(challengeId: string, announcementKey: str
   })
 }
 
-function injectBlackboard(runStore: RunStore, challengeId: string): string {
+function injectBlackboard(runStore: RunStore, challengeId: string, readerV2 = false): string {
+  if (readerV2) return blackboardIndexSnapshot(runStore, challengeId)
   const summary = runStore.getBlackboardSummary(challengeId)
   const text = serializeBlackboard(summary, {
     maxCharacters: BLACKBOARD_INJECTION_MAX_CHARACTERS,

@@ -1,5 +1,5 @@
 import { Icon } from "@iconify/react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Button, Card } from "../../components/index.ts"
 import { ApiError, apiRequest, projectApi } from "../../lib/api.ts"
 import { errorMessage } from "../../lib/format.ts"
@@ -35,10 +35,16 @@ export function SubagentReport({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const version = subagent.resultVersion
+  const requestGeneration = useRef(0)
 
   useEffect(() => {
     setReport(null)
     setError("")
+    setLoading(false)
+    requestGeneration.current++
+    return () => {
+      requestGeneration.current++
+    }
   }, [projectId, runId, subagent.id, version])
 
   const readPage = (offset: number, expectedVersion?: string) => {
@@ -61,14 +67,16 @@ export function SubagentReport({
   })
 
   const run = async (read: () => Promise<LoadedReport>) => {
+    const generation = ++requestGeneration.current
     setLoading(true)
     setError("")
     try {
-      setReport(await read())
+      const loadedReport = await read()
+      if (generation === requestGeneration.current) setReport(loadedReport)
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (generation === requestGeneration.current) setError(errorMessage(cause))
     } finally {
-      setLoading(false)
+      if (generation === requestGeneration.current) setLoading(false)
     }
   }
 
@@ -90,12 +98,12 @@ export function SubagentReport({
   const kind = subagent.resultKind ? KIND_LABELS[subagent.resultKind] : undefined
   return (
     <Card className="overflow-hidden p-0">
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2.5">
-        <span className="flex items-center gap-2.5 text-sm font-medium">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-border px-3 py-2.5">
+        <span className="flex items-center gap-2.5 whitespace-nowrap text-sm font-medium">
           <Icon icon="lucide:file-text" width="15" />
           SubAgent 报告
         </span>
-        <span className="font-mono text-[10px] text-muted-foreground">
+        <span className="whitespace-nowrap font-mono text-[10px] text-muted-foreground">
           {kind ? `${kind} · ` : ""}
           {(subagent.totalLength ?? 0).toLocaleString()} 字符
         </span>

@@ -32,6 +32,19 @@ export const SUBAGENT_COMPACTION_PROMPT = [
   "Note which findings you have not yet reported to the primary Solver.",
 ].join("\n")
 
+export const BLACKBOARD_READER_V2_PROMPT = [
+  "The shared blackboard contains recorded evidence and observations, including unverified interpretations. Verify important claims under their stated conditions.",
+  "Multiple reports repeating the same original observation are one source, not independent corroboration. Record or report observations, conditions, source references, interpretation, and the precise scope of negative results separately.",
+  "blackboard_read {} returns only the first evidence index page. Use kind=opportunity for leads and afterId=nextAfterId for later pages. Use view=full with ids for complete records, and omittedIds to continue an ID query.",
+  "Re-read important records and compare contentHash before relying on them; a hash detects text changes, not changes to the challenge environment. Only the primary Solver writes the blackboard.",
+].join("\n")
+
+export const SUBAGENT_READER_COMPACTION_PROMPT = [
+  "Compact this SubAgent investigation so it can continue. No full blackboard or other worker transcript is re-injected.",
+  "Preserve the delegated task, constraints, later instructions, candidate flags and verification status, experimental conditions, artifact paths/hashes, negative results with their exact scope, and the next executable steps.",
+  "Preserve relevant blackboard IDs and contentHash values. You can re-read complete records with blackboard_read view=full and ids; re-read before relying on key conclusions. Keep your own unreported facts explicitly because they are not on the board.",
+].join("\n")
+
 export function subagentTaskContextPrompt(options: {
   title: string
   id: string

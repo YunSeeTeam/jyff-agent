@@ -4,6 +4,10 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vite-plus/test"
 import type { SubagentRecord } from "../../src/collaboration/subagent-manager.ts"
 import { RunStore } from "../../src/persistence/run-store.ts"
+import {
+  firstSubagentResultPage,
+  subagentResultVersion,
+} from "../../src/collaboration/subagent-report.ts"
 
 const roots: string[] = []
 
@@ -44,6 +48,89 @@ function record(overrides: Partial<SubagentRecord> = {}): SubagentRecord {
 }
 
 describe("RunStore SubAgent persistence", () => {
+  it("CAS isolates resumes and the first terminal writer wins (T13/T14)", async () => {
+    const store = await storeFixture()
+    store.createRun({ id: "run-1", challengeId: "pwn-1", workspace: "workspace", attempt: 1 })
+    const started = store.beginSubagentExecution(record({ executionId: "first" }), null)
+    const completed = store.commitSubagentResult({
+      ...started,
+      status: "completed",
+      result: "same",
+      resultKind: "assistant_final",
+    })
+    expect(
+      store.commitSubagentResult({ ...started, status: "cancelled", result: "loser" }),
+    ).toEqual(completed)
+    store.recordSubagentProgress({ ...started, turns: 500, result: "must not write" })
+    expect(store.subagents("run-1")[0]).toEqual(completed)
+    const resumed = store.beginSubagentExecution(
+      { ...completed, executionId: "second", status: "running" },
+      "first",
+    )
+    expect(resumed.result).toBeUndefined()
+    expect(() => store.commitSubagentResult({ ...completed, result: "stale" })).toThrow(
+      expect.objectContaining({ code: "stale_execution" }),
+    )
+    expect(() => store.recordSubagentProgress({ ...started, turns: 1000 })).toThrow(
+      expect.objectContaining({ code: "stale_execution" }),
+    )
+    expect(() =>
+      store.beginSubagentExecution({ ...resumed, executionId: "third" }, "first"),
+    ).toThrow()
+    expect(() => store.upsertSubagent({ ...resumed, executionId: undefined })).toThrow()
+    const final = store.commitSubagentResult({
+      ...resumed,
+      status: "cancelled",
+      result: "same",
+      resultKind: "assistant_partial",
+    })
+    expect(subagentResultVersion(final)).not.toBe(subagentResultVersion(completed))
+    expect(
+      store.events("run-1").filter((event) => event.type === "subagent_result_committed"),
+    ).toHaveLength(2)
+    store.close()
+  })
+
+  it("rejects oversized reports without changing active state (T16)", async () => {
+    const store = await storeFixture()
+    store.createRun({ id: "run-1", challengeId: "pwn-1", workspace: "workspace", attempt: 1 })
+    const started = store.beginSubagentExecution(record({ executionId: "one" }), null)
+    expect(() =>
+      store.commitSubagentResult({
+        ...started,
+        status: "completed",
+        result: "x".repeat(4 * 1024 * 1024 + 1),
+      }),
+    ).toThrow(expect.objectContaining({ code: "report_storage_limit" }))
+    expect(store.subagents("run-1")[0]).toMatchObject({ status: "running" })
+    store.close()
+  })
+
+  it("reopens long reports unchanged and serves bounded pages when feature is off (T40)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "subagent-rollback-"))
+    roots.push(root)
+    const path = join(root, "runs.sqlite")
+    let store = await RunStore.open(path)
+    store.createRun({ id: "run-1", challengeId: "pwn-1", workspace: "workspace", attempt: 1 })
+    const started = store.beginSubagentExecution(record({ executionId: "one" }), null)
+    const text = "😀界".repeat(9000) + "tail"
+    store.commitSubagentResult({
+      ...started,
+      status: "completed",
+      result: text,
+      resultKind: "assistant_final",
+    })
+    store.close()
+    store = await RunStore.open(path)
+    const saved = store.subagents("run-1")[0]!
+    expect(saved.result).toBe(text)
+    const page = firstSubagentResultPage(saved)
+    expect(Array.from(page.result)).toHaveLength(8000)
+    expect(page.hasMore).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(96 * 1024)
+    store.close()
+  })
+
   it("以同一稳定 ID 更新完整 worker 生命周期快照", async () => {
     const store = await storeFixture()
     store.createRun({

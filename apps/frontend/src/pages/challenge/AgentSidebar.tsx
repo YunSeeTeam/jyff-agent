@@ -83,7 +83,7 @@ export function AgentSidebar({
           </span>
           <Badge className="text-[10px]">{run?.subagentCount ?? 0}</Badge>
         </div>
-        <div className="flex flex-col gap-0.5 overflow-y-auto p-1.5">
+        <div className="flex max-h-80 flex-col gap-0.5 overflow-y-auto p-1.5">
           <AR
             icon="lucide:bot"
             title="Solver"

@@ -22,10 +22,14 @@ import {
 import { RUN_STORE_DATA_CAPABILITIES } from "../persistence/run-store.ts"
 
 /**
- * Optional capabilities this build provides. Empty until stage 3 ships the
- * information contracts; every switch therefore stays off.
+ * Implemented information contracts. Settings still default off; budget,
+ * persistent processes and review remain unavailable until their own gates pass.
  */
-export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability> = new Set()
+export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability> = new Set([
+  "blackboard-reader-v2",
+  "full-subagent-reports",
+  "skill-snapshots",
+])
 
 export const RUN_CONFIG_SNAPSHOT_FILE = "run-config.json"
 
@@ -66,6 +70,8 @@ export interface RunConfigSnapshot {
     thinkingLevel: ThinkingLevel
     systemPromptSha256: string
   }>
+  /** Actual role definitions for new snapshots; hashes alone cannot restore a changed prompt. */
+  roleDefinitions?: SubagentRole[]
   /** Null when the Run was created without a configured model. */
   model: {
     provider: string
@@ -215,6 +221,7 @@ export async function buildRunConfigSnapshot(
     origin: input.origin ?? "new_run",
     settings: structuredClone(input.settings),
     skills: { solver: solver.names, subagentDefault: subagentDefault.names, subagentRoles },
+    roleDefinitions: structuredClone([...input.subagentRoles.values()]),
     subagentRoles: [...input.subagentRoles.values()]
       .map((role) => ({
         name: role.name,
@@ -245,6 +252,35 @@ export async function buildRunConfigSnapshot(
     },
     runtimeProfile: await currentRuntimeProfile(),
   }
+}
+
+/** Restore frozen roles; old hash-only snapshots fail explicitly if source definitions changed. */
+export function frozenSubagentRoles(
+  snapshot: RunConfigSnapshot,
+  current: ReadonlyMap<string, SubagentRole>,
+): ReadonlyMap<string, SubagentRole> {
+  const roles = snapshot.roleDefinitions
+    ? new Map(snapshot.roleDefinitions.map((role) => [role.name, role]))
+    : current
+  const restored = new Map<string, SubagentRole>()
+  for (const frozen of snapshot.subagentRoles) {
+    const role = roles.get(frozen.name)
+    if (
+      !role ||
+      sha256(role.systemPrompt) !== frozen.systemPromptSha256 ||
+      canonicalJson(role.tools ?? "all") !== canonicalJson(frozen.tools) ||
+      role.enabled !== frozen.enabled ||
+      role.thinkingLevel !== frozen.thinkingLevel ||
+      (role.model ?? null) !== frozen.model
+    ) {
+      throw new RunConfigurationError(
+        "capability_unavailable",
+        `Frozen SubAgent role unavailable: ${frozen.name}`,
+      )
+    }
+    restored.set(role.name, structuredClone(role))
+  }
+  return restored
 }
 
 /** Publish the snapshot atomically next to the Run's session. */

@@ -54,6 +54,7 @@ export function subagentSummary(
   return {
     id: record.id,
     runId: record.runId,
+    ...(record.executionId ? { executionId: record.executionId } : {}),
     role: codePointPrefix(record.role, NAME_MAX_CODE_POINTS).text,
     displayName: codePointPrefix(record.displayName, NAME_MAX_CODE_POINTS).text,
     status: record.status,
@@ -81,9 +82,8 @@ export function subagentSummary(
       : {}),
     ...(preview ? { resultPreview: preview.text } : {}),
     ...(kind ? { resultKind: kind } : {}),
-    ...(result
-      ? { resultVersion: subagentResultVersion(record), totalLength: subagentResultLength(record) }
-      : {}),
+    resultVersion: subagentResultVersion(record),
+    totalLength: subagentResultLength(record),
     hasMore: result ? (preview?.truncated ?? true) : false,
   }
 }

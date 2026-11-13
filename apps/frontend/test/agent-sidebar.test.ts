@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { createElement } from "react"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { AgentSidebar } from "../src/pages/challenge/AgentSidebar.tsx"
@@ -12,6 +12,49 @@ const endpoint =
 afterEach(cleanup)
 
 describe("AgentSidebar", () => {
+  it("ignores a delayed report response from the execution replaced during the request", async () => {
+    const run = details.runs[0]!
+    const worker = run.subagents[0]!
+    const snapshot = (version: string) =>
+      ({
+        ...details,
+        runs: [
+          {
+            ...run,
+            subagents: [{ ...worker, resultVersion: version, totalLength: 10, hasMore: false }],
+          },
+        ],
+      }) as ChallengeDetails
+    let resolveOld!: (response: Response) => void
+    const old = new Promise<Response>((resolve) => {
+      resolveOld = resolve
+    })
+    const response = (version: string, result: string) =>
+      new Response(JSON.stringify({ resultVersion: version, result, hasMore: false }), {
+        headers: { "content-type": "application/json" },
+      })
+    const fetchMock = vi
+      .fn()
+      .mockReturnValueOnce(old)
+      .mockResolvedValueOnce(response("v1:new", "current execution"))
+    vi.stubGlobal("fetch", fetchMock)
+    try {
+      const { rerender } = render(sidebar("worker-1", snapshot("v1:old")))
+      fireEvent.click(screen.getByRole("button", { name: "查看报告" }))
+      rerender(sidebar("worker-1", snapshot("v1:new")))
+      fireEvent.click(screen.getByRole("button", { name: "查看报告" }))
+      await waitFor(() => expect(screen.getByText("current execution")).toBeTruthy())
+      await act(async () => {
+        resolveOld(response("v1:old", "obsolete execution"))
+        await old
+      })
+      expect(screen.getByText("current execution")).toBeTruthy()
+      expect(screen.queryByText("obsolete execution")).toBeNull()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it("根据选中 Agent 按需展示用量详情", () => {
     const { rerender } = renderSidebar("worker-1")
 

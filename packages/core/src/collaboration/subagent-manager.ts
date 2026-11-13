@@ -8,6 +8,9 @@ import {
   type ChallengeInfo,
   type CtfSolverAgent,
   CtfSubagent,
+  collectSubagentReport,
+  markSubagentExecution,
+  type ExecutionOutcome,
   resolveSubagentRole,
   type Sandbox,
   type SubagentRole,
@@ -16,14 +19,18 @@ import { subagentCompletionNotificationPrompt } from "@ctf-agent/prompts"
 import { DockerExecutionEnv } from "@ctf-agent/sandbox"
 import type { AgentOptions, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
-import { extractAssistantText } from "../agent/thinking.ts"
 import {
   SUBAGENT_LIST_MAX_LIMIT,
+  SUBAGENT_REPORT_MAX_STORED_BYTES,
+  type SubagentResultKind,
+  toolError,
   SUBAGENT_RESULT_PAGE_MAX_CODE_POINTS,
   type SubagentListPageDto,
   type SubagentResultPageDto,
   type SubagentStatus,
   type ToolErrorEnvelope,
+  type ToolErrorCode,
+  codePointPrefix,
 } from "../contracts/index.ts"
 import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentListPage } from "./subagent-projection.ts"
 import { firstSubagentResultPage, subagentResultPage } from "./subagent-report.ts"
@@ -41,6 +48,8 @@ export interface SubagentRecord {
   prompt: string
   sessionPath: string
   containerCwd: string
+  executionId?: string
+  resultKind?: SubagentResultKind
   result?: string
   error?: string
   activeTool?: string
@@ -66,6 +75,12 @@ export type SubagentLifecycleEvent =
   | "aborted"
   | "steered"
 
+export interface SubagentLifecyclePersistence {
+  beginExecution(record: SubagentRecord, previousExecutionId: string | null): SubagentRecord
+  commitResult(record: SubagentRecord): SubagentRecord
+  recordProgress(record: SubagentRecord): void
+}
+
 export interface SubagentManagerOptions {
   projectId: string
   runId: string
@@ -76,6 +91,10 @@ export interface SubagentManagerOptions {
   agent: AgentOptions
   roles: ReadonlyMap<string, SubagentRole>
   skills?: readonly AgentSkill[]
+  skillsForRole?: (role: string) => Promise<readonly AgentSkill[]>
+  blackboardReadTool?: AgentTool
+  fullSubagentReports?: boolean
+  persistence?: SubagentLifecyclePersistence
   /** 可选注入 web-access 工具，SubAgent 通过 role.tools 白名单决定是否启用。 */
   webAccessTools?: AgentTool[]
   /** 可选注入 ShellPoop 反弹 shell 工具，SubAgent 通过 role.tools 白名单决定是否启用。 */
@@ -96,6 +115,11 @@ interface ManagedSubagent {
   agent?: CtfSubagent
   promise: Promise<SubagentRecord>
   resolve: (record: SubagentRecord) => void
+  reject: (error: unknown) => void
+  storageError?: Error
+  unsubscribe?: () => void
+  launchPromise?: Promise<void>
+  pendingReport?: { result: string; resultKind: SubagentResultKind }
   resultConsumed: boolean
   hardAborted: boolean
 }
@@ -143,18 +167,9 @@ export class CtfSubagentManager {
       if (!TERMINAL.has(record.status)) continue
       const role = resolveSubagentRole(this.options.roles, record.role)
       if (!role) continue
-      let resolve!: (value: SubagentRecord) => void
-      const promise = new Promise<SubagentRecord>((done) => {
-        resolve = done
-      })
-      this.records.set(record.id, {
-        record: snapshot(record),
-        role,
-        promise,
-        resolve,
-        resultConsumed: false,
-        hardAborted: false,
-      })
+      const managed = this.managed(snapshot(record), role)
+      managed.resolve(snapshot(record))
+      this.records.set(record.id, managed)
     }
   }
 
@@ -181,6 +196,7 @@ export class CtfSubagentManager {
     const now = new Date().toISOString()
     const record: SubagentRecord = {
       id,
+      executionId: randomUUID(),
       runId: this.options.runId,
       role: role.name,
       displayName: role.displayName,
@@ -199,18 +215,8 @@ export class CtfSubagentManager {
       createdAt: now,
       updatedAt: now,
     }
-    let resolve!: (value: SubagentRecord) => void
-    const promise = new Promise<SubagentRecord>((done) => {
-      resolve = done
-    })
-    const managed: ManagedSubagent = {
-      record,
-      role,
-      promise,
-      resolve,
-      resultConsumed: false,
-      hardAborted: false,
-    }
+    const committed = this.begin(record, null)
+    const managed = this.managed(committed, role)
     this.records.set(id, managed)
     this.emit(managed, "created")
     if (input.background && this.runningBackground >= this.maxConcurrent) {
@@ -218,7 +224,7 @@ export class CtfSubagentManager {
     } else {
       this.launch(managed, prompt, true)
     }
-    return snapshot(record)
+    return snapshot(managed.record)
   }
 
   async resume(id: string, prompt: string, background: boolean): Promise<SubagentRecord> {
@@ -234,36 +240,74 @@ export class CtfSubagentManager {
     background: boolean,
     bypassQueue = false,
   ): Promise<SubagentRecord> {
-    const managed = this.records.get(id)
-    if (!managed || !TERMINAL.has(managed.record.status)) {
+    const previous = this.records.get(id)
+    if (!previous || !TERMINAL.has(previous.record.status)) {
       throw new Error(`SubAgent ${id} 不存在、尚未完成或会话不可恢复`)
     }
+    if (previous.storageError) throw previous.storageError
     const nextPrompt = boundedText(prompt, "prompt", 32_000)
-    managed.record.background = background
-    managed.record.status = background ? "queued" : "running"
-    managed.record.prompt = nextPrompt
-    managed.record.result = undefined
-    managed.record.error = undefined
-    managed.record.completedAt = undefined
-    managed.record.updatedAt = new Date().toISOString()
-    managed.resultConsumed = false
-    managed.hardAborted = false
-    let resolve!: (value: SubagentRecord) => void
-    managed.promise = new Promise<SubagentRecord>((done) => {
-      resolve = done
-    })
-    managed.resolve = resolve
+    // Await old transport teardown before reusing its session. Re-check identity
+    // afterwards so two concurrent resumes cannot both claim the old execution.
+    await previous.launchPromise
+    await previous.agent?.waitForIdle()
+    if (this.records.get(id) !== previous)
+      throw lifecycleError("stale_execution", "Execution already replaced")
+    previous.unsubscribe?.()
+    const record: SubagentRecord = {
+      ...previous.record,
+      executionId: randomUUID(),
+      background,
+      status: background ? "queued" : "running",
+      prompt: nextPrompt,
+      result: undefined,
+      resultKind: undefined,
+      error: undefined,
+      activeTool: undefined,
+      startedAt: undefined,
+      completedAt: undefined,
+      updatedAt: new Date().toISOString(),
+    }
+    const committed = this.begin(record, previous.record.executionId ?? null)
+    const managed = this.managed(committed, previous.role)
+    this.records.set(id, managed)
     this.emit(managed, "created")
     if (!bypassQueue && background && this.runningBackground >= this.maxConcurrent) {
       this.queue.push({ managed, prompt: nextPrompt })
-    } else {
-      this.launch(managed, nextPrompt, !managed.agent)
-    }
+    } else this.launch(managed, nextPrompt, true)
     return background ? snapshot(managed.record) : await managed.promise
+  }
+
+  private managed(record: SubagentRecord, role: SubagentRole): ManagedSubagent {
+    let resolve!: (value: SubagentRecord) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<SubagentRecord>((done, fail) => {
+      resolve = done
+      reject = fail
+    })
+    // Background failures remain observable via wait without unhandled rejections.
+    void promise.catch(() => undefined)
+    return { record, role, promise, resolve, reject, resultConsumed: false, hardAborted: false }
+  }
+
+  private current(managed: ManagedSubagent): boolean {
+    return this.records.get(managed.record.id) === managed && !managed.storageError
+  }
+
+  private begin(record: SubagentRecord, previousExecutionId: string | null): SubagentRecord {
+    try {
+      return this.options.persistence?.beginExecution(record, previousExecutionId) ?? record
+    } catch (error) {
+      if (hasLifecycleCode(error, "stale_execution")) throw error
+      throw lifecycleError(
+        "report_persistence_failed",
+        `Cannot begin SubAgent execution: ${errorText(error)}`,
+      )
+    }
   }
 
   get(id: string): SubagentRecord | undefined {
     const managed = this.records.get(id)
+    if (managed?.storageError) throw managed.storageError
     return managed ? snapshot(managed.record) : undefined
   }
 
@@ -283,9 +327,13 @@ export class CtfSubagentManager {
   async wait(id: string, signal?: AbortSignal): Promise<SubagentRecord> {
     const managed = this.records.get(id)
     if (!managed) throw new Error(`SubAgent 不存在: ${id}`)
+    if (managed.storageError) throw managed.storageError
     const result = TERMINAL.has(managed.record.status)
       ? managed.record
       : await abortable(managed.promise, signal)
+    if (this.records.get(id) !== managed)
+      throw lifecycleError("execution_changed", "Execution changed while waiting")
+    if (managed.storageError) throw managed.storageError
     managed.resultConsumed = true
     return snapshot(result)
   }
@@ -313,10 +361,11 @@ export class CtfSubagentManager {
           record,
           waitInterrupted: false,
         })),
-        waitForParentSteer(parent, combined).then(() => ({
-          record: snapshot(current.record),
-          waitInterrupted: true,
-        })),
+        waitForParentSteer(parent, combined).then(() => {
+          if (this.records.get(id) !== current)
+            throw lifecycleError("execution_changed", "Execution changed while waiting")
+          return { record: snapshot(current.record), waitInterrupted: true }
+        }),
       ])
     } finally {
       completed.abort()
@@ -360,16 +409,28 @@ export class CtfSubagentManager {
 
   async cancel(id: string): Promise<SubagentRecord> {
     const managed = this.records.get(id)
-    if (!managed || TERMINAL.has(managed.record.status)) {
-      throw new Error(`SubAgent ${id} 不存在或已经结束`)
+    if (!managed) throw new Error(`SubAgent ${id} 不存在`)
+    if (managed.storageError) throw managed.storageError
+    if (TERMINAL.has(managed.record.status)) return snapshot(managed.record)
+    const index = this.queue.findIndex((item) => item.managed === managed)
+    if (index >= 0) this.queue.splice(index, 1)
+    // Commit the first terminal state synchronously, before awaiting abort.
+    let captureError: unknown
+    try {
+      this.captureLatestResult(managed, "cancelled")
+    } catch (error) {
+      captureError = error
+      managed.pendingReport = undefined
+      managed.record.error = errorText(error)
+      managed.resultConsumed = true
+      managed.reject(error)
     }
-    if (managed.record.status === "queued") {
-      const index = this.queue.findIndex((item) => item.managed === managed)
-      if (index >= 0) this.queue.splice(index, 1)
-    } else {
+    try {
+      this.finish(managed, "cancelled")
+    } finally {
       await managed.agent?.abort()
     }
-    this.finish(managed, "cancelled")
+    if (captureError) throw captureError
     return snapshot(managed.record)
   }
 
@@ -390,7 +451,6 @@ export class CtfSubagentManager {
     await Promise.allSettled(
       running.map(async (record) => {
         const managed = this.records.get(record.id)
-        if (managed) await this.captureLatestResult(managed)
         await this.cancel(record.id)
         await managed?.agent?.waitForIdle()
       }),
@@ -408,13 +468,7 @@ export class CtfSubagentManager {
     const unfinished = this.list().filter(
       (record) => record.status === "running" || record.status === "queued",
     )
-    await Promise.allSettled(
-      unfinished.map(async (record) => {
-        const managed = this.records.get(record.id)
-        if (managed) await this.captureLatestResult(managed)
-        await this.cancel(record.id)
-      }),
-    )
+    await Promise.allSettled(unfinished.map((record) => this.cancel(record.id)))
     await Promise.allSettled(
       unfinished.map(
         (record) => this.records.get(record.id)?.agent?.waitForIdle() ?? Promise.resolve(),
@@ -439,7 +493,6 @@ export class CtfSubagentManager {
         // A winner has already ended the run. Persist the latest usable worker
         // output, but do not inject cancellation notices into the writeup turn.
         managed.resultConsumed = true
-        if (managed.record.status === "running") await this.captureLatestResult(managed)
         if (!TERMINAL.has(managed.record.status)) await this.cancel(record.id)
       }),
     )
@@ -452,7 +505,7 @@ export class CtfSubagentManager {
   private launch(managed: ManagedSubagent, prompt: string, initialize: boolean): void {
     const background = managed.record.background
     if (background) this.runningBackground++
-    void this.executeLaunch(managed, prompt, initialize).finally(() => {
+    managed.launchPromise = this.executeLaunch(managed, prompt, initialize).finally(() => {
       if (background) {
         this.runningBackground = Math.max(0, this.runningBackground - 1)
       }
@@ -483,19 +536,39 @@ export class CtfSubagentManager {
           sandbox: this.options.sandbox,
           agent: this.options.agent,
           role: managed.role,
-          skills: this.options.skills,
+          skills: this.options.skillsForRole
+            ? await this.options.skillsForRole(managed.role.name)
+            : this.options.skills,
+          blackboardReadTool: this.options.blackboardReadTool,
           webAccessTools: this.options.webAccessTools,
           shellpoopTools: this.options.shellpoopTools,
         })
+        if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
+        markSubagentExecution(managed.agent.sessionManager, managed.record.executionId!)
         this.subscribe(managed, managed.agent)
       }
-      if (TERMINAL.has(managed.record.status)) return
+      if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
       await this.run(managed, prompt)
     } catch (error) {
-      if (!isCancelled(managed)) {
-        await this.captureLatestResult(managed).catch(() => undefined)
-        managed.record.error = errorText(error)
+      if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
+      if (hasLifecycleCode(error, "report_persistence_failed")) {
+        this.failPersistence(managed, error)
+        return
+      }
+      try {
+        this.captureLatestResult(managed, "failed")
+      } catch {
+        managed.pendingReport = undefined
+      }
+      managed.record.error = errorText(error)
+      if (hasLifecycleCode(error, "report_storage_limit")) {
+        managed.resultConsumed = true
+        managed.reject(error)
+      }
+      try {
         this.finish(managed, managed.hardAborted ? "aborted" : "failed")
+      } catch (failure) {
+        this.failPersistence(managed, failure)
       }
     }
   }
@@ -504,27 +577,79 @@ export class CtfSubagentManager {
     managed.record.status = "running"
     managed.record.startedAt = new Date().toISOString()
     managed.record.updatedAt = managed.record.startedAt
+    this.progress(managed)
+    if (managed.storageError) throw managed.storageError
     this.emit(managed, "started")
-    await managed.agent?.prompt(prompt)
-    if (isCancelled(managed)) return
-    await this.captureLatestResult(managed)
-    this.finish(managed, managed.hardAborted ? "aborted" : "completed")
+    const message = await managed.agent!.prompt(prompt)
+    if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
+    const reason: string = message.stopReason
+    const status: SubagentStatus =
+      managed.hardAborted || reason === "aborted"
+        ? "aborted"
+        : reason === "cancel" || reason === "cancelled"
+          ? "cancelled"
+          : reason !== "stop"
+            ? "failed"
+            : "completed"
+    if (status !== "completed")
+      managed.record.error = message.errorMessage || `Agent stopped: ${reason}`
+    this.captureLatestResult(managed, status === "completed" ? "completed" : "failed")
+    this.finish(managed, status)
   }
 
-  private async captureLatestResult(managed: ManagedSubagent): Promise<void> {
-    const messages = (await managed.agent?.transcript()) ?? []
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const message = messages[index]
-      const text = extractAssistantText(message) || extractToolResultText(message)
-      if (text) {
-        managed.record.result = text
-        return
-      }
+  private captureLatestResult(
+    managed: ManagedSubagent,
+    outcome: ExecutionOutcome = "cancelled",
+  ): void {
+    if (!this.current(managed) || TERMINAL.has(managed.record.status) || !managed.agent) return
+    const report = collectSubagentReport(
+      managed.agent.sessionManager,
+      managed.record.executionId!,
+      outcome,
+    )
+    if (!report.available) {
+      if (report.reason === "boundary_unavailable")
+        throw lifecycleError(
+          "result_boundary_unavailable",
+          report.detail ?? "Missing execution boundary",
+        )
+      return
+    }
+    if (Buffer.byteLength(report.text, "utf8") > SUBAGENT_REPORT_MAX_STORED_BYTES) {
+      managed.pendingReport = undefined
+      throw lifecycleError(
+        "report_storage_limit",
+        "Report exceeds the 4 MiB storage limit; inspect the session",
+      )
+    }
+    managed.pendingReport = {
+      result: this.options.fullSubagentReports ? report.text : report.text.slice(0, 8_000),
+      resultKind: report.kind,
     }
   }
 
+  private progress(managed: ManagedSubagent): void {
+    if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
+    try {
+      this.options.persistence?.recordProgress(snapshot(managed.record))
+    } catch (error) {
+      this.failPersistence(managed, error)
+    }
+  }
+
+  private failPersistence(managed: ManagedSubagent, cause: unknown): void {
+    const error = lifecycleError(
+      "report_persistence_failed",
+      `SubAgent persistence failed: ${errorText(cause)}`,
+    )
+    managed.storageError = error
+    managed.reject(error)
+    void managed.agent?.abort().catch(() => undefined)
+  }
+
   private subscribe(managed: ManagedSubagent, agent: CtfSubagent): void {
-    agent.subscribe((event) => {
+    managed.unsubscribe = agent.subscribe((event) => {
+      if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
       try {
         const model = managed.agent?.model
         this.options.onAgentEvent?.(
@@ -565,15 +690,28 @@ export class CtfSubagentManager {
     }
     if (!changed) return
     managed.record.updatedAt = new Date().toISOString()
+    this.progress(managed)
     this.emit(managed, "progress")
   }
 
   private finish(managed: ManagedSubagent, status: SubagentStatus): void {
-    if (TERMINAL.has(managed.record.status)) return
-    managed.record.status = status
-    managed.record.activeTool = undefined
-    managed.record.completedAt = new Date().toISOString()
-    managed.record.updatedAt = managed.record.completedAt
+    if (!this.current(managed) || TERMINAL.has(managed.record.status)) return
+    const now = new Date().toISOString()
+    const next = {
+      ...managed.record,
+      ...managed.pendingReport,
+      status,
+      activeTool: undefined,
+      completedAt: now,
+      updatedAt: now,
+    }
+    try {
+      managed.record = this.options.persistence?.commitResult(next) ?? next
+    } catch (error) {
+      this.failPersistence(managed, error)
+      throw managed.storageError
+    }
+    status = managed.record.status
     const event: SubagentLifecycleEvent =
       status === "completed"
         ? "completed"
@@ -603,9 +741,13 @@ export class CtfSubagentManager {
   }
 
   private emit(managed: ManagedSubagent, event: SubagentLifecycleEvent): void {
-    void Promise.resolve(this.options.onRecord?.(snapshot(managed.record), event)).catch(
-      () => undefined,
-    )
+    try {
+      void Promise.resolve(this.options.onRecord?.(snapshot(managed.record), event)).catch(
+        () => undefined,
+      )
+    } catch {
+      /* Telemetry must not interrupt durable lifecycle publication. */
+    }
   }
 
   private async notifyParent(record: SubagentRecord): Promise<void> {
@@ -629,24 +771,12 @@ export class CtfSubagentManager {
   }
 }
 
-function extractToolResultText(message: unknown): string {
-  if (!message || typeof message !== "object") return ""
-  const candidate = message as {
-    role?: string
-    toolName?: unknown
-    content?: unknown
-  }
-  if (candidate.role !== "toolResult" || !Array.isArray(candidate.content)) return ""
-  const parts = candidate.content.flatMap((block) => {
-    if (!block || typeof block !== "object") return []
-    const value = block as { type?: unknown; text?: unknown }
-    return value.type === "text" && typeof value.text === "string" ? [value.text] : []
-  })
-  if (parts.length === 0) return ""
-  const output = parts.join("\n").trim()
-  if (!output || output === "(no output)") return ""
-  const prefix = typeof candidate.toolName === "string" ? `[${candidate.toolName}] ` : ""
-  return `${prefix}${output}`.slice(0, 8_000)
+function lifecycleError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code })
+}
+
+function hasLifecycleCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code
 }
 
 function settleWithin(promises: Promise<unknown>[], milliseconds: number) {
@@ -665,7 +795,7 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
     .availableRoles()
     .map((role) => role.name)
     .join(", ")
-  return [
+  const tools: AgentTool[] = [
     {
       name: "Agent",
       label: "Launch SubAgent",
@@ -798,6 +928,24 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
       },
     },
   ]
+  return tools.map((tool) => ({
+    ...tool,
+    async execute(...args: Parameters<AgentTool["execute"]>) {
+      try {
+        return await tool.execute(...args)
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string")
+          throw error
+        return errorToolResult(
+          toolError(error.code as ToolErrorCode, codePointPrefix(error.message, 2_000).text, {
+            retryable: error.code === "execution_changed" || error.code === "stale_execution",
+            nextAction:
+              "Read the current execution from offset 0; storage failures require operator recovery.",
+          }),
+        )
+      }
+    },
+  }))
 }
 
 /**
@@ -861,10 +1009,6 @@ function boundedText(value: string, field: string, max: number): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-function isCancelled(managed: ManagedSubagent): boolean {
-  return managed.record.status === "cancelled"
 }
 
 function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

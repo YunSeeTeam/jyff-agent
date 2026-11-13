@@ -12,6 +12,7 @@ import type {
   SubagentResultQuery,
 } from "../contracts/dto.ts"
 import type { ToolErrorEnvelope } from "../contracts/errors.ts"
+import type { SubagentLifecyclePersistence } from "./subagent-manager.ts"
 
 /** Challenge-scoped blackboard reads; the challenge comes from the caller's scope, never from input. */
 export interface BlackboardReader {
@@ -63,11 +64,9 @@ export interface CommittedSubagent {
  * `(runId, subagentId, executionId)`: a stale execution gets `stale_execution`
  * and must never overwrite a newer one.
  */
-export interface SubagentPersistence {
-  beginExecution(input: BeginExecution): Promise<CommittedSubagent>
-  commitResult(input: ResultCommit): Promise<CommittedSubagent | ToolErrorEnvelope>
-  recordProgress(input: ExecutionProgress): Promise<void>
-}
+// SQLite's synchronous transaction boundary lets spawn commit before returning.
+// The record is a captured execution snapshot; progress SQL never writes report columns.
+export type SubagentPersistence = SubagentLifecyclePersistence
 
 /** Bounded reads shared by the agent tools and the HTTP routes. */
 export interface SubagentReportReader {

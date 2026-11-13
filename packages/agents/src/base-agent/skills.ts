@@ -21,6 +21,24 @@ export interface DiscoveredSkills {
   diagnostics: ResourceDiagnostic[]
 }
 
+/** Parse a published package again so metadata and package bytes share a version. */
+export function parseSkillPackage(directory: string, expectedName: string): AgentSkill {
+  const loaded = loadSkillsFromDir({ dir: directory, source: "project" })
+  const skill = loaded.skills.find(
+    (entry) => resolve(entry.filePath) === resolve(directory, "SKILL.md"),
+  )
+  if (!skill || skill.name !== expectedName) {
+    throw new Error(`Skill package metadata does not match ${expectedName}`)
+  }
+  return {
+    name: skill.name,
+    description: skill.description,
+    filePath: skill.filePath,
+    baseDir: skill.baseDir,
+    disableModelInvocation: skill.disableModelInvocation,
+  }
+}
+
 /** Discover project skills with Pi's canonical parser and diagnostics. Earlier roots win by name. */
 export async function discoverProjectSkillsWithDiagnostics(
   root: string,

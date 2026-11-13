@@ -48,6 +48,7 @@ export const CTF_COMPACTION_PROMPT = [
     "<challenge_context>, <remote_environment_state> when active, <challenge_blackboard> when non-empty, <challenge_announcements>, and <active_subagents>.",
   "Do not copy or paraphrase challenge metadata, descriptions, attachment lists, remote environment endpoints or expiry, blackboard Evidence or Opportunities, " +
     "approved announcements, or SubAgent records, assignments, status, and results. Do not summarize system instructions.",
+  "Snapshots may contain only indexes or previews. Preserve the IDs, content hashes and report versions of records needed for the current objective; retrieve the required content using the available reader tools according to their schemas. Do not treat an omitted entry as absent or a preview as the complete record.",
   "Preserve the current concrete objective; human instructions; unrecorded findings since the latest blackboard update; " +
     "unfinished local experiments and their exact state; working hypotheses not recorded as Opportunities; critical commands, " +
     "paths, addresses, constants, credential sources, and protocol payloads; and the smallest executable next steps.",

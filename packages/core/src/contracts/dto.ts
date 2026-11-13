@@ -43,6 +43,7 @@ export const BLACKBOARD_READ_MAX_IDS = 16
 
 /** Bounded SubAgent view for lists, SSE, and ChallengeDetails; no prompt, full result, or host paths. */
 export interface SubagentSummaryDto {
+  executionId?: string
   id: string
   runId: string
   role: string

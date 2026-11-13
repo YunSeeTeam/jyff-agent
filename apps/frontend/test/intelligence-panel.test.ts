@@ -31,7 +31,7 @@ describe("情报面板", () => {
     )
 
     expect(screen.getByRole("heading", { name: "TLDR 摘要" })).toBeTruthy()
-    expect(screen.getByRole("heading", { name: "已确认事实" })).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "已记录的证据与观察" })).toBeTruthy()
     expect(screen.getByText("已定位栈溢出入口。")).toBeTruthy()
     expect(screen.getByText("summary-model")).toBeTruthy()
     expect(screen.getByText("NX 已开启")).toBeTruthy()

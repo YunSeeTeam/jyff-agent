@@ -1,5 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
+import { createBlackboardReadTool } from "./blackboard-reader.ts"
 import {
   BLACKBOARD_DESCRIPTION_MAX_LENGTH,
   BLACKBOARD_SOURCE_MAX_ITEMS,
@@ -89,27 +90,30 @@ export interface BlackboardToolOptions {
   runStore: RunStore
   challengeId: string
   runId: string
+  readerV2?: boolean
 }
 
 export function createBlackboardTools(options: BlackboardToolOptions): AgentTool[] {
   const { runStore, challengeId, runId } = options
 
   return [
-    {
-      name: "blackboard_read",
-      label: "Read Blackboard",
-      description: "Read the current state of the shared challenge blackboard.",
-      parameters: Type.Object({}),
-      executionMode: "sequential",
-      async execute() {
-        const summary = runStore.getBlackboardSummary(challengeId)
-        const text = serializeBlackboard(summary)
-        return {
-          content: [{ type: "text", text }],
-          details: summary as unknown as Record<string, unknown>,
-        }
-      },
-    },
+    options.readerV2
+      ? createBlackboardReadTool(runStore, challengeId)
+      : {
+          name: "blackboard_read",
+          label: "Read Blackboard",
+          description: "Read the current state of the shared challenge blackboard.",
+          parameters: Type.Object({}),
+          executionMode: "sequential",
+          async execute() {
+            const summary = runStore.getBlackboardSummary(challengeId)
+            const text = serializeBlackboard(summary)
+            return {
+              content: [{ type: "text", text }],
+              details: summary as unknown as Record<string, unknown>,
+            }
+          },
+        },
     {
       name: "blackboard_record",
       label: "Record to Blackboard",

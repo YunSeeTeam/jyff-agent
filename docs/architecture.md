@@ -145,7 +145,7 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 创建 Solver 前，`Project` 先冻结 Run 配置（`packages/core/src/project/run-config-snapshot.ts`），写入 `runs/<runId>/run-config.json`，并记录 `run_configuration_frozen` 事件。快照包括：
 
 - 优化开关与 Skills 选择；
-- SubAgent 角色，含系统提示词 hash；
+- SubAgent 角色，含系统提示词 hash；新快照同时保存角色定义，以便恢复原提示词、工具与模型选择；
 - 模型与限额；
 - runtimeProfile：适配器 ID、会话格式、Pi 包版本和锁文件 hash。
 
@@ -155,6 +155,8 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 
 - Run 从未启动（在冻结时就被拒绝）：按新 Run 冻结，依赖检查照常进行；
 - Run 在有快照之前就已运行：固定为全部开关关闭，写入 `origin: "legacy_resume"` 的快照并记录 `run_configuration_legacy_resume` 事件，之后的续跑与其他 Run 一样恢复该快照。
+
+当前构建支持 `blackboard-reader-v2`、`full-subagent-reports`、`skill-snapshots` 三项能力，默认仍全部关闭。设置页提供对应开关及技能选择，保存只影响新 Run。预算、本地进程与自动复核的能力检查仍会拒绝提前开启。旧配置只有角色 hash 时，恢复验证现有角色；角色已经变化则明确拒绝，不偷偷加载新提示词。
 
 Solver 的关闭顺序在 `packages/agents/src/solver/agent/solver-agent.ts`：
 
@@ -203,6 +205,7 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 ├── project-registry.json
 ├── project-config.json / runtime-config.json / runs.sqlite  # 根 Project
 ├── runs/<run-id>/session.jsonl / run-config.json
+│   └── skills/manifest.json / packages/<hash>/        # 开启 Skills 快照的 Run
 ├── challenges/<challenge-key>/
 ├── projects/<sha256(projectId)[0:32]>/                    # 其他 Project
 │   ├── project-config.json
@@ -225,18 +228,18 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 
 `packages/core/src/persistence/run-store.ts` 使用 Node `sqlite` 的 `DatabaseSync`。主要表包括：
 
-| 表                                                                            | 内容                                                   |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `runs`、`run_events`                                                          | Run 基本信息、状态、退出原因、错误和顺序事件           |
-| `run_subagents`                                                               | SubAgent role、状态、session、工具统计、usage 和结果   |
-| `model_token_usage`                                                           | 按 provider/model 记录 Solver、SubAgent、TLDR 逐次用量 |
-| `platform_view_cache`                                                         | overview、题目、公告、远程环境快照                     |
-| `scheduler_queue`、`scheduler_control`、`challenge_scheduling_overrides`      | 双队列阶段/顺序/版本、调度模式和人工覆盖               |
-| `challenge_runtime_state`、`challenge_block_events`                           | blocked 分数、阈值、复活次数和审计事件                 |
-| `remote_environment_leases`                                                   | Project 内远程环境租约和优先级                         |
-| `challenge_evidence`、`challenge_opportunities`                               | 黑板数据                                               |
-| `challenge_tldr`                                                              | TLDR 内容、模型、session 和 token usage                |
-| `contest_announcements`、`challenge_announcements`、`announcement_deliveries` | 公告去重、题目匹配、审核和投递状态                     |
+| 表                                                                            | 内容                                                                        |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `runs`、`run_events`                                                          | Run 基本信息、状态、退出原因、错误和顺序事件                                |
+| `run_subagents`                                                               | SubAgent role、状态、session、execution_id、报告来源/正文、工具统计与 usage |
+| `model_token_usage`                                                           | 按 provider/model 记录 Solver、SubAgent、TLDR 逐次用量                      |
+| `platform_view_cache`                                                         | overview、题目、公告、远程环境快照                                          |
+| `scheduler_queue`、`scheduler_control`、`challenge_scheduling_overrides`      | 双队列阶段/顺序/版本、调度模式和人工覆盖                                    |
+| `challenge_runtime_state`、`challenge_block_events`                           | blocked 分数、阈值、复活次数和审计事件                                      |
+| `remote_environment_leases`                                                   | Project 内远程环境租约和优先级                                              |
+| `challenge_evidence`、`challenge_opportunities`                               | 黑板数据                                                                    |
+| `challenge_tldr`                                                              | TLDR 内容、模型、session 和 token usage                                     |
+| `contest_announcements`、`challenge_announcements`、`announcement_deliveries` | 公告去重、题目匹配、审核和投递状态                                          |
 
 `model_token_usage` 以 Pi 的 provider 报告为准，记录普通回复以及 compaction、branch summary 的输入、输出、缓存读取和缓存写入；首次升级时会从旧 `agent_usage`、SubAgent 与 TLDR 累计字段回填，无法恢复模型名的旧记录明确标为未归因。该账本由默认开启的内置 `token-usage` 插件维护，开关持久化在 `built-in-plugins.json`；关闭后保留已有数据和 Solver 运行事件，但不再写入新的插件账本记录，HTTP 接口与前端项目入口同时停用。
 
@@ -282,6 +285,28 @@ Scheduler 的内存队列负责当前进程执行，RunStore 的 `scheduler_queu
 - GitHub clone、PDF 临时文件落在题目 workspace；缺少 `workspaceHostPath` 时这些能力关闭。
 - GitHub 能力需要宿主 `git`；视频能力可选需要 `ffmpeg/ffprobe`。
 
+### 6.4 黑板的按需读取
+
+`packages/core/src/collaboration/blackboard-reader.ts` 提供绑定题目的 reader v2。RunStore 直接按题目、记录类型和 ID/游标查询；无参调用读取 evidence 索引第一页。`ids` 用于指定条目、`view=full` 读取完整内容，机会列表使用 `kind=opportunity`。索引和全文工具封套分别限制为 8 KiB 和 64 KiB；记录来源、contentHash、missingIds、omittedIds 与后续游标帮助调用者判断下一步读取。
+
+主模型保留记录和管理工具，子模型仅增加 reader；显式 `role.tools` 必须允许 `blackboard_read`。Project 根据冻结开关选择工具、提示词与压缩恢复快照，reader 开启后恢复快照只含短索引及读取指引。新版 Project scoped 黑板 HTTP 路由与模型工具共用查询服务，WebUI 进入情报视图后读取索引并按需展开完整条目。共享 bash/workspace 权限仍是原有模型，不因只读黑板工具变成完整只读沙箱。
+
+### 6.5 子任务执行与报告
+
+稳定的 subagentId 标识一个可续跑会话，每次 spawn/resume 则生成新 executionId。Manager 经注入的同步 RunStore 方法提交执行身份后才启动会话；开始执行、进度和报告提交分别写入，进度不覆盖正文。结果按 Run、子任务、executionId 和非终态前态作 CAS；同执行首次合法终态胜出，旧执行的完成/进度回调不能污染新执行。
+
+`agents/src/subagent/session-report.ts` 在 Pi 原始 Session 写入模型不可见的执行 marker，冻结 leaf 后沿原始 parent 链采集本次文本。正常完成选最后一条可用 assistant 文本，失败/取消可选择最近的 assistant 或工具文本；排除 thinking、压缩摘要和前次执行。Pi 的 error/aborted 等 stopReason 不会因为 prompt Promise resolve 被误记为正常完成。
+
+完整报告开关开启后存储上限为 4 MiB，超限明确报错；开关关闭保留兼容长度，读取已保存长报告仍有界。报告页以 Unicode 码点分页，每页最多 8000 码点、封套最多 96 KiB；列表和恢复摘要最多 16 KiB。版本 hash 包括 executionId 与来源，即使 resume 后文本相同也不会拼接成上一执行的报告。HTTP/工具/UI 复用报告页与列表投影；正文仅按需加载。
+
+报告持久化失败会拒绝等待、停止该执行并冻结复用；未提交正文不发布为完成。活动 Manager 的故障可经 Project 报告读取返回 `report_persistence_failed`，而不是永久 pending。旧记录使用 legacy 来源，不从历史 Session 补造完整报告。
+
+### 6.6 每 Run 的技能包
+
+`packages/core/src/project/run-skill-snapshot.ts` 使用冻结的主任务、默认子任务及角色覆盖选择，复制所需包并集。staging 中完成路径/字节/可执行位 hash、SKILL.md 重解析、源变化检查及 manifest，再以一次目录 rename 发布宿主快照。默认限制每 Run 2048 文件、64 MiB 和深度 32，拒绝链接与特殊文件。
+
+Solver 与每次子任务启动/resume 只获得自身选择，容器路径为 `/workspace/.skills/<runId>/<packageHash>/`。宿主 manifest 与包是权威：读取时检查缺失/损坏，工作区副本遭修改则从快照修复，不使用当前源包替换旧 Run。Father 保持原有技能物化路径。Compose 源目录挂载、发现时机及保留策略见 [Skills 快照](skills-snapshots.md)。这提供版本固定和恢复检查，不承诺不可写 workspace 或掉电级持久化。
+
 ## 7. Father 与扩展边界
 
 Father 会话由 `packages/core/src/father/father-manager.ts` 管理，保留宿主 workspace 和 JSONL，但每个工作回合使用一个临时 Docker sandbox；回合结束后 sandbox 回收，下一次消息或验证反馈再创建新的 sandbox。
@@ -294,6 +319,8 @@ GitHub 源码更新是全局运维能力，不属于 `PlatformPlugin`。当前�
 [GitHub 源码更新插件设计](github-source-updater.md)。它必须由独立 Update Worker 执行下载、构建、镜像切换和回滚；WebUI/backend 只负责配置、鉴权、维护排空和持久化操作状态，不能在正在运行的 WebUI 进程内执行 `git pull` 或覆盖当前源码目录。
 
 更新对象是包含 WebUI、Solver 和 Audit 镜像的同一 revision bundle。候选 revision 经过 GitHub allowlist、Compare、digest/provenance 与 staging health check 后才能应用；应用前暂停调度领取并等待 Solver、Father、Audit 空闲，失败则恢复旧 bundle。GitHub Token 只进入 SecretStore，浏览器只获得配置状态。
+
+切换与回滚还受数据能力检查约束：updater 从 `CTF_AGENT_UPDATE_DATA_ROOT` 指定的后端根目录读取全部 Project（含归档）SQLite 的 `runtime_data_capabilities`，核对候选构建的 `runtime-data-capabilities.json`。新库登记 `bounded-subagent-reports@1`；不支持的旧无限输出构建不能通过新版 updater 应用或自动回滚。兼容构建关闭完整报告开关后仍可分页读取新库。完全旧版程序不认识这个检查，手工回退必须恢复对应数据备份；普通健康检查成功不替代数据兼容检查。
 
 ## 9. 安全与资源约束
 

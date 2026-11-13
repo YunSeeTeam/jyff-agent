@@ -7,6 +7,7 @@ export {
 export * from "@ctf-agent/platform"
 export * from "./agent/thinking.ts"
 export * from "./collaboration/blackboard.ts"
+export * from "./collaboration/blackboard-reader.ts"
 export * from "./collaboration/information-contracts.ts"
 export * from "./collaboration/subagent-manager.ts"
 export * from "./collaboration/subagent-projection.ts"

@@ -1,9 +1,14 @@
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { CTF_COMPACTION_PROMPT, SUBAGENT_COMPACTION_PROMPT } from "@ctf-agent/prompts"
+import {
+  CTF_COMPACTION_PROMPT,
+  SUBAGENT_COMPACTION_PROMPT,
+  SUBAGENT_READER_COMPACTION_PROMPT,
+} from "@ctf-agent/prompts"
 import type { CommandResult, Sandbox } from "@ctf-agent/sandbox"
-import type { AgentOptions } from "@earendil-works/pi-agent-core"
+import type { AgentOptions, AgentTool } from "@earendil-works/pi-agent-core"
+import { Type } from "typebox"
 import type { Model } from "@earendil-works/pi-ai"
 import { AgentSession } from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
@@ -54,7 +59,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
-async function createSubagent(): Promise<CtfSubagent> {
+async function createSubagent(
+  options: { blackboardReadTool?: AgentTool; role?: SubagentRole } = {},
+): Promise<CtfSubagent> {
   const runDirectory = await mkdtemp(join(tmpdir(), "subagent-agent-"))
   roots.push(runDirectory)
   return CtfSubagent.create({
@@ -74,10 +81,49 @@ async function createSubagent(): Promise<CtfSubagent> {
     sandbox: new IdleSandbox(),
     agent,
     role,
+    ...options,
   })
 }
 
 describe("CtfSubagent compaction (T06)", () => {
+  const reader: AgentTool = {
+    name: "blackboard_read",
+    label: "Read",
+    description: "read only",
+    parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: "text", text: "index" }], details: {} }
+    },
+  }
+
+  it("enabled reader compaction preserves references and offers only the read capability", async () => {
+    const compact = vi
+      .spyOn(AgentSession.prototype, "compact")
+      .mockResolvedValue({ summary: "refs", firstKeptEntryId: "entry", tokensBefore: 1024 })
+    const subagent = await createSubagent({ blackboardReadTool: reader })
+    expect(subagent.activeTools.map((tool) => tool.name)).toContain("blackboard_read")
+    expect(subagent.activeTools.map((tool) => tool.name)).not.toContain("blackboard_record")
+    await subagent.compact()
+    expect(compact).toHaveBeenCalledExactlyOnceWith(SUBAGENT_READER_COMPACTION_PROMPT)
+    expect(SUBAGENT_READER_COMPACTION_PROMPT).toContain("contentHash")
+    expect(SUBAGENT_READER_COMPACTION_PROMPT).toContain("unreported facts")
+    await subagent.close()
+  })
+
+  it("rejects explicit role tool lists without read permission", async () => {
+    await expect(
+      createSubagent({ blackboardReadTool: reader, role: { ...role, tools: ["read"] } }),
+    ).rejects.toMatchObject({ code: "configuration_dependency_error" })
+    const subagent = await createSubagent({
+      blackboardReadTool: reader,
+      role: { ...role, tools: ["read", "blackboard_read"] },
+    })
+    expect(subagent.activeTools.map((tool) => tool.name).sort()).toEqual([
+      "blackboard_read",
+      "read",
+    ])
+    await subagent.close()
+  })
   it("compacts with the SubAgent prompt instead of the Solver prompt", async () => {
     const compact = vi.spyOn(AgentSession.prototype, "compact").mockResolvedValue({
       summary: "worker summary",

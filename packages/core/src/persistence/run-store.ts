@@ -7,6 +7,7 @@ import type {
   ContestOverview,
   RemoteEnvironment,
 } from "@ctf-agent/platform"
+import { SUBAGENT_REPORT_MAX_STORED_BYTES } from "../contracts/index.ts"
 import type { SubagentRecord } from "../collaboration/subagent-manager.ts"
 import type {
   RemoteEnvironmentLeaseRecord,
@@ -58,7 +59,10 @@ const WRITEUP_STATUSES = [
 const WRITEUP_STATUS_SQL = WRITEUP_STATUSES.map((status) => `'${status}'`).join(", ")
 
 /** Data features this store has migrated to; checked before rolling back to older builds. */
-export const RUN_STORE_DATA_CAPABILITIES = { "accepted-fact": 1 } as const
+export const RUN_STORE_DATA_CAPABILITIES = {
+  "accepted-fact": 1,
+  "bounded-subagent-reports": 1,
+} as const
 
 export type RunCloseReason =
   | "submitted"
@@ -459,6 +463,8 @@ interface EventRow {
 }
 
 interface SubagentRow {
+  execution_id: string | null
+  result_kind: SubagentRecord["resultKind"] | null
   id: string
   run_id: string
   role: string
@@ -773,6 +779,8 @@ function subagentFromRow(row: SubagentRow): SubagentRecord {
     prompt: row.prompt,
     sessionPath: row.session_path,
     containerCwd: row.container_cwd,
+    ...(row.execution_id == null ? {} : { executionId: row.execution_id }),
+    ...(row.result_kind == null ? {} : { resultKind: row.result_kind }),
     ...(row.result === null ? {} : { result: row.result }),
     ...(row.error === null ? {} : { error: row.error }),
     ...(row.active_tool === null ? {} : { activeTool: row.active_tool }),
@@ -1004,6 +1012,8 @@ export class RunStore {
         concluded_at        TEXT
       ) STRICT;
 
+      CREATE INDEX IF NOT EXISTS idx_opportunities_challenge_id
+        ON challenge_opportunities(challenge_id, id);
       CREATE INDEX IF NOT EXISTS idx_opportunities_challenge
         ON challenge_opportunities(challenge_id, status);
 
@@ -1210,7 +1220,7 @@ export class RunStore {
         ON CONFLICT(name) DO UPDATE SET version = MAX(version, excluded.version)
       `)
       for (const [name, version] of Object.entries(RUN_STORE_DATA_CAPABILITIES)) {
-        registerCapability.run(name, version)
+        if (name !== "bounded-subagent-reports") registerCapability.run(name, version)
       }
       database.exec("COMMIT")
     } catch (error) {
@@ -1241,6 +1251,27 @@ export class RunStore {
     ] as const
     for (const [name, sql] of subagentUsageMigrations) {
       if (!subagentColumns.has(name)) database.exec(sql)
+    }
+
+    database.exec("BEGIN IMMEDIATE")
+    try {
+      if (!subagentColumns.has("execution_id"))
+        database.exec("ALTER TABLE run_subagents ADD COLUMN execution_id TEXT NULL")
+      if (!subagentColumns.has("result_kind")) {
+        database.exec(
+          "ALTER TABLE run_subagents ADD COLUMN result_kind TEXT NULL CHECK (result_kind IN ('assistant_final', 'assistant_partial', 'tool_partial', 'legacy'))",
+        )
+        database.exec("UPDATE run_subagents SET result_kind = 'legacy' WHERE result IS NOT NULL")
+      }
+      database
+        .prepare(
+          "INSERT INTO runtime_data_capabilities (name, version) VALUES ('bounded-subagent-reports', 1) ON CONFLICT(name) DO UPDATE SET version = MAX(version, excluded.version)",
+        )
+        .run()
+      database.exec("COMMIT")
+    } catch (error) {
+      database.exec("ROLLBACK")
+      throw error
     }
 
     const tldrColumns = new Set(
@@ -2966,6 +2997,11 @@ export class RunStore {
   upsertSubagent(record: SubagentRecord): SubagentRecord {
     this.assertOpen()
     this.getRunOrThrow(record.runId)
+    const current = this.database
+      .prepare("SELECT execution_id FROM run_subagents WHERE id = ?")
+      .get(record.id) as { execution_id: string | null } | undefined
+    if (current?.execution_id || record.executionId)
+      throw subagentStoreError("stale_execution", "Execution records require CAS lifecycle methods")
     this.database
       .prepare(`
         INSERT INTO run_subagents (
@@ -3022,6 +3058,174 @@ export class RunStore {
         record.completedAt ?? null,
       )
     return { ...record }
+  }
+
+  /** Begin and its audit event commit before any session marker or model work. */
+  beginSubagentExecution(
+    record: SubagentRecord,
+    previousExecutionId: string | null,
+  ): SubagentRecord {
+    this.assertOpen()
+    if (
+      !record.executionId ||
+      record.executionId === previousExecutionId ||
+      !["queued", "running"].includes(record.status)
+    ) {
+      throw subagentStoreError(
+        "invalid_execution",
+        "A new execution identity and active state are required",
+      )
+    }
+    this.database.exec("BEGIN IMMEDIATE")
+    try {
+      const old = this.database
+        .prepare("SELECT * FROM run_subagents WHERE id = ?")
+        .get(record.id) as unknown as SubagentRow | undefined
+      if (old) {
+        if (
+          old.run_id !== record.runId ||
+          old.execution_id !== previousExecutionId ||
+          ["queued", "running"].includes(old.status)
+        ) {
+          throw subagentStoreError(
+            "stale_execution",
+            "The previous execution changed or remains active",
+          )
+        }
+      } else {
+        if (previousExecutionId !== null)
+          throw subagentStoreError("stale_execution", "Previous execution does not exist")
+        this.upsertSubagent({
+          ...record,
+          executionId: undefined,
+          result: undefined,
+          resultKind: undefined,
+        })
+      }
+      const updated = this.database
+        .prepare(`
+        UPDATE run_subagents SET execution_id = ?, status = ?, background = ?, prompt = ?,
+          result = NULL, result_kind = NULL, error = NULL, active_tool = NULL,
+          started_at = NULL, completed_at = NULL, updated_at = ?
+        WHERE id = ? AND run_id = ? AND execution_id IS ?
+      `)
+        .run(
+          record.executionId,
+          record.status,
+          record.background ? 1 : 0,
+          record.prompt,
+          record.updatedAt,
+          record.id,
+          record.runId,
+          previousExecutionId,
+        )
+      if (Number(updated.changes) !== 1)
+        throw subagentStoreError("stale_execution", "Execution CAS failed")
+      this.insertEvent(
+        record.runId,
+        "subagent_execution_started",
+        { subagentId: record.id, executionId: record.executionId },
+        record.updatedAt,
+      )
+      const saved = this.subagentRecord(record.runId, record.id)
+      this.database.exec("COMMIT")
+      return saved
+    } catch (error) {
+      this.database.exec("ROLLBACK")
+      throw error
+    }
+  }
+
+  /** First legal terminal writer wins; duplicates return the saved terminal. */
+  commitSubagentResult(record: SubagentRecord): SubagentRecord {
+    this.assertOpen()
+    if (["queued", "running"].includes(record.status))
+      throw subagentStoreError("invalid_execution", "A terminal result is required")
+    this.database.exec("BEGIN IMMEDIATE")
+    try {
+      const old = this.subagentRecord(record.runId, record.id)
+      if (!record.executionId || old.executionId !== record.executionId)
+        throw subagentStoreError("stale_execution", "Execution changed")
+      if (["queued", "running"].includes(old.status)) {
+        if (Buffer.byteLength(record.result ?? "", "utf8") > SUBAGENT_REPORT_MAX_STORED_BYTES) {
+          throw subagentStoreError("report_storage_limit", "Report exceeds the 4 MiB storage limit")
+        }
+        const result = this.database
+          .prepare(`
+          UPDATE run_subagents SET status = ?, result = ?, result_kind = ?, error = ?,
+            active_tool = NULL, completed_at = ?, updated_at = ?
+          WHERE run_id = ? AND id = ? AND execution_id = ? AND status IN ('queued', 'running')
+        `)
+          .run(
+            record.status,
+            record.result ?? null,
+            record.resultKind ?? null,
+            record.error ?? null,
+            record.completedAt ?? record.updatedAt,
+            record.updatedAt,
+            record.runId,
+            record.id,
+            record.executionId,
+          )
+        if (Number(result.changes) !== 1)
+          throw subagentStoreError("stale_execution", "Result CAS failed")
+        this.insertEvent(
+          record.runId,
+          "subagent_result_committed",
+          {
+            subagentId: record.id,
+            executionId: record.executionId,
+            status: record.status,
+            resultKind: record.resultKind ?? null,
+            storedBytes: Buffer.byteLength(record.result ?? "", "utf8"),
+          },
+          record.updatedAt,
+        )
+      }
+      const saved = this.subagentRecord(record.runId, record.id)
+      this.database.exec("COMMIT")
+      return saved
+    } catch (error) {
+      this.database.exec("ROLLBACK")
+      throw error
+    }
+  }
+
+  recordSubagentProgress(record: SubagentRecord): void {
+    this.assertOpen()
+    const saved = this.subagentRecord(record.runId, record.id)
+    if (!record.executionId || saved.executionId !== record.executionId)
+      throw subagentStoreError("stale_execution", "Execution changed")
+    // A late same-execution event is harmless, and never resurrects a terminal.
+    this.database
+      .prepare(`
+      UPDATE run_subagents SET turns = ?, tool_uses = ?, total_tokens = ?, input_tokens = ?,
+        cache_read_tokens = ?, cache_write_tokens = ?, active_tool = ?, status = ?, started_at = ?, updated_at = ?
+      WHERE run_id = ? AND id = ? AND execution_id = ? AND status IN ('queued', 'running')
+    `)
+      .run(
+        record.turns,
+        record.toolUses,
+        record.totalTokens,
+        record.inputTokens ?? 0,
+        record.cacheReadTokens ?? 0,
+        record.cacheWriteTokens ?? 0,
+        record.activeTool ?? null,
+        record.status === "running" ? "running" : "queued",
+        record.startedAt ?? null,
+        record.updatedAt,
+        record.runId,
+        record.id,
+        record.executionId,
+      )
+  }
+
+  private subagentRecord(runId: string, id: string): SubagentRecord {
+    const row = this.database
+      .prepare("SELECT * FROM run_subagents WHERE run_id = ? AND id = ?")
+      .get(runId, id) as unknown as SubagentRow | undefined
+    if (!row) throw subagentStoreError("stale_execution", "SubAgent execution does not exist")
+    return subagentFromRow(row)
   }
 
   subagents(runId: string): SubagentRecord[] {
@@ -3379,6 +3583,63 @@ export class RunStore {
     }
   }
 
+  /** Bounded, challenge-scoped SQL reads; never materializes the whole board. */
+  readBlackboardRecords(
+    challengeId: string,
+    kind: "evidence" | "opportunity",
+    query: { ids?: number[]; afterId?: number; limit: number },
+  ): {
+    records: Array<EvidenceRecord | OpportunityRecord>
+    counts: { evidence: number; opportunities: number }
+  } {
+    this.assertOpen()
+    const count = (table: string) =>
+      Number(
+        (
+          this.database
+            .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE challenge_id = ?`)
+            .get(challengeId) as { n: number }
+        ).n,
+      )
+    const counts = {
+      evidence: count("challenge_evidence"),
+      opportunities: count("challenge_opportunities"),
+    }
+    if (query.ids?.length === 0) return { records: [], counts }
+    const where = query.ids ? `id IN (${query.ids.map(() => "?").join(",")})` : "id > ?"
+    const args = [challengeId, ...(query.ids ?? [query.afterId ?? 0]), query.limit]
+    if (kind === "evidence") {
+      const rows = this.database
+        .prepare(
+          `SELECT id, challenge_id, description, run_id, created_at FROM challenge_evidence
+         WHERE challenge_id = ? AND ${where} ORDER BY id ASC LIMIT ?`,
+        )
+        .all(...args) as unknown as EvidenceRow[]
+      return { records: rows.map(evidenceRecordFromRow), counts }
+    }
+    const rows = this.database
+      .prepare(
+        `SELECT id, challenge_id, description, status, resolution, run_id, target_evidence_id,
+              created_at, concluded_at FROM challenge_opportunities
+       WHERE challenge_id = ? AND ${where} ORDER BY id ASC LIMIT ?`,
+      )
+      .all(...args) as unknown as OpportunityRow[]
+    return {
+      records: rows.map((row) => {
+        const sources = this.database
+          .prepare(
+            "SELECT evidence_id FROM challenge_opportunity_sources WHERE opportunity_id = ? ORDER BY evidence_id",
+          )
+          .all(row.id) as unknown as OpportunitySourceRow[]
+        return opportunityFromRow(
+          row,
+          sources.map((source) => source.evidence_id),
+        )
+      }),
+      counts,
+    }
+  }
+
   getBlackboardSummary(challengeId: string): BlackboardSummary {
     this.assertOpen()
     const evidenceRows = this.database
@@ -3613,4 +3874,8 @@ export class RunStore {
       throw new Error(`${table} has reached the per-challenge limit of ${maximum}`)
     }
   }
+}
+
+function subagentStoreError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code })
 }

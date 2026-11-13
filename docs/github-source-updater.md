@@ -575,7 +575,17 @@ apps/updater/                             # 独立执行器；不导入 WebUI HT
 - backend/Worker 任一方在更新阶段重启后，都能从持久化 operation 恢复而不重复应用。
 - 所有公开行为有单元、HTTP、前端与至少一条真实 Compose 故障回滚测试。
 
-## 14. 相关资料
+## 14. 数据兼容与完整报告回退（阶段 3）
+
+Update Worker 的 `CTF_AGENT_UPDATE_DATA_ROOT` 必须指向后端 `--root` 使用的数据根，例如后端以 `--root /data` 启动时配置 `CTF_AGENT_UPDATE_DATA_ROOT=/data`。Worker 需要读取该根下的 `.ctf-agent` 和各 Project 的 `runs.sqlite`；此路径不是源码 release 目录。未配置、数据库损坏或无法核实目录时拒绝切换。
+
+每个候选源码根目录携带 `runtime-data-capabilities.json`，`schemaVersion: 1` 的 `read` 映射声明该构建可读取的数据能力及版本。Worker 在应用、手动回退及失败后的自动恢复前，检查根 Project 和所有已归档 Project 的能力要求。阶段 3 数据库登记 `bounded-subagent-reports: 1`，能力记录不会随 `fullSubagentReports` 开关关闭而删除；不声明相应能力的旧构建因此无法直接读取扩容后的数据。
+
+常规回退使用仍支持有界列表和报告分页的兼容构建，通过关闭新入口控制行为，已有完整报告继续保留。若必须部署完全旧版，应先停止调度及服务，保留当前数据库、WAL、Session 和 Skills 的一致副本，再恢复与该旧版匹配的数据备份。恢复后先核对平台已解状态，避免备份后新增的 accepted 丢失导致重复求解。对于仍登记能力的旧备份，目标构建也必须声明相应读取能力；不能通过删除能力行或伪造 manifest 绕过检查。
+
+此检查不自动备份、降级或还原数据库，也不证明业务健康。新版本已迁移数据库后，如果旧版本不兼容，自动恢复会明确报告失败并保持当前部署链接，等待维护者选择兼容构建或恢复匹配备份；不会因为健康检查失败而强行交给旧读取器。
+
+## 15. 相关资料
 
 - GitHub Releases API：<https://docs.github.com/en/rest/releases/releases>
 - GitHub Compare API：<https://docs.github.com/en/rest/commits/commits#compare-two-commits>

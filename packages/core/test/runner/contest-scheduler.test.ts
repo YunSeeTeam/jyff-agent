@@ -977,7 +977,7 @@ describe("ContestScheduler", () => {
     const byId = new Map(items.map((item) => [item.id, item]))
     const tracker = new SandboxTracker()
     let settings = mergeRunSettings(defaultRunSettings(), {
-      optimization: { blackboardReaderV2: true },
+      budgetPolicy: { enabled: true },
     })
     const project = await fixture(items, tracker, { runSettings: () => settings })
     const scheduler = new ContestScheduler(project, {

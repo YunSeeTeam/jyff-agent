@@ -1,12 +1,16 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { CtfSubagent } from "@ctf-agent/agents"
+import { SOLVER_SYSTEM_PROMPT } from "@ctf-agent/prompts"
 import type { CommandResult, Sandbox, SandboxExecOptions } from "@ctf-agent/sandbox"
 import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import type { Model } from "@earendil-works/pi-ai"
-import { afterEach, describe, expect, it } from "vite-plus/test"
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux"
+import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { defaultRunSettings, mergeRunSettings } from "../../src/contracts/index.ts"
 import { Project } from "../../src/project/project.ts"
+import { RunStore } from "../../src/persistence/run-store.ts"
 import {
   buildRunConfigSnapshot,
   canonicalJson,
@@ -17,6 +21,7 @@ import { testPlatform } from "../fake-platform.ts"
 
 const roots: string[] = []
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
@@ -128,7 +133,11 @@ describe("Run configuration freeze", () => {
           sessionFormat: "pi-session-v3",
           packages: { "@earendil-works/pi-coding-agent": "1.5.0" },
           runStoreCapabilities: { "accepted-fact": 1 },
-          optimizationCapabilities: [],
+          optimizationCapabilities: [
+            "blackboard-reader-v2",
+            "full-subagent-reports",
+            "skill-snapshots",
+          ],
         },
       })
       expect(snapshot.runtimeProfile.lockfileSha256).toMatch(/^[0-9a-f]{64}$/)
@@ -209,12 +218,12 @@ describe("Run configuration freeze", () => {
   it("refuses a Run this build cannot honor without blocking the challenge, and freezes it once fixed", async () => {
     const root = await fixture()
     let settings = mergeRunSettings(defaultRunSettings(), {
-      optimization: { blackboardReaderV2: true },
+      budgetPolicy: { enabled: true },
     })
     const { project, sandboxes } = await openProject(root, { runSettings: () => settings })
     try {
       await expect(project.createSolver("warmup-flag", { agent })).rejects.toMatchObject({
-        message: expect.stringContaining("blackboard-reader-v2"),
+        message: expect.stringContaining("budget-policy"),
         blocked: false,
         retryable: false,
         requiresConfiguration: true,
@@ -222,7 +231,7 @@ describe("Run configuration freeze", () => {
       expect(sandboxes()).toBe(0)
       const [run] = project.runs({ challengeId: "warmup-flag" })
       expect(run).toMatchObject({ status: "failed", closeReason: "failed" })
-      expect(run?.error).toContain("optimization.blackboardReaderV2")
+      expect(run?.error).toContain("budgetPolicy.enabled")
       expect(project.isChallengeBlocked("warmup-flag")).toBe(false)
       if (!run) throw new Error("the rejected Run was not recorded")
 
@@ -242,6 +251,149 @@ describe("Run configuration freeze", () => {
       expect(types).not.toContain("run_configuration_legacy_resume")
       await solver.close("manual")
     } finally {
+      await project.close()
+    }
+  })
+
+  it("combines frozen skills, reader v2 and execution reports across child and Run resume", async () => {
+    const root = await fixture()
+    let settings = mergeRunSettings(defaultRunSettings(), {
+      optimization: { blackboardReaderV2: true, fullSubagentReports: true, skillSnapshots: true },
+      skills: { solver: [], subagents: { default: ["reverse"], roles: { explorer: [] } } },
+    })
+    const { project } = await openProject(root, { runSettings: () => settings })
+    const faux = createFauxCore({ provider: "frozen-stage3" })
+    const report = "verified observation ".repeat(600)
+    faux.setResponses([
+      fauxAssistantMessage(report),
+      fauxAssistantMessage(report),
+      fauxAssistantMessage(report),
+    ])
+    const childCreate = vi.spyOn(CtfSubagent, "create")
+    const options = {
+      agent: {
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" as const },
+      },
+    }
+    try {
+      const solver = await project.createSolver("warmup-flag", options)
+      expect(solver.state.systemPrompt).toContain(SOLVER_SYSTEM_PROMPT)
+      expect(solver.state.systemPrompt).not.toContain("<name>reverse</name>")
+      const read = solver.tools.find((tool) => tool.name === "blackboard_read")!
+      const firstIndex = await read.execute("read", {})
+      expect(firstIndex.details).toMatchObject({ schemaVersion: 2 })
+      const launch = solver.tools.find((tool) => tool.name === "Agent")!
+      await launch.execute("launch", {
+        subagent_type: "general-purpose",
+        prompt: "verify",
+        description: "verify",
+        run_in_background: false,
+      })
+      const first = project.subagents(solver.runId)[0]!
+      expect(first.result).toBe(report)
+      expect(first.executionId).toBeTruthy()
+      expect(childCreate.mock.calls[0]![0].skills?.map((skill) => skill.name)).toEqual(["reverse"])
+      expect(childCreate.mock.calls[0]![0].blackboardReadTool?.name).toBe("blackboard_read")
+      const skillPath = childCreate.mock.calls[0]![0].skills![0]!.sandboxPath!
+      const copy = join(solver.workspace, skillPath.slice("/workspace/".length))
+      await writeFile(copy, "modified by worker")
+      await writeFile(join(root, ".pi/skills/reverse/SKILL.md"), "changed source")
+      settings = defaultRunSettings()
+      await launch.execute("resume-child", {
+        subagent_type: "general-purpose",
+        prompt: "verify again",
+        description: "verify",
+        resume: first.id,
+      })
+      const second = project.subagents(solver.runId)[0]!
+      expect(second.executionId).not.toBe(first.executionId)
+      expect(second.result).toBe(report)
+      expect(await readFile(copy, "utf8")).toContain("# Reverse")
+      expect(
+        project.runEvents(solver.runId).filter((event) => event.type === "run_skill_snapshot"),
+      ).toHaveLength(1)
+      await solver.close("failed", "test recovery")
+      const resumed = await project.resumeSolver(solver.runId, options)
+      expect(
+        (await resumed.tools.find((tool) => tool.name === "blackboard_read")!.execute("read", {}))
+          .details,
+      ).toMatchObject({ schemaVersion: 2 })
+      await resumed.tools
+        .find((tool) => tool.name === "Agent")!
+        .execute("explorer", { subagent_type: "explorer", prompt: "verify", description: "verify" })
+      expect(childCreate.mock.calls.at(-1)![0].skills).toEqual([])
+      await resumed.prepareWriteup()
+      expect(resumed.activeTools.map((tool) => tool.name).sort()).toEqual([
+        "edit",
+        "list",
+        "read",
+        "write",
+      ])
+      await resumed.close("manual")
+    } finally {
+      await project.close()
+    }
+  })
+
+  it("rejects a reader configuration whose enabled custom role excludes blackboard_read", async () => {
+    const root = await fixture()
+    await mkdir(join(root, ".agents/agents"), { recursive: true })
+    await writeFile(
+      join(root, ".agents/agents/restricted.md"),
+      "---\ndescription: Restricted\ntools: [read]\n---\nInspect input",
+    )
+    const { project, sandboxes } = await openProject(root, {
+      runSettings: () =>
+        mergeRunSettings(defaultRunSettings(), { optimization: { blackboardReaderV2: true } }),
+    })
+    try {
+      await expect(project.createSolver("warmup-flag", { agent })).rejects.toMatchObject({
+        requiresConfiguration: true,
+        message: expect.stringContaining("blackboard_read"),
+      })
+      expect(sandboxes()).toBe(0)
+      expect(project.isChallengeBlocked("warmup-flag")).toBe(false)
+    } finally {
+      await project.close()
+    }
+  })
+
+  it("exposes a failed report commit through the Project report reader instead of perpetual pending", async () => {
+    const root = await fixture()
+    const { project } = await openProject(root, {
+      runSettings: () =>
+        mergeRunSettings(defaultRunSettings(), { optimization: { fullSubagentReports: true } }),
+    })
+    const faux = createFauxCore({ provider: "report-commit-fault" })
+    faux.setResponses([fauxAssistantMessage("captured report")])
+    const commit = vi.spyOn(RunStore.prototype, "commitSubagentResult").mockImplementation(() => {
+      throw new Error("disk unavailable")
+    })
+    try {
+      const solver = await project.createSolver("warmup-flag", {
+        agent: {
+          streamFn: faux.streamSimple as AgentOptions["streamFn"],
+          initialState: { model: faux.getModel(), thinkingLevel: "off" },
+        },
+      })
+      const result = await solver.tools
+        .find((tool) => tool.name === "Agent")!
+        .execute("launch", {
+          subagent_type: "general-purpose",
+          prompt: "verify",
+          description: "verify",
+        })
+      expect(result.isError).toBe(true)
+      const record = project.subagents(solver.runId)[0]!
+      expect(record.status).not.toBe("completed")
+      expect(project.subagentResult(solver.runId, { agentId: record.id })).toMatchObject({
+        error: { code: "report_persistence_failed" },
+      })
+      commit.mockRestore()
+      await solver.close("manual")
+    } finally {
+      commit.mockRestore()
       await project.close()
     }
   })
