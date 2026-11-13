@@ -1,13 +1,18 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { discoverProjectSkills, discoverSubagentRoles } from "@ctf-agent/agents"
-import { afterEach, describe, expect, it } from "vite-plus/test"
+import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { defaultRunSettings, mergeRunSettings } from "../../src/contracts/index.ts"
 import {
   buildRunConfigSnapshot,
   frozenSubagentRoles,
 } from "../../src/project/run-config-snapshot.ts"
 import { openRunSkills, skillManifestHash } from "../../src/project/run-skill-snapshot.ts"
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>()
+  return { ...original, writeFile: vi.fn(original.writeFile) }
+})
 
 const roots: string[] = []
 afterEach(async () => {
@@ -194,6 +199,54 @@ describe("Run skill snapshots", () => {
     })
     expect(await readdir(input.runDirectory)).toEqual([])
   })
+
+  it.each(["crypto", "reverse"])(
+    "rejects a source mutation while copying %s and publishes no manifest (T22)",
+    async (copyingName) => {
+      const { root, input } = await fixture()
+      const original = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")
+      const source = join(root, ".pi/skills/crypto/helper.py")
+      const changedSource = "print('crypto modified')"
+      const onPublished = vi.fn()
+      let mutated = false
+      vi.mocked(writeFile).mockImplementation(async (path, data, options) => {
+        await original.writeFile(path, data, options)
+        const text =
+          typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : null
+        if (
+          !mutated &&
+          typeof path === "string" &&
+          path.includes(".skills-staging-") &&
+          path.endsWith("helper.py") &&
+          text === `print('${copyingName} original')`
+        ) {
+          mutated = true
+          // Same-sized bytes change during copying, including an already copied package
+          // when reverse is being staged after crypto's first source verification.
+          await original.writeFile(source, changedSource)
+        }
+      })
+      try {
+        await expect(openRunSkills({ ...input, onPublished })).rejects.toMatchObject({
+          code: "skill_snapshot_changed",
+          message: `Skill source changed ${copyingName === "crypto" ? "during" : "before"} publication: crypto`,
+        })
+        expect(mutated).toBe(true)
+        expect(await readFile(source, "utf8")).toBe(changedSource)
+        expect(onPublished).not.toHaveBeenCalled()
+        expect(await readdir(input.runDirectory)).toEqual([])
+        await expect(
+          readFile(join(input.runDirectory, "skills/manifest.json")),
+        ).rejects.toMatchObject({ code: "ENOENT" })
+        // A resumed Run must report the missing snapshot, never load the changed source.
+        await expect(openRunSkills({ ...input, hasStarted: true })).rejects.toMatchObject({
+          code: "skill_snapshot_unavailable",
+        })
+      } finally {
+        vi.mocked(writeFile).mockImplementation(original.writeFile)
+      }
+    },
+  )
 
   it("rejects source directory links and workspace parent links", async () => {
     const { root, input } = await fixture()

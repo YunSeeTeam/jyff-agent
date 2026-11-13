@@ -14,6 +14,7 @@ import {
   createFauxCore,
   fauxAssistantMessage,
   fauxToolCall,
+  type FauxResponseFactory,
 } from "@earendil-works/pi-ai/providers/faux"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import {
@@ -266,6 +267,193 @@ function solvingAgent(item: TestChallenge, delayMs = 0): AgentOptions {
 }
 
 describe("ContestScheduler", () => {
+  it("T18: sees a candidate at the end of the 8000-character prefix and stops a blocked worker on acceptance", async () => {
+    const item = challenge(918)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker, {
+      runSettings: () =>
+        mergeRunSettings(defaultRunSettings(), {
+          optimization: { fullSubagentReports: true },
+        }),
+    })
+    const faux = createFauxCore({ provider: "prefix-candidate-and-blocked-worker" })
+    const blockedStarted = deferred()
+    const allowCandidate = deferred()
+    const prefix = "x".repeat(8_000 - item.flag.length) + item.flag
+    const report = prefix + "\nAdditional report details beyond the first page."
+    let solverCalls = 0
+    let blockedAborted = false
+    let outcomeAtAbort: string | undefined
+    let receivedPrefix: string | undefined
+    let interruptedWait: unknown
+    let workerStatusAtSubmit: string | undefined
+    const respond: FauxResponseFactory = async (context, options) => {
+      const messages = context.messages.map((message) => ({
+        role: message.role,
+        text:
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .filter((block) => block.type === "text")
+                .map((block) => block.text)
+                .join(""),
+      }))
+      if (
+        context.messages.some(
+          (message) =>
+            message.role === "system" && JSON.stringify(message).includes("<subagent_context>"),
+        )
+      ) {
+        if (messages.some((message) => message.text.includes("T18 blocked investigation"))) {
+          blockedStarted.resolve()
+          // This worker cannot finish naturally: only production cancellation releases it.
+          await new Promise<void>((resolve) => {
+            const aborted = () => {
+              blockedAborted = true
+              outcomeAtAbort = project.runs()[0]?.solveOutcome
+              resolve()
+            }
+            if (options?.signal?.aborted) aborted()
+            else options?.signal?.addEventListener("abort", aborted, { once: true })
+          })
+          return fauxAssistantMessage("late output after cancellation")
+        }
+        await allowCandidate.promise
+        return fauxAssistantMessage(report)
+      }
+
+      solverCalls++
+      if (solverCalls === 1) {
+        return fauxAssistantMessage(
+          [
+            fauxToolCall(
+              "Agent",
+              {
+                subagent_type: "general-purpose",
+                prompt: "T18 blocked investigation",
+                description: "blocked worker",
+                run_in_background: true,
+              },
+              { id: "launch-blocked" },
+            ),
+            fauxToolCall(
+              "Agent",
+              {
+                subagent_type: "general-purpose",
+                prompt: "T18 candidate investigation",
+                description: "candidate worker",
+                run_in_background: true,
+              },
+              { id: "launch-candidate" },
+            ),
+          ],
+          { stopReason: "toolUse" },
+        )
+      }
+      const runId = project.runs()[0]!.id
+      const blocked = project
+        .subagents(runId)
+        .find((worker) => worker.description === "blocked worker")!
+      if (solverCalls === 2) {
+        await blockedStarted.promise
+        return fauxAssistantMessage(
+          fauxToolCall(
+            "get_subagent_result",
+            { agent_id: blocked.id, wait: true },
+            { id: "wait-blocked" },
+          ),
+          { stopReason: "toolUse" },
+        )
+      }
+      if (solverCalls !== 3) throw new Error("Exploration continued after accepting the candidate")
+      const notification = messages.find(
+        (message) => message.role === "user" && message.text.includes("<subagent_notification>"),
+      )?.text
+      receivedPrefix = notification?.match(/<output>([\s\S]*?)<\/output>/)?.[1]
+      const waitResult = context.messages.find(
+        (message) => message.role === "toolResult" && message.toolCallId === "wait-blocked",
+      )
+      if (waitResult?.role === "toolResult") {
+        const text = waitResult.content.find((block) => block.type === "text")
+        if (text?.type === "text") interruptedWait = JSON.parse(text.text)
+      }
+      workerStatusAtSubmit = blocked.status
+      // Submission depends on the actual notification, not the fixture's expected flag.
+      const candidate = receivedPrefix?.match(/MOCK\{\d+\}/)?.[0] ?? "missing candidate"
+      return fauxAssistantMessage(
+        fauxToolCall("ctf_submit_flag", { flag: candidate }, { id: "submit-prefix-candidate" }),
+        { stopReason: "toolUse" },
+      )
+    }
+    faux.setResponses(Array.from({ length: 8 }, () => respond))
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      maxAttempts: 1,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => project.runs().length === 1)
+      const runId = project.runs()[0]!.id
+      await waitUntil(() =>
+        project
+          .runEvents(runId)
+          .some(
+            (event) =>
+              event.type === "tool_started" &&
+              (event.data as { toolName?: string })?.toolName === "get_subagent_result",
+          ),
+      )
+      await waitUntil(() => project.subagents(runId).every((worker) => worker.status === "running"))
+      expect(blockedAborted).toBe(false)
+      expect(project.subagents(runId).map((worker) => worker.status)).toEqual([
+        "running",
+        "running",
+      ])
+      allowCandidate.resolve()
+      await waitUntil(() => scheduler.snapshot().active.length === 0)
+
+      expect(receivedPrefix).toBe(prefix)
+      expect(receivedPrefix).toHaveLength(8_000)
+      expect(interruptedWait).toMatchObject({
+        status: "running",
+        waitInterrupted: true,
+        waitInterruptedReason: "parent_steer_queued",
+      })
+      expect(workerStatusAtSubmit).toBe("running")
+      expect(outcomeAtAbort).toBe("accepted")
+      expect(blockedAborted).toBe(true)
+      expect(project.runs()).toEqual([
+        expect.objectContaining({ id: runId, status: "solved", solveOutcome: "accepted" }),
+      ])
+      const workers = project.subagents(runId)
+      expect(workers.find((worker) => worker.description === "blocked worker")).toMatchObject({
+        status: "cancelled",
+      })
+      expect(workers.find((worker) => worker.description === "candidate worker")).toMatchObject({
+        status: "completed",
+        result: report,
+      })
+      expect(solverCalls).toBe(3)
+      expect(faux.state.callCount).toBe(5)
+      expect(project.runEvents(runId).filter((event) => event.type === "flag_submitted")).toEqual([
+        expect.objectContaining({
+          data: expect.objectContaining({ flag: item.flag, status: "accepted" }),
+        }),
+      ])
+      expect(tracker.active).toBe(0)
+    } finally {
+      blockedStarted.resolve()
+      allowCandidate.resolve()
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
   it("不将人工排除或标记已解出的题目加入任何调度队列", async () => {
     const skipped = challenge(90)
     const solved = challenge(91)
