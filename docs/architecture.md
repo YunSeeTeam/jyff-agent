@@ -326,7 +326,8 @@ GitHub 源码更新是全局运维能力，不属于 `PlatformPlugin`。当前�
 
 - `secrets.json`、模型认证和平台 Secret 不进入 Project 配置、Run 日志、黑板或浏览器响应。
 - Docker sandbox 默认资源为 2 CPU、4 GiB 内存/交换、512 PIDs、20 GiB 可写层；Project 可配置 `privileged` 和 `networkMode`，因此部署者必须明确接受这些权限设置。
-- Docker 命令直接调用 `docker`，不经过宿主 shell；stdout/stderr 单向各限制为 8 MiB。
+- Docker 命令不经过宿主 shell；stdout/stderr 单向各限制为 8 MiB。Linux/macOS 直接调用本机 `docker`。Windows 默认通过 `wsl.exe -e docker` 调用默认 WSL 发行版，并转换 Windows bind mount 源路径，因此该发行版需要可用的 Docker CLI 和 daemon 连接。
+- Windows 若已安装可用的原生 Docker CLI（例如 Docker Desktop），可在启动后端/评测的 PowerShell 中设置 `$env:CTF_AGENT_DOCKER_MODE = 'native'`，直接调用 PATH 中的 `docker`。原生模式保留 Windows 挂载路径、命令参数和交互流，不依赖 WSL integration，也不修改 Docker Desktop 设置。设为 `wsl` 或删除该环境变量可恢复默认路径；Windows 只接受严格的 `native`/`wsl` 值，其他值在执行前报错。该变量在 Linux/macOS 上不生效。
 - workspace 文件列表只包含普通文件且最多 2,000 项；下载和预览执行 containment 校验。文本预览要求白名单扩展名、有效 UTF-8，大小最多 256 KiB。
 - `needsEnv` 未被平台提供时保持 `undefined`，提示层显示为 `unknown`，不会自行启动远程环境。
 - 归档不打断活跃 Solver；它只停止新的自动调度，空闲后转为 local-only。

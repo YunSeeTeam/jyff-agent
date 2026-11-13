@@ -11,8 +11,9 @@ import {
   type DockerSandboxOptions,
   dockerSandboxCreateArguments,
   removeManagedContainers,
+  spawnDockerProcess,
 } from "@ctf-agent/sandbox"
-import { afterEach, describe, expect, it, vi } from "vite-plus/test"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const spawnMock = vi.hoisted(() => vi.fn())
 vi.mock("node:child_process", async (importOriginal) => ({
@@ -45,42 +46,116 @@ function result(code: number, output: { stdout?: string; stderr?: string } = {})
   }
 }
 
+beforeEach(() => {
+  vi.stubEnv("CTF_AGENT_DOCKER_MODE", undefined)
+})
+
 afterEach(() => {
   Object.defineProperty(process, "platform", originalPlatform)
   spawnMock.mockReset()
+  vi.unstubAllEnvs()
   vi.restoreAllMocks()
 })
 
 describe("Docker command execution", () => {
-  it("uses WSL Docker and converts bind source paths", async () => {
-    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
-    spawnMock.mockImplementationOnce(successfulChildProcess)
+  it.each([undefined, "wsl"])(
+    "uses WSL Docker and converts bind source paths (mode=%s)",
+    async (mode) => {
+      Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
+      vi.stubEnv("CTF_AGENT_DOCKER_MODE", mode)
+      spawnMock.mockImplementationOnce(successfulChildProcess)
 
-    await expect(
-      executeDockerCommand([
-        "run",
-        "--rm",
-        "--mount",
-        String.raw`type=bind,src=C:\work\source,dst=/source,readonly`,
-        "alpine",
-        "true",
-      ]),
-    ).resolves.toMatchObject({ code: 0, stdout: "", stderr: "" })
-    expect(spawnMock).toHaveBeenCalledWith(
-      "wsl.exe",
-      [
-        "-e",
-        "docker",
-        "run",
-        "--rm",
-        "--mount",
-        "type=bind,src=/mnt/c/work/source,dst=/source,readonly",
-        "alpine",
-        "true",
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    )
+      await expect(
+        executeDockerCommand([
+          "run",
+          "--rm",
+          "--mount",
+          String.raw`type=bind,src=C:\work\source,dst=/source,readonly`,
+          "alpine",
+          "true",
+        ]),
+      ).resolves.toMatchObject({ code: 0, stdout: "", stderr: "" })
+      expect(spawnMock).toHaveBeenCalledWith(
+        "wsl.exe",
+        [
+          "-e",
+          "docker",
+          "run",
+          "--rm",
+          "--mount",
+          "type=bind,src=/mnt/c/work/source,dst=/source,readonly",
+          "alpine",
+          "true",
+        ],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      )
+    },
+  )
+
+  it("opts into native Windows Docker without converting mount paths or command text", async () => {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
+    vi.stubEnv("CTF_AGENT_DOCKER_MODE", "native")
+    spawnMock.mockImplementationOnce(successfulChildProcess)
+    const args = [
+      "run",
+      "--rm",
+      "--mount",
+      String.raw`type=bind,src=C:\work\含 空格,dst=/source,readonly`,
+      "alpine",
+      "sh",
+      "-c",
+      String.raw`printf '%s\n' 'a\tb'`,
+    ]
+
+    await expect(executeDockerCommand(args)).resolves.toMatchObject({ code: 0 })
+    expect(spawnMock).toHaveBeenCalledExactlyOnceWith("docker", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
   })
+
+  it("uses the same native mode for raw, interactive Docker processes", () => {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
+    vi.stubEnv("CTF_AGENT_DOCKER_MODE", "native")
+    spawnMock.mockImplementationOnce(successfulChildProcess)
+    const args = ["exec", "-i", "container", "bash", "-lc", String.raw`cat; printf '\000' >&2`]
+
+    const child = spawnDockerProcess(args)
+    expect(child.stdin.writable).toBe(true)
+    expect(spawnMock).toHaveBeenCalledExactlyOnceWith("docker", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  })
+
+  it.each(["", "auto", "NATIVE"])(
+    "rejects invalid Windows Docker mode %j before spawning",
+    async (mode) => {
+      Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })
+      vi.stubEnv("CTF_AGENT_DOCKER_MODE", mode)
+
+      await expect(executeDockerCommand(["version"])).rejects.toThrow(
+        "CTF_AGENT_DOCKER_MODE must be 'native' or 'wsl'",
+      )
+      expect(() => spawnDockerProcess(["version"])).toThrow(
+        "CTF_AGENT_DOCKER_MODE must be 'native' or 'wsl'",
+      )
+      expect(spawnMock).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(["native", "wsl", "invalid"])(
+    "keeps Linux Docker local regardless of the Windows-only mode %s",
+    async (mode) => {
+      Object.defineProperty(process, "platform", { ...originalPlatform, value: "linux" })
+      vi.stubEnv("CTF_AGENT_DOCKER_MODE", mode)
+      spawnMock.mockImplementationOnce(successfulChildProcess)
+      const args = ["run", "--mount", "type=bind,src=/srv/work space,dst=/source", "alpine", "true"]
+
+      await executeDockerCommand(args)
+      expect(spawnMock).toHaveBeenCalledExactlyOnceWith("docker", args, {
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    },
+  )
 
   it("passes container commands through WSL without rewriting backslashes", async () => {
     Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" })

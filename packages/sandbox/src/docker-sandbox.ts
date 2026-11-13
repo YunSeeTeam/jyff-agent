@@ -78,11 +78,18 @@ export type DockerWorkspaceMount =
 
 const OUTPUT_LIMIT = 8 * 1024 * 1024
 
-/** The Docker CLI invocation for this host: Docker inside WSL on Windows, otherwise the local CLI. */
+/** Windows defaults to WSL; native Docker is an explicit, Windows-only opt-in. */
 export function dockerInvocation(args: readonly string[]): { command: string; args: string[] } {
-  return process.platform === "win32"
-    ? { command: "wsl.exe", args: ["-e", "docker", ...toWslDockerArgs(args)] }
-    : { command: "docker", args: [...args] }
+  if (process.platform === "win32") {
+    const mode = process.env.CTF_AGENT_DOCKER_MODE ?? "wsl"
+    if (mode !== "native" && mode !== "wsl") {
+      throw new Error("CTF_AGENT_DOCKER_MODE must be 'native' or 'wsl' on Windows")
+    }
+    if (mode === "wsl") {
+      return { command: "wsl.exe", args: ["-e", "docker", ...toWslDockerArgs(args)] }
+    }
+  }
+  return { command: "docker", args: [...args] }
 }
 
 /**
