@@ -2,6 +2,8 @@ import { lstat, mkdtemp, mkdir, readlink, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
+import { fileURLToPath } from "node:url"
+import { RunStore } from "@ctf-agent/core"
 import { afterEach, describe, expect, it } from "vite-plus/test"
 import {
   assertDataCompatible,
@@ -32,6 +34,27 @@ function database(path: string, capabilities: Record<string, number>) {
   db.close()
 }
 describe("updater minimum data reader capability (T40)", () => {
+  it("ships a reader declaration compatible with its own persisted solve goals and blocks older readers", async () => {
+    const { root, candidate, state } = await fixture()
+    const store = await RunStore.open(join(state, "runs.sqlite"))
+    try {
+      store.solveGoals.begin("local-challenge", false)
+      store.enqueueSchedulerChallenge({ challengeId: "local-challenge", source: "manual" })
+    } finally {
+      store.close()
+    }
+    const currentBuild = fileURLToPath(new URL("../../../", import.meta.url))
+    await expect(assertDataCompatible(currentBuild, root)).resolves.toBeUndefined()
+    await writeFile(
+      join(candidate, "runtime-data-capabilities.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        read: { "accepted-fact": 1, "bounded-subagent-reports": 1 },
+      }),
+    )
+    await expect(assertDataCompatible(candidate, root)).rejects.toThrow("continuous-solve-goals@1")
+  })
+
   it("does not lose capability names inherited from Object.prototype", async () => {
     const { root, candidate, state } = await fixture()
     database(state, JSON.parse('{"__proto__":1}') as Record<string, number>)

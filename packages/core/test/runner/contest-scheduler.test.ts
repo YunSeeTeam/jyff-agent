@@ -2627,6 +2627,100 @@ describe("ContestScheduler", () => {
     }
   })
 
+  it("T28: retry 准备失败后自动恢复仍使用原提示词和 Run", async () => {
+    const item = challenge(411)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const original = await project.createSolver(item.id, {
+      agent: solvingAgent(item),
+      source: "manual",
+    })
+    await original.close("interrupted")
+    const create = vi
+      .fn(() => solvingAgent(item))
+      .mockImplementationOnce(() => {
+        throw new Error("Connection error.")
+      })
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      retryDelayMs: 0,
+      infrastructureRetryDelayMs: 0,
+      transientRetryDelaysMs: [0, 0, 0],
+      createAgentOptions: create,
+    })
+    try {
+      await scheduler.retryAttempt(original.runId, { prompt: "仅继续证据 evidence-411" })
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      expect(create).toHaveBeenCalledTimes(2)
+      expect(project.runs()).toEqual([
+        expect.objectContaining({ id: original.runId, solveOutcome: "accepted" }),
+      ])
+      expect(await readFile(project.runSessionPath(original.runId), "utf8")).toContain(
+        "仅继续证据 evidence-411",
+      )
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24: 不可用重启期间移出空闲题目会持久停止目标，恢复不重新加入", async () => {
+    const item = challenge(412)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item], tracker)
+    let available = true
+    const options = {
+      maxConcurrent: 1,
+      availability: () => ({ available }),
+      createAgentOptions: () => solvingAgent(item),
+    }
+    let scheduler = new ContestScheduler(project, options)
+    try {
+      await scheduler.stage([item.id])
+      const root = project.root
+      await scheduler.shutdown()
+      await project.close()
+      project = await reopenFixture(root, tracker)
+      available = false
+      scheduler = new ContestScheduler(project, options)
+      await scheduler.restore()
+      expect(scheduler.snapshot().idle).toEqual([expect.objectContaining({ challengeId: item.id })])
+      scheduler.unstage([item.id])
+      expect(project.schedulerQueue()).toEqual([])
+      expect(project.solveGoals.get(item.id)?.state).toBe("stopped")
+      available = true
+      await scheduler.startAuto()
+      expect(scheduler.snapshot().queued).toEqual([])
+      expect(project.runs()).toEqual([])
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24: 人工标记已解仅表示停止，不能被刷新提升为判题 accepted", async () => {
+    const item = challenge(413)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: () => solvingAgent(item),
+    })
+    try {
+      await scheduler.stage([item.id])
+      project.setChallengeSchedulingDisposition(item.id, "solved")
+      await scheduler.cancel(item.id)
+      await scheduler.reconcile()
+      expect(project.solveGoals.get(item.id)?.state).toBe("stopped")
+      expect(project.runs()).toEqual([])
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
   it("T24: 首次创建时附件下载失败恢复原 Run 与目标", async () => {
     const item = challenge(1, {
       attachments: [{ id: "chall", name: "chall", content: "payload" }],

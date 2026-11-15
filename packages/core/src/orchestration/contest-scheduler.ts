@@ -410,7 +410,13 @@ export class ContestScheduler {
       const challenge = byId.get(goal.challengeId)
       if (!challenge || this.resetting.has(goal.challengeId)) continue
       if (invalid(goal.challengeId)) {
-        if (challenge.solved || this.project.isChallengeSolved(goal.challengeId)) {
+        // Manual "solved" is a scheduling override, not a judge receipt.
+        const confirmedSolved =
+          challenge.solved ||
+          this.project
+            .runs({ challengeId: goal.challengeId })
+            .some((run) => run.solveOutcome !== undefined || run.status === "solved")
+        if (confirmedSolved) {
           this.project.solveGoals.update(goal.id, {
             state: "accepted",
             retryAt: null,
@@ -605,21 +611,24 @@ export class ContestScheduler {
     this.assertNotShuttingDown()
     this.assertPlanningStopped()
     const ids = new Set(challengeIds)
+    // The durable queue remains editable while restore is waiting for model/platform
+    // availability. Stop its goals even when no in-memory entries exist yet.
+    const removed = this.project.schedulerQueue("idle").filter((item) => ids.has(item.challengeId))
+    for (const item of removed) {
+      this.stopVersions.set(item.challengeId, (this.stopVersions.get(item.challengeId) ?? 0) + 1)
+      const goal =
+        this.project.solveGoals.get(item.challengeId) ??
+        this.project.solveGoals.begin(item.challengeId, true)
+      this.project.solveGoals.update(goal.id, {
+        state: "stopped",
+        reason: "已移出空闲队列",
+        retryAt: null,
+      })
+    }
     this.project.removeSchedulerChallenges([...ids], "idle")
     for (let index = this.idleQueue.length - 1; index >= 0; index--) {
       const item = this.idleQueue[index]
       if (item && ids.has(item.challenge.id)) {
-        this.stopVersions.set(
-          item.challenge.id,
-          (this.stopVersions.get(item.challenge.id) ?? 0) + 1,
-        )
-        const goal = this.project.solveGoals.get(item.challenge.id)
-        if (goal)
-          this.project.solveGoals.update(goal.id, {
-            state: "stopped",
-            reason: "已移出空闲队列",
-            retryAt: null,
-          })
         this.idleQueue.splice(index, 1)
       }
     }
@@ -1436,19 +1445,28 @@ export class ContestScheduler {
       ...(options.retryPrompt ? { retryPrompt: options.retryPrompt } : {}),
       ...(options.writeupRetry ? { writeupRetry: true } : {}),
     })
+    // An earlier explicit retry may still own this row after preparation failed.
+    // Use its durable intent instead of replacing it with an automatic continuation.
+    const resumeRun = persisted.resumeRunId
+      ? this.project
+          .runs({ challengeId: challenge.id })
+          .find((run) => run.id === persisted.resumeRunId)
+      : options.resumeRun
     const item: QueueItem = {
       challenge,
-      source,
-      stage,
-      lane,
-      manualOverride,
-      requiresAuto,
+      source: persisted.source as SchedulerQueueSource,
+      stage: persisted.stage,
+      lane: persisted.lane,
+      manualOverride: persisted.manualOverride,
+      requiresAuto: persisted.requiresAuto,
       enqueuedAt: persisted.enqueuedAt,
       version: persisted.version,
-      ...options,
+      ...(resumeRun ? { resumeRun } : {}),
+      ...(persisted.retryPrompt ? { retryPrompt: persisted.retryPrompt } : {}),
+      ...(persisted.writeupRetry ? { writeupRetry: true } : {}),
     }
-    const target = stage === "idle" ? this.idleQueue : this.queue
-    if (manualOverride) target.unshift(item)
+    const target = item.stage === "idle" ? this.idleQueue : this.queue
+    if (item.manualOverride) target.unshift(item)
     else target.push(item)
   }
 

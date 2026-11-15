@@ -580,6 +580,8 @@ Compose 可追加 `./ctf-skills:/data/.pi/skills:ro`，保留状态卷和 Docker
 
 正式求解以判题确认的 accepted 为成功依据，保留人工停止。模型自报 flag、候选字符串、单次尝试结束或固定失败次数均不等于目标完成。暂时的网络、限流、订阅配额或鉴权故障应保存进度，退避或显示需处理状态；条件恢复后继续。不得用极大费用/时长数字模拟“不限”，不新增预算开关或限额模式。
 
+人工“标记已解”属于调度停止，不得在刷新时提升为目标的 accepted 状态；只有平台已解或实际 Run 成功记录可确认成功。Solver 默认提示词同步采用判题确认/人工停止语义，不允许以自行放弃或包装未经验证的字符串代替结果。
+
 阶段 4 已移除生产调度的整题超时、maxAttempts 与 maxSessionInterruptions。模型结束、长度截断和压缩后继续同一 Run；网络错误按 10/60/300/300… 秒恢复。有进展后连续失败归零；鉴权/配额/配置和三次无进展的非瞬态错误保留为可恢复暂停，页面提供原因与恢复入口。单请求默认 5 分钟、流空闲 90 秒，仅释放卡死请求，不结束目标。恢复保留原 Session、workspace、黑板和配置快照，解题效果与长时间真实运行质量仍需后续样本评估。
 
 ### 11.2 请求与工具的可靠性
@@ -591,6 +593,8 @@ accepted、人工停止及暂停必须在排队后、实际发送前再次检查
 ### 11.3 持久入队、恢复与 accepted 对账
 
 `retryAttempt()` 已并入统一持久入队，队列增加 `resume_run_id/retry_prompt/writeup_retry/requires_auto`。`solve_goals` 以 challenge_id 为主键、UUID 为目标身份，保存 active/paused/stopped/accepted、run_id、requires_auto、retry_at、failures、reason、updated_at；无预算表或累计 deadline。旧 worker 更新受目标身份与终态检查保护，入队刷新和 reset/cancel 也防止晚到任务复活。使用新状态后登记 `continuous-solve-goals: 1` 数据能力，防止不兼容回退。
+
+准备阶段失败后重新入队必须以尚未消费的持久队列行为准，保留自定义提示词、原 Run 和用途。模型/平台不可用、内存队列尚未恢复时，移出持久空闲项也必须先保存目标的停止意图。发布清单必须声明本构建实际写入的数据能力；T40 使用实际 RunStore 与仓库发布清单验证兼容，并拒绝缺少持续求解能力的旧构建。
 
 `accepted_persistence_failed` 通过 `accepted-receipt.json` 对账：实际回执在 SQLite 写入前原子落盘并 fsync，恢复核对项目/题目/Run/状态/观察时间与 checksum。平台当前已解不能证明原 Run 的接受归属或原始接受时间。成功后停止探索，按现有配置总结和清理，失败可诊断/重试但不抹除 accepted。发送中崩溃的 model_request 记录补为未知用量失败，不能计成已知零费用。
 

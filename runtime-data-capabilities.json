@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "read": {
     "accepted-fact": 1,
-    "bounded-subagent-reports": 1
+    "bounded-subagent-reports": 1,
+    "continuous-solve-goals": 1
   }
 }
