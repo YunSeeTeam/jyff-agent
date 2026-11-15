@@ -151,14 +151,42 @@ describe("ProjectRuntimeConfiguration", () => {
       expect(configuration.snapshot()).toEqual({ ...base, ...defaultRunSettings(), revision: 0 })
     })
 
-    it("fills the budget fields when the file has the earlier placeholder", async () => {
+    it.each([false, true])(
+      "drops a legacy budget placeholder with enabled=%s on read and save",
+      async (enabled) => {
+        const storagePath = await fixture()
+        const legacy = {
+          version: 1,
+          ...base,
+          budgetPolicy: { schemaVersion: 1, enabled, wallClockMs: 1, maxCostMicros: 1 },
+          optimization: { review: { enabled: false, maxPerBudget: 5, maxConcurrent: 2 } },
+        }
+        await writeFile(storagePath, JSON.stringify(legacy))
+        const configuration = await create(storagePath)
+        expect(configuration.snapshot()).not.toHaveProperty("budgetPolicy")
+        expect(configuration.snapshot().optimization.review).toEqual({
+          enabled: false,
+          maxPerGoal: 5,
+          maxConcurrent: 2,
+        })
+        // Opening historical files does not rewrite them; an explicit save uses the current schema.
+        expect(JSON.parse(await readFile(storagePath, "utf8"))).toEqual(legacy)
+        const saved = await configuration.update(base)
+        const persisted = JSON.parse(await readFile(storagePath, "utf8"))
+        expect(persisted).not.toHaveProperty("budgetPolicy")
+        expect(persisted.optimization.review).not.toHaveProperty("maxPerBudget")
+        expect((await create(storagePath)).snapshot()).toEqual(saved)
+      },
+    )
+
+    it("validates migrated review counts and prefers the current field when both exist", async () => {
       const storagePath = await fixture()
-      await writeFile(
-        storagePath,
-        JSON.stringify({ version: 1, ...base, budgetPolicy: { schemaVersion: 1, enabled: false } }),
-      )
-      const configuration = await create(storagePath)
-      expect(configuration.snapshot().budgetPolicy).toEqual(defaultRunSettings().budgetPolicy)
+      const writeReview = async (review: Record<string, unknown>) =>
+        writeFile(storagePath, JSON.stringify({ version: 1, ...base, optimization: { review } }))
+      await writeReview({ maxPerBudget: 17 })
+      await expect(create(storagePath)).rejects.toThrow("优化设置无效")
+      await writeReview({ maxPerBudget: 5, maxPerGoal: 3 })
+      expect((await create(storagePath)).snapshot().optimization.review.maxPerGoal).toBe(3)
     })
 
     it("keeps stored settings when an older client omits them", async () => {

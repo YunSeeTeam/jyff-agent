@@ -14,7 +14,7 @@ const none = new Set<OptimizationCapability>()
 describe("run settings merge", () => {
   it("keeps every current value when the patch omits it", () => {
     const current = mergeRunSettings(defaultRunSettings(), {
-      optimization: { review: { maxPerBudget: 5 } },
+      optimization: { review: { maxPerGoal: 5 } },
       skills: { solver: ["reverse"], subagents: { roles: { web: ["recon"] } } },
     })
     expect(mergeRunSettings(current, {})).toEqual(current)
@@ -23,32 +23,16 @@ describe("run settings merge", () => {
 
   it("merges declared object fields and replaces arrays and the role table", () => {
     const current = mergeRunSettings(defaultRunSettings(), {
-      optimization: { review: { maxPerBudget: 5, maxConcurrent: 2 } },
+      optimization: { review: { maxPerGoal: 5, maxConcurrent: 2 } },
       skills: { solver: ["a", "b"], subagents: { roles: { web: ["x"], pwn: ["y"] } } },
     })
     const next = mergeRunSettings(current, {
       optimization: { review: { maxConcurrent: 3 } },
       skills: { solver: ["c"], subagents: { roles: { crypto: "all" } } },
     })
-    expect(next.optimization.review).toEqual({ enabled: false, maxPerBudget: 5, maxConcurrent: 3 })
+    expect(next.optimization.review).toEqual({ enabled: false, maxPerGoal: 5, maxConcurrent: 3 })
     expect(next.skills.solver).toEqual(["c"])
     expect(next.skills.subagents.roles).toEqual({ crypto: "all" })
-  })
-
-  it("merges budget fields one by one; null clears a cost limit, omission keeps it", () => {
-    const current = mergeRunSettings(defaultRunSettings(), {
-      budgetPolicy: { wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: 2_000_000 },
-    })
-    expect(current.budgetPolicy).toMatchObject({
-      enabled: false,
-      wallClockMs: 3_600_000,
-      currency: "CNY",
-      maxCostMicros: 2_000_000,
-      postprocessMs: 360_000,
-    })
-    expect(mergeRunSettings(current, { budgetPolicy: {} })).toEqual(current)
-    const cleared = mergeRunSettings(current, { budgetPolicy: { maxCostMicros: null } })
-    expect(cleared.budgetPolicy).toEqual({ ...current.budgetPolicy, maxCostMicros: null })
   })
 
   it("clears overrides with an empty role table and deduplicates names", () => {
@@ -109,27 +93,27 @@ describe("configuration dependencies", () => {
     ).toEqual([])
   })
 
-  it("requires the budget before local processes and every contract before review", () => {
+  it("requires information contracts for review, with no budget dependency", () => {
     const all = new Set<OptimizationCapability>([
       "blackboard-reader-v2",
       "full-subagent-reports",
       "local-processes",
       "review",
-      "budget-policy",
     ])
     const processes = mergeRunSettings(defaultRunSettings(), {
       optimization: { localProcesses: true },
     })
-    expect(configurationDependencyIssues(processes, all).map((issue) => issue.requires)).toEqual([
-      "budgetPolicy.enabled",
-    ])
+    expect(configurationDependencyIssues(processes, all)).toEqual([])
     const review = mergeRunSettings(defaultRunSettings(), {
       optimization: { review: { enabled: true } },
     })
     expect(configurationDependencyIssues(review, all).map((issue) => issue.requires)).toEqual([
       "optimization.blackboardReaderV2",
       "optimization.fullSubagentReports",
-      "budgetPolicy.enabled",
     ])
+    const ready = mergeRunSettings(review, {
+      optimization: { blackboardReaderV2: true, fullSubagentReports: true },
+    })
+    expect(configurationDependencyIssues(ready, all)).toEqual([])
   })
 })

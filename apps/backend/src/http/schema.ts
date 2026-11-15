@@ -253,7 +253,7 @@ const subagentModelsSchema = z
 
 /** Project 运行配置更新。 */
 export const projectRuntimeConfigurationSchema = z
-  .object({
+  .strictObject({
     solverModelId: optionalBinding("Solver Model"),
     tldrModelId: optionalBinding("TLDR Model"),
     subagentModels: subagentModelsSchema,
@@ -261,6 +261,8 @@ export const projectRuntimeConfigurationSchema = z
     maxRemoteEnvironments: z.number({ message: "远程环境并发量必须是整数" }).int().min(1).max(64),
     // 旧客户端不发送以下字段，省略时保留服务端现值。
     ...runSettingsUpdateSchema.shape,
+    // A returned snapshot may be echoed; only expectedRevision controls the update.
+    revision: z.number().int().min(0).optional(),
     expectedRevision: z.number({ message: "配置版本号必须是整数" }).int().min(0).optional(),
   })
   .transform((value) => ({

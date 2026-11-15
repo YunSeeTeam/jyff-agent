@@ -156,7 +156,7 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 - Run 从未启动（在冻结时就被拒绝）：按新 Run 冻结，依赖检查照常进行；
 - Run 在有快照之前就已运行：固定为全部开关关闭，写入 `origin: "legacy_resume"` 的快照并记录 `run_configuration_legacy_resume` 事件，之后的续跑与其他 Run 一样恢复该快照。
 
-当前构建支持 `blackboard-reader-v2`、`full-subagent-reports`、`skill-snapshots` 三项能力，默认仍全部关闭。设置页提供对应开关及技能选择，保存只影响新 Run。预算、本地进程与自动复核的能力检查仍会拒绝提前开启。旧配置只有角色 hash 时，恢复验证现有角色；角色已经变化则明确拒绝，不偷偷加载新提示词。
+当前构建支持 `blackboard-reader-v2`、`full-subagent-reports`、`skill-snapshots` 三项能力，默认仍全部关闭。设置页提供对应开关及技能选择，保存只影响新 Run。本地进程与自动复核的能力检查仍会拒绝提前开启。产品预算设计已于 2026-11-15 撤销：新配置/API/Run 快照不含 `budgetPolicy`，旧 Project 配置读取时忽略旧字段，旧 Run 快照字节与 hash 保留，只在运行投影中去掉旧字段。`review.maxPerBudget` 仅作历史读取别名迁移为 `maxPerGoal`，次数只约束自动复核。费用/整题墙钟限制仅在独立测试器执行；持续求解及旧单次超时/失败次数的恢复语义留阶段 4 实现。旧配置只有角色 hash 时，恢复验证现有角色；角色已经变化则明确拒绝，不偷偷加载新提示词。
 
 Solver 的关闭顺序在 `packages/agents/src/solver/agent/solver-agent.ts`：
 

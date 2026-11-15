@@ -247,8 +247,8 @@ const controlPlane = await ControlPlane.create({
         modelForRole: (role) => modelConfiguration.modelForSubagent(role, runtime.snapshot()),
       },
       runSettings: () => {
-        const { optimization, skills, budgetPolicy } = runtime.snapshot()
-        return { optimization, skills, budgetPolicy }
+        const { optimization, skills } = runtime.snapshot()
+        return { optimization, skills }
       },
     }
   },

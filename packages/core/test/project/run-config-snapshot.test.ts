@@ -14,6 +14,7 @@ import { RunStore } from "../../src/persistence/run-store.ts"
 import {
   buildRunConfigSnapshot,
   canonicalJson,
+  effectiveRunSettings,
   type RunConfigSnapshot,
   runConfigHash,
 } from "../../src/project/run-config-snapshot.ts"
@@ -215,15 +216,57 @@ describe("Run configuration freeze", () => {
     }
   })
 
+  it("resumes a legacy budget snapshot without enforcing or rewriting the retired settings", async () => {
+    const root = await fixture()
+    const { project } = await openProject(root)
+    try {
+      const first = await project.createSolver("warmup-flag", { agent })
+      await first.close("failed", "test legacy recovery")
+      const snapshot = await snapshotOf(root, first.runId)
+      const legacy = {
+        ...snapshot,
+        settings: {
+          ...snapshot.settings,
+          budgetPolicy: { schemaVersion: 1, enabled: true, wallClockMs: 1, maxCostMicros: 1 },
+          optimization: {
+            ...snapshot.settings.optimization,
+            review: { enabled: false, maxPerBudget: 5, maxConcurrent: 1 },
+          },
+        },
+      } as unknown as RunConfigSnapshot
+      const path = join(root, ".ctf-agent", "runs", first.runId, "run-config.json")
+      const archived = JSON.stringify(legacy, null, 2)
+      await writeFile(path, archived)
+      const hash = runConfigHash(legacy)
+      const active = effectiveRunSettings(legacy)
+      expect(active).not.toHaveProperty("budgetPolicy")
+      expect(active.optimization.review).toEqual({
+        enabled: false,
+        maxPerGoal: 5,
+        maxConcurrent: 1,
+      })
+      expect(runConfigHash(legacy)).toBe(hash)
+      const resumed = await project.resumeSolver(first.runId, { agent })
+      expect(await readFile(path, "utf8")).toBe(archived)
+      expect(
+        project.runEvents(first.runId).find((event) => event.type === "run_configuration_restored")
+          ?.data,
+      ).toMatchObject({ configHash: hash })
+      await resumed.close("manual")
+    } finally {
+      await project.close()
+    }
+  })
+
   it("refuses a Run this build cannot honor without blocking the challenge, and freezes it once fixed", async () => {
     const root = await fixture()
     let settings = mergeRunSettings(defaultRunSettings(), {
-      budgetPolicy: { enabled: true },
+      optimization: { localProcesses: true },
     })
     const { project, sandboxes } = await openProject(root, { runSettings: () => settings })
     try {
       await expect(project.createSolver("warmup-flag", { agent })).rejects.toMatchObject({
-        message: expect.stringContaining("budget-policy"),
+        message: expect.stringContaining("local-processes"),
         blocked: false,
         retryable: false,
         requiresConfiguration: true,
@@ -231,7 +274,7 @@ describe("Run configuration freeze", () => {
       expect(sandboxes()).toBe(0)
       const [run] = project.runs({ challengeId: "warmup-flag" })
       expect(run).toMatchObject({ status: "failed", closeReason: "failed" })
-      expect(run?.error).toContain("budgetPolicy.enabled")
+      expect(run?.error).toContain("optimization.localProcesses")
       expect(project.isChallengeBlocked("warmup-flag")).toBe(false)
       if (!run) throw new Error("the rejected Run was not recorded")
 

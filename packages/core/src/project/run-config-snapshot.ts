@@ -16,14 +16,18 @@ import type { Api, Model } from "@earendil-works/pi-ai"
 import {
   type OptimizationCapability,
   type RunSettings,
+  type RunSettingsPatch,
+  defaultRunSettings,
+  mergeRunSettings,
+  migrateStoredRunSettings,
   resolveSkillSelection,
   skillSelectionForRole,
 } from "../contracts/index.ts"
 import { RUN_STORE_DATA_CAPABILITIES } from "../persistence/run-store.ts"
 
 /**
- * Implemented information contracts. Settings still default off; budget,
- * persistent processes and review remain unavailable until their own gates pass.
+ * Implemented information contracts. Settings still default off; persistent
+ * processes and review remain unavailable until their own gates pass.
  */
 export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability> = new Set([
   "blackboard-reader-v2",
@@ -219,7 +223,7 @@ export async function buildRunConfigSnapshot(
     challengeId: input.challengeId,
     frozenAt: new Date().toISOString(),
     origin: input.origin ?? "new_run",
-    settings: structuredClone(input.settings),
+    settings: mergeRunSettings(defaultRunSettings(), input.settings),
     skills: { solver: solver.names, subagentDefault: subagentDefault.names, subagentRoles },
     roleDefinitions: structuredClone([...input.subagentRoles.values()]),
     subagentRoles: [...input.subagentRoles.values()]
@@ -313,6 +317,14 @@ export async function readRunConfigSnapshot(
     )
   }
   return parsed
+}
+
+/** Project the active settings without changing the archived bytes or config hash. */
+export function effectiveRunSettings(snapshot: RunConfigSnapshot): RunSettings {
+  return mergeRunSettings(
+    defaultRunSettings(),
+    migrateStoredRunSettings(snapshot.settings) as RunSettingsPatch,
+  )
 }
 
 /** A resumed Run must keep the runtime it started with; it never switches halfway. */

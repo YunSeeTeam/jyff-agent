@@ -476,9 +476,9 @@ describe("Project 运行配置的优化设置", () => {
     expect(runtime).toMatchObject({
       optimization: { blackboardReaderV2: false, review: { enabled: false } },
       skills: { solver: "all", subagents: { default: "all", roles: {} } },
-      budgetPolicy: { enabled: false },
       revision: 0,
     })
+    expect(runtime).not.toHaveProperty("budgetPolicy")
     const echoed = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
       ...runtime,
       expectedRevision: runtime.revision,
@@ -493,12 +493,8 @@ describe("Project 运行配置的优化设置", () => {
       { ...base, optimization: { unknownSwitch: true } },
       { ...base, optimization: null },
       { ...base, skills: { solver: null } },
-      { ...base, budgetPolicy: { unknownLimit: 1 } },
-      { ...base, budgetPolicy: { wallClockMs: null } },
-      { ...base, budgetPolicy: { wallClockMs: 1_000 } },
-      { ...base, budgetPolicy: { currency: "usd" } },
-      { ...base, budgetPolicy: { maxConcurrentModelRequests: 0 } },
-      { ...base, budgetPolicy: { maxCostMicros: 0 } },
+      { ...base, optimization: { review: { maxPerBudget: 2 } } },
+      { ...base, optimization: { review: { maxPerGoal: 17 } } },
     ]) {
       const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", payload)
       expect(response.status).toBe(400)
@@ -508,32 +504,25 @@ describe("Project 运行配置的优化设置", () => {
     }
   })
 
-  it("预算字段逐项保存，成本上限的 null 表示不设上限", async () => {
+  it("拒绝已废除的预算配置且不改变运行设置", async () => {
     const { app } = await appWithFileRuntime()
-    const set = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
-      ...base,
-      budgetPolicy: { wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: 2_000_000 },
-    })
-    expect(set.status).toBe(200)
-    expect(((await jsonOf(set)).runtime as ProjectRuntimeConfigurationView).budgetPolicy).toEqual({
-      schemaVersion: 1,
-      enabled: false,
-      clockMode: "strict_wall_clock",
-      wallClockMs: 3_600_000,
-      currency: "CNY",
-      maxCostMicros: 2_000_000,
-      maxConcurrentModelRequests: 5,
-      postprocessMs: 360_000,
-      postprocessMaxCostMicros: null,
-    })
-    const cleared = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
-      ...base,
-      budgetPolicy: { maxCostMicros: null },
-    })
-    expect(cleared.status).toBe(200)
-    expect(
-      ((await jsonOf(cleared)).runtime as ProjectRuntimeConfigurationView).budgetPolicy,
-    ).toMatchObject({ wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: null })
+    const initial = await jsonOf(await app.request("/api/projects/demo/runtime-config"))
+    for (const budgetPolicy of [
+      { enabled: true, wallClockMs: 3_600_000, currency: "CNY", maxCostMicros: 2_000_000 },
+      { enabled: false },
+      { maxCostMicros: null },
+      null,
+    ]) {
+      const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+        ...base,
+        budgetPolicy,
+      })
+      expect(response.status).toBe(400)
+      expect(await jsonOf(response)).toMatchObject({
+        error: "invalid_project_runtime_configuration",
+      })
+    }
+    expect(await jsonOf(await app.request("/api/projects/demo/runtime-config"))).toEqual(initial)
   })
 
   it("开关依赖不满足时返回原错误码并在 details 中说明", async () => {
@@ -548,8 +537,10 @@ describe("Project 运行配置的优化设置", () => {
       details: {
         reason: "configuration_dependency_error",
         issues: [
-          expect.objectContaining({ setting: "optimization.localProcesses" }),
-          expect.objectContaining({ requires: "budgetPolicy.enabled" }),
+          expect.objectContaining({
+            setting: "optimization.localProcesses",
+            requires: "local-processes",
+          }),
         ],
       },
     })

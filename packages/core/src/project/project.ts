@@ -69,6 +69,7 @@ import {
   assertResumableRuntime,
   BUILD_OPTIMIZATION_CAPABILITIES,
   buildRunConfigSnapshot,
+  effectiveRunSettings,
   frozenSubagentRoles,
   RUN_CONFIG_SNAPSHOT_FILE,
   type RunConfigOrigin,
@@ -1304,9 +1305,10 @@ export class Project {
         resumed,
         options,
       })
-      this.frozenRunSettings.set(runId, configuration.settings)
+      const settings = effectiveRunSettings(configuration)
+      this.frozenRunSettings.set(runId, settings)
       const roles = frozenSubagentRoles(configuration, this.configuredSubagentRoles())
-      const readerV2 = configuration.settings.optimization.blackboardReaderV2
+      const readerV2 = settings.optimization.blackboardReaderV2
       if (readerV2) {
         for (const role of roles.values()) {
           if (role.enabled && role.tools && !role.tools.includes("blackboard_read")) {
@@ -1363,7 +1365,7 @@ export class Project {
           : []
 
       // skills 的脚本/参考资料必须在容器内可见，不能把宿主机路径注入给 Agent。
-      const runSkills = configuration.settings.optimization.skillSnapshots
+      const runSkills = settings.optimization.skillSnapshots
         ? await openRunSkills({
             runDirectory,
             workspace,
@@ -1456,7 +1458,7 @@ export class Project {
         ...(readerV2
           ? { blackboardReadTool: createBlackboardReadTool(this.runStore, challengeId) }
           : {}),
-        fullSubagentReports: configuration.settings.optimization.fullSubagentReports,
+        fullSubagentReports: settings.optimization.fullSubagentReports,
         persistence: {
           beginExecution: (record, previousExecutionId) =>
             this.runStore.beginSubagentExecution(record, previousExecutionId),

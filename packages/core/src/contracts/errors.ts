@@ -18,8 +18,6 @@ export type ToolErrorCode =
   | "configuration_dependency_error"
   | "skill_snapshot_unavailable"
   | "skill_snapshot_changed"
-  | "budget_exhausted"
-  | "budget_unattributed"
   | "unsupported_mode"
   | "capability_unavailable"
   | "request_key_conflict"

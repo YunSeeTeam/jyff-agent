@@ -103,7 +103,6 @@ function runSettingsPatch(update: ProjectRuntimeConfigurationUpdate): RunSetting
   return {
     ...(update.optimization ? { optimization: update.optimization } : {}),
     ...(update.skills ? { skills: update.skills } : {}),
-    ...(update.budgetPolicy ? { budgetPolicy: update.budgetPolicy } : {}),
   }
 }
 
@@ -143,7 +142,6 @@ function storedRunSettings(parsed: Record<string, unknown>, path: string): RunSe
   const patch = parseStoredRunSettings({
     optimization: parsed.optimization,
     skills: parsed.skills,
-    budgetPolicy: parsed.budgetPolicy,
   })
   if (!patch) throw new Error(`Project 运行配置中的优化设置无效: ${path}`)
   return mergeRunSettings(defaultRunSettings(), patch)
@@ -223,7 +221,6 @@ function publicView(
     maxRemoteEnvironments: configuration.maxRemoteEnvironments,
     optimization: settings.optimization,
     skills: settings.skills,
-    budgetPolicy: settings.budgetPolicy,
     revision: configuration.revision,
   }
 }

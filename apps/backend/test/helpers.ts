@@ -14,10 +14,7 @@ import { FakeDashboardProject } from "./fake-project.ts"
 
 /** In-memory runtime configuration with the same merge semantics as the file store. */
 export function fakeRuntimeConfiguration(
-  initial: Omit<
-    ProjectRuntimeConfigurationView,
-    "revision" | "optimization" | "skills" | "budgetPolicy"
-  >,
+  initial: Omit<ProjectRuntimeConfigurationView, "revision" | "optimization" | "skills">,
 ): DashboardProjectRuntimeConfiguration & { current(): ProjectRuntimeConfigurationView } {
   let current: ProjectRuntimeConfigurationView = {
     ...initial,

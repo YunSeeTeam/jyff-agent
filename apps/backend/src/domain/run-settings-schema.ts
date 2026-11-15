@@ -1,11 +1,7 @@
 import {
-  BUDGET_MAX_CONCURRENT_MODEL_REQUESTS_LIMIT,
-  BUDGET_POSTPROCESS_MAX_MS,
-  BUDGET_POSTPROCESS_MIN_MS,
-  BUDGET_WALL_CLOCK_MAX_MS,
-  BUDGET_WALL_CLOCK_MIN_MS,
+  migrateStoredRunSettings,
   REVIEW_MAX_CONCURRENT_LIMIT,
-  REVIEW_MAX_PER_BUDGET_LIMIT,
+  REVIEW_MAX_PER_GOAL_LIMIT,
   type RunSettingsPatch,
 } from "@ctf-agent/core/contracts"
 import { z } from "zod"
@@ -20,8 +16,6 @@ const skillSelection = z.union([
   z.array(skillName).max(256, { message: "单个 Skill 选择最多 256 项" }),
 ])
 const roleName = z.string().trim().min(1).max(64)
-// Millionths of the budget currency; null (where allowed) means no limit.
-const costMicros = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 
 /**
  * Run settings as a partial update. `strict` rejects unknown keys for API input;
@@ -39,7 +33,7 @@ function runSettingsPatchSchema(strict: boolean) {
       localProcesses: z.boolean().optional(),
       review: object({
         enabled: z.boolean().optional(),
-        maxPerBudget: z.number().int().min(0).max(REVIEW_MAX_PER_BUDGET_LIMIT).optional(),
+        maxPerGoal: z.number().int().min(0).max(REVIEW_MAX_PER_GOAL_LIMIT).optional(),
         maxConcurrent: z.number().int().min(1).max(REVIEW_MAX_CONCURRENT_LIMIT).optional(),
       }).optional(),
     }).optional(),
@@ -51,35 +45,6 @@ function runSettingsPatchSchema(strict: boolean) {
         roles: z.record(roleName, skillSelection).optional(),
       }).optional(),
     }).optional(),
-    budgetPolicy: object({
-      schemaVersion: z.literal(1).optional(),
-      enabled: z.boolean().optional(),
-      clockMode: z.literal("strict_wall_clock").optional(),
-      wallClockMs: z
-        .number()
-        .int()
-        .min(BUDGET_WALL_CLOCK_MIN_MS)
-        .max(BUDGET_WALL_CLOCK_MAX_MS)
-        .optional(),
-      currency: z
-        .string()
-        .regex(/^[A-Z]{3}$/, { message: "currency 必须是 3 位大写 ISO 4217 货币代码" })
-        .optional(),
-      maxCostMicros: costMicros.nullable().optional(),
-      maxConcurrentModelRequests: z
-        .number()
-        .int()
-        .min(1)
-        .max(BUDGET_MAX_CONCURRENT_MODEL_REQUESTS_LIMIT)
-        .optional(),
-      postprocessMs: z
-        .number()
-        .int()
-        .min(BUDGET_POSTPROCESS_MIN_MS)
-        .max(BUDGET_POSTPROCESS_MAX_MS)
-        .optional(),
-      postprocessMaxCostMicros: costMicros.nullable().optional(),
-    }).optional(),
   })
 }
 
@@ -90,6 +55,6 @@ const storedRunSettingsSchema = runSettingsPatchSchema(false)
 
 /** Parse the run settings stored in a runtime configuration file. */
 export function parseStoredRunSettings(value: unknown): RunSettingsPatch | undefined {
-  const parsed = storedRunSettingsSchema.safeParse(value)
+  const parsed = storedRunSettingsSchema.safeParse(migrateStoredRunSettings(value))
   return parsed.success ? parsed.data : undefined
 }

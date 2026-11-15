@@ -67,6 +67,6 @@ describe("Information settings", () => {
       localProcesses: false,
       review: { enabled: false },
     })
-    expect(save.mock.lastCall![0].budgetPolicy.enabled).toBe(false)
+    expect(save.mock.lastCall![0]).not.toHaveProperty("budgetPolicy")
   })
 })

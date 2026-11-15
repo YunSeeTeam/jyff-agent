@@ -2,7 +2,7 @@
 
 | 项目     | 内容                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------- |
-| 文档版本 | 1.1；补充 Pi 版本调查、运行时迁移决策与兼容验收                                          |
+| 文档版本 | 1.2（2026-11-15）：撤销产品预算，P3 改为持续求解与故障恢复；1.1 的 Pi 调查保留为历史基线 |
 | 编制日期 | 2026-11-02                                                                               |
 | 状态     | 开发设计基线；新增接口、迁移和收益尚未实现或验收                                         |
 | 需求输入 | `jyff_agent_ctf_optimization_plan_v1.md`（不在本仓库内），以下简称“原方案”               |
@@ -10,7 +10,9 @@
 | 读者     | 后端、Agent 运行时、前端、测试、部署维护人员                                             |
 | 交付边界 | 本文只交付设计，不修改业务代码，不宣称已取得解题率或成本收益                             |
 
-快速导航：[现状架构](#sec-02) · [数据库与身份](#sec-03) · [方案审查](#sec-06) · [协作协议](#sec-07) · [迁移事务](#sec-08) · [前后端](#sec-09) · [Skills](#sec-10) · [预算](#sec-11) · [进程与证据](#sec-12) · [复核](#sec-13) · [开发拆分](#sec-14) · [验收评测](#sec-15) · [发布回退](#sec-16) · [Pi 升级与迁移](#sec-18)
+**2026-11-15 维护者决策：预算仅用于测试。** 最终产品不实现费用上限、整题累计时长上限、预算耗尽停机或“限额运行”模式；撤销原 P3 预算设计及其产品入口。费用观察、Token Usage、请求/命令超时、并发和存储配额保留各自职责。阶段 4 改为持续求解与故障恢复，目标是经判题确认 accepted 或人工停止；供应商暂不可用时保留进度并暂停/恢复。测试器独立控制费用和墙钟，不向产品配置注入预算，不把截断样本计为完整失败。旧方案和阶段记录仅作历史证据，发生冲突时以本次决策为准。
+
+快速导航：[现状架构](#sec-02) · [数据库与身份](#sec-03) · [方案审查](#sec-06) · [协作协议](#sec-07) · [迁移事务](#sec-08) · [前后端](#sec-09) · [Skills](#sec-10) · [持续求解](#sec-11) · [进程与证据](#sec-12) · [复核](#sec-13) · [开发拆分](#sec-14) · [验收评测](#sec-15) · [发布回退](#sec-16) · [Pi 升级与迁移](#sec-18)
 
 <a id="sec-01"></a>
 
@@ -18,13 +20,13 @@
 
 本项目已经具备多模型委派、异步子任务、Pi 会话、Docker 沙箱、平台适配、黑板、Skills、Web Access 和持久调度。二开应保留这些骨架，优先修复信息交接与成功结果持久化，再增加受控的执行能力。没有必要更换 Agent 框架、建设第二套任务调度器，或把现有异步协作改为所有成员必须参加的讨论会议。
 
-原方案总体方向正确，尤其是子模型只读黑板、完整报告按需读取、按 Run 固定 Skills、复核后置于累计预算。但它还不是可以直接照抄实现的设计：部分迁移、前端出口、成功语义、预算归属和文件事务边界没有落到足够具体的代码合同。
+原方案总体方向正确，尤其是子模型只读黑板、完整报告按需读取、按 Run 固定 Skills、复核后置于可靠生命周期。但它还不是可以直接照抄实现的设计：部分迁移、前端出口、成功语义、调用归属和文件事务边界没有落到足够具体的代码合同。
 
 **本设计作出六项实质修订：**
 
 1. 将“平台 accepted 不可被 writeup 或清理失败抹除”提升为首批修复。现有代码确实存在 accepted 后 writeup 校验失败而清除终态提交的路径；只新增评测指标不足以修正它。
 2. 完整报告是一项跨数据库、原生 Session、工具返回、HTTP、SSE 与 UI 的联合变更。必须先建立持久化提交点和统一投影，再开放完整存储。
-3. 将整题预算基础设施移到本地进程生产放量之前；预算账本独立于可关闭的 Token Usage 展示插件。
+3. 将持续求解、持久入队与故障恢复放在本地进程生产放量之前；费用/整题时长限制只存在于独立测试工具。
 4. 本地进程的幂等身份和状态采用现有 SQLite 的小型元数据表，日志仍用文件。放弃用两个 JSON 文件模拟跨文件原子事务的方案，不建设通用 Artifact 数据库。
 5. 把“兼容旧客户端”“回退到旧二进制”“Run 内配置冻结”分别设计。功能开关不能自动解决这三类问题。
 6. 将 Pi 升级纳入独立工作流：版本选型/兼容性调查必须完成，生产升级有条件放行。截至本次核查，0.82.1 到 1.4.0 涉及 Harness 和 Session 架构变化，不是普通依赖更新；第 7—12 章的具体 Pi API 绑定旧基线，新路线须通过第 18 章适配和验收。
@@ -84,7 +86,7 @@ Project 是应用层数据作用域，单题 ChallengeCapability 是解题 Agent
 
 | 模块                  | 主要文件/入口                                      | 现有责任                                     | 本次处理                                              |
 | --------------------- | -------------------------------------------------- | -------------------------------------------- | ----------------------------------------------------- |
-| `apps/backend`        | `src/main.ts`、`server.ts`、`http/app.ts`          | 启动、认证、路由、SSE、运行配置与模型配置    | 增加 DTO、分页接口、配置合并与预算归属                |
+| `apps/backend`        | `src/main.ts`、`server.ts`、`http/app.ts`          | 启动、认证、路由、SSE、运行配置与模型配置    | 增加 DTO、分页接口、配置合并与请求归属                |
 | `apps/frontend`       | `src/main.tsx`、`pages/challenge/*`                | 题目、对话、子任务、黑板、工作区、Attempts   | 报告按需展开，显示成功/总结/清理的不同状态            |
 | `apps/updater`        | `src/main.ts`                                      | 准备版本、构建、切换 current、重启与失败回切 | 增加数据兼容检查；不能把代码回切当数据库回滚          |
 | `packages/core`       | `control-plane/`、`project/`、`orchestration/`     | Project 装配、调度、状态、持久化             | 本次主要业务改动层                                    |
@@ -92,12 +94,12 @@ Project 是应用层数据作用域，单题 ChallengeCapability 是解题 Agent
 | `packages/prompts`    | `solver.ts`、`subagent.ts`、`project.ts`           | 稳定角色约束和动态上下文模板                 | 修正不真实恢复承诺，保持候选优先                      |
 | `packages/sandbox`    | `docker-sandbox.ts`、`docker-execution-env.ts`     | Docker 生命周期、命令、文件与输出            | 可选 attached pipes 能力、进程监督传输                |
 | `packages/platform`   | `index.ts`、`registry.ts`、各平台实现              | CTFd、DASCTF、GZCTF、Ret2Shell 统一契约      | 复用；补可选接受时间只能通过契约，不散落平台特判      |
-| `packages/web-access` | `src/*`、`UPSTREAM_PIN.md`                         | 搜索、来源检查、内容提取                     | 不重写 fork；用量和宿主网络边界须纳入预算分析         |
+| `packages/web-access` | `src/*`、`UPSTREAM_PIN.md`                         | 搜索、来源检查、内容提取                     | 不重写 fork；保留用量观察与宿主网络边界               |
 | `packages/shellpoop`  | `src/index.ts`                                     | 远程 shell 会话                              | 不受本地进程工具替换，保留既有清理                    |
-| Father / 扩展         | `core/src/father/`、`extensions/`                  | 插件作者会话、验证、激活                     | 回归保护；不注入 CTF 角色选择或题目预算               |
-| 代码审计 / TLDR       | `core/src/code-audit/`、`agents/src/tldr-agent.ts` | 独立审计、题目摘要                           | 审计不套用 CTF 协议；由求解触发的 TLDR 需明确预算归属 |
+| Father / 扩展         | `core/src/father/`、`extensions/`                  | 插件作者会话、验证、激活                     | 回归保护；不注入 CTF 角色选择或求解策略               |
+| 代码审计 / TLDR       | `core/src/code-audit/`、`agents/src/tldr-agent.ts` | 独立审计、题目摘要                           | 审计不套用 CTF 协议；由求解触发的 TLDR 需明确调用归属 |
 
-保持 `core → agents → sandbox/platform/prompts` 的依赖方向。core 将 reader、进程能力和预算 hook 作为窄接口传给 agents；禁止 agents 导入 core 的 Manager/RunStore 形成循环。暂不创建通用工作流包或共享协议平台：先在现有导出面定义 DTO 和纯函数，确有跨应用运行时复用时再提取。
+保持 `core → agents → sandbox/platform/prompts` 的依赖方向。core 将 reader、进程能力和请求生命周期 hook 作为窄接口传给 agents；禁止 agents 导入 core 的 Manager/RunStore 形成循环。暂不创建通用工作流包或共享协议平台：先在现有导出面定义 DTO 和纯函数，确有跨应用运行时复用时再提取。
 
 <a id="sec-03"></a>
 
@@ -126,36 +128,36 @@ Project 是应用层数据作用域，单题 ChallengeCapability 是解题 Agent
 
 RunStore 打开 SQLite 时启用 WAL、`synchronous=FULL`、外键和 5000 ms busy timeout。业务迁移目前采用 `CREATE TABLE IF NOT EXISTS` 与 `PRAGMA table_info` 检查后加列；没有完整迁移框架。[E03](#e03)
 
-| 表                                                  | 核心身份/关系                        | 内容及二开影响                                   |
-| --------------------------------------------------- | ------------------------------------ | ------------------------------------------------ |
-| `runs`                                              | `id`；`(challenge_id, attempt)` 唯一 | 生命周期；需增加成功事实和 budget 关联           |
-| `run_events`                                        | 自增 ID，FK `run_id`                 | 顺序事件；适合关键状态审计，不适合逐字节日志     |
-| `run_subagents`                                     | `id` 主键，FK `run_id`               | 当前子会话状态、result、usage；无执行版本历史    |
-| `model_token_usage`                                 | provider/model/source/source_id      | 展示统计；缺少预算归属、请求幂等键和费用结算合同 |
-| `challenge_evidence`                                | 自增 ID、challenge_id、creator run   | 同题跨 Run 记录，可修改；不是自动验证的事实库    |
-| `challenge_opportunities`                           | 自增 ID、challenge_id、creator run   | open/concluded，confirmed/dead_end 结论          |
-| `challenge_opportunity_sources`                     | opportunity/evidence 复合键          | 黑板关系表                                       |
-| `challenge_runtime_state`、`challenge_block_events` | challenge_id                         | 阻塞评分、恢复和诊断                             |
-| `scheduler_queue`、`scheduler_control`              | 持久队列、版本与模式                 | 需补预算关联和 retry 持久化路径                  |
-| `challenge_scheduling_overrides`                    | challenge_id                         | 人工 solved/excluded，与本次评测 accepted 分开   |
-| `platform_view_cache`                               | 平台缓存身份                         | 平台状态快照，不是本次求解结果证明               |
-| `remote_environment_leases`                         | 租约身份、challenge_id               | 实例容量、恢复、补偿清理                         |
-| 公告相关表、`challenge_tldr`                        | 公告/题目/Run 关系                   | 维持现状；求解期间模型调用应计入相应预算         |
+| 表                                                  | 核心身份/关系                        | 内容及二开影响                                       |
+| --------------------------------------------------- | ------------------------------------ | ---------------------------------------------------- |
+| `runs`                                              | `id`；`(challenge_id, attempt)` 唯一 | 生命周期；需增加成功事实和持久恢复关联               |
+| `run_events`                                        | 自增 ID，FK `run_id`                 | 顺序事件；适合关键状态审计，不适合逐字节日志         |
+| `run_subagents`                                     | `id` 主键，FK `run_id`               | 当前子会话状态、result、usage；无执行版本历史        |
+| `model_token_usage`                                 | provider/model/source/source_id      | 展示统计；仅作观察，不参与停止决策；未知费用不当作零 |
+| `challenge_evidence`                                | 自增 ID、challenge_id、creator run   | 同题跨 Run 记录，可修改；不是自动验证的事实库        |
+| `challenge_opportunities`                           | 自增 ID、challenge_id、creator run   | open/concluded，confirmed/dead_end 结论              |
+| `challenge_opportunity_sources`                     | opportunity/evidence 复合键          | 黑板关系表                                           |
+| `challenge_runtime_state`、`challenge_block_events` | challenge_id                         | 阻塞评分、恢复和诊断                                 |
+| `scheduler_queue`、`scheduler_control`              | 持久队列、版本与模式                 | 需补 retry 持久化与目标恢复路径                      |
+| `challenge_scheduling_overrides`                    | challenge_id                         | 人工 solved/excluded，与本次评测 accepted 分开       |
+| `platform_view_cache`                               | 平台缓存身份                         | 平台状态快照，不是本次求解结果证明                   |
+| `remote_environment_leases`                         | 租约身份、challenge_id               | 实例容量、恢复、补偿清理                             |
+| 公告相关表、`challenge_tldr`                        | 公告/题目/Run 关系                   | 维持现状；求解期间模型调用应记录对应 Run/用途        |
 
 黑板现有限制为描述 4000 个 JavaScript UTF-16 code unit、每条最多 32 个来源、每题两类分别最多 256 条。新的输出分页按 Unicode 码点和序列化字节计算；本期不顺带改变已有写入长度合同。
 
 ### 3.3 身份模型
 
-| 身份                     | 生命周期                     | 不可混同的对象                         |
-| ------------------------ | ---------------------------- | -------------------------------------- |
-| projectId                | 一个比赛/项目                | 不能由工具调用参数任意覆盖闭包绑定     |
-| challengeId              | 平台题目                     | 多个 Run 可共享题目黑板与 workspace    |
-| runId                    | 一次尝试/可恢复运行          | 已有恢复可能沿用同一 Run，不总是新建   |
-| subagentId               | 可 resume 的子会话           | 不是一次执行身份                       |
-| executionId（新增）      | spawn/每次 resume 各生成新值 | 相同报告文本也属于不同执行             |
-| budgetId（新增）         | 一次明确求解目标             | retry/resume/revival 不得自行刷新预算  |
-| processSessionId（新增） | 一次受管进程启动             | 与 Pi session、远程 ShellPoop ID 分开  |
-| artifactRef（新增）      | Run 内文件或固定前缀的引用   | 路径不等于不可变内容，必须含完整性信息 |
+| 身份                      | 生命周期                     | 不可混同的对象                             |
+| ------------------------- | ---------------------------- | ------------------------------------------ |
+| projectId                 | 一个比赛/项目                | 不能由工具调用参数任意覆盖闭包绑定         |
+| challengeId               | 平台题目                     | 多个 Run 可共享题目黑板与 workspace        |
+| runId                     | 一次尝试/可恢复运行          | 已有恢复可能沿用同一 Run，不总是新建       |
+| subagentId                | 可 resume 的子会话           | 不是一次执行身份                           |
+| executionId（新增）       | spawn/每次 resume 各生成新值 | 相同报告文本也属于不同执行                 |
+| 求解目标身份（P3 待冻结） | 一次明确求解目标             | retry/resume 保留状态，不关联费用/时长上限 |
+| processSessionId（新增）  | 一次受管进程启动             | 与 Pi session、远程 ShellPoop ID 分开      |
+| artifactRef（新增）       | Run 内文件或固定前缀的引用   | 路径不等于不可变内容，必须含完整性信息     |
 
 ### 3.4 恢复能力的真实边界
 
@@ -206,7 +208,7 @@ RunStore 打开 SQLite 时启用 WAL、`synchronous=FULL`、外键和 5000 ms bu
 | D04 | 当前执行完整报告、版本化分页、所有自动出口有界 | 5               | 7.3、8、9      | P1                      |
 | D05 | Run 冻结配置、旧客户端省略不清值               | 7、11           | 7.5、9.3       | P1/P2                   |
 | D06 | Skills 按角色选择并冻结包版本                  | 7               | 10             | P2                      |
-| D07 | 跨 Run 的整题截止、请求预留、复核额度          | 11              | 11             | P3                      |
+| D07 | 持续求解、持久重试与请求恢复                   | 原预算方案撤销  | 11             | P3（修订后）            |
 | D08 | 本地 pipes 长进程、幂等、输入、输出、清理      | 8               | 12             | P4                      |
 | D09 | 实验记录、文件引用和真正范围读取               | 9               | 12.5           | P4                      |
 | D10 | 有条件、有限额的复核和重新规划                 | 10              | 13             | P5                      |
@@ -219,15 +221,15 @@ RunStore 打开 SQLite 时启用 WAL、`synchronous=FULL`、外键和 5000 ms bu
 - 权限：查询只在当前 Project/challenge/Run 作用域内；子模型没有黑板写 API、提交 API 或递归派发 API。
 - 完整性：已成功保存的当前报告可以有限次分页精确重组；缺失或变化必须显式报错。
 - 有界性：度量实际序列化后的 AgentToolResult/HTTP DTO 字节数，包含封套和 details；字符数不等于 Token 数。
-- 生命周期：重试不刷新预算，终态发布不早于数据库提交，过期执行不能覆盖新执行。
-- 可恢复性：缺少 marker、manifest、日志或预算归属时显式诊断，不能自动换最新文件或拼接旧报告掩盖缺失。
+- 生命周期：重试不丢失目标状态，终态发布不早于数据库提交，过期执行不能覆盖新执行。
+- 可恢复性：缺少 marker、manifest、日志或调用归属时显式诊断，不能自动换最新文件或拼接旧报告掩盖缺失。
 - 成功路径：候选不等待全员；accepted 与 writeup/cleanup 独立，截止后的 accepted 仍是实际平台事实，但不算严格评测的按时成功。
 
 不能由 schema/hash 保证：证据真实性、自然语言推理正确、不同模型没有锚定、复核一定改善解题率、共享 workspace 内的 OS 级隔离。评测必须区分工程合同和策略收益。
 
 ### 5.3 首版明确不做
 
-不更换 Pi 技术生态；首批正确性修复可保留当前 Harness，新版运行时迁移独立按第 18 章推进。不增加第二个比赛/子任务业务调度器，不建设多人可写黑板，不复制完整思考到共享报告，不建设 Skills 市场或自动安装依赖，不新增通用 MCP 平台，不承诺跨重启恢复 stdin/PTY，不把全部外部工具一次性重做成专用接口。固定“每题三名子模型且全部最高思考档位”不作为产品默认；并行人数应由任务可分解性和预算决定。
+不更换 Pi 技术生态；首批正确性修复可保留当前 Harness，新版运行时迁移独立按第 18 章推进。不增加第二个比赛/子任务业务调度器，不建设多人可写黑板，不复制完整思考到共享报告，不建设 Skills 市场或自动安装依赖，不新增通用 MCP 平台，不承诺跨重启恢复 stdin/PTY，不把全部外部工具一次性重做成专用接口。固定“每题三名子模型且全部最高思考档位”不作为产品默认；并行人数应由任务可分解性和资源并发能力决定。
 
 <a id="sec-06"></a>
 
@@ -241,7 +243,7 @@ RunStore 打开 SQLite 时启用 WAL、`synchronous=FULL`、外键和 5000 ms bu
 | A04 / P1    | 无参 reader 语义有隐性回退               | 旧调用拿两类全板，新调用默认只有 evidence 索引；机会可能被忽略                            | prompt 与恢复快照显式携带两类计数/入口，UI 识别 schemaVersion，不称结构兼容                   |
 | A05 / P1    | 全板可读可能增加错误结论传播             | 共享结论会使路线趋同，主写子读也不能证明事实                                              | 索引默认，按任务读 ID；条件化记录；保留污染专项，收益不达标就少共享                           |
 | A06 / P1    | 定向复核容易成为高成本重复探索           | 名为 review 不等于独立验证；全板可读更不等于盲评                                          | 必须列决策问题、可区分实验、新证据与限额；先对照再开启                                        |
-| A07 / P1    | 预算过晚接入会制造假收益                 | 进程/重试/压缩可各自合法但合计超限；展示 usage 可关闭                                     | 预算 P3 先于进程生产 P4，账本不可由展示开关关闭                                               |
+| A07 / P1    | 测试限制与产品目标混淆                   | 同等评测条件不能成为产品停机机制                                                          | 独立评测器控制费用/墙钟；产品持续求解与恢复                                                   |
 | A08 / P1    | 两个 JSON 原子 rename 不构成联合事务     | request 文件和 session 文件之间崩溃，可重复启动或丢句柄                                   | 用 SQLite 唯一键原子保留请求与状态；文件仅日志/导出                                           |
 | A09 / P1    | Skills 包 hash 不等于环境复现            | 工具二进制、镜像、依赖、远端实例仍可能变化                                                | manifest 另记录镜像 digest/附件 hash/实际模型等可获得环境信息；未知明确标记                   |
 | A10 / P1    | 主写黑板可能成为串行瓶颈                 | 所有观察都要求主模型转录会消耗推理预算                                                    | 子任务直接交报告和引用，只将影响后续决策的观察入板；首版不加自动总结模型                      |
@@ -250,7 +252,7 @@ RunStore 打开 SQLite 时启用 WAL、`synchronous=FULL`、外键和 5000 ms bu
 | A13 / P2    | 进程工具会增加大量生命周期成本           | stdin、双流、EOF、超时、重启、配额均是实际新能力                                          | 先 pipes 能力样例；普通批处理继续 bash；不提前承诺 PTY                                        |
 | A14 / P2    | “可回退”被低估                           | updater 回切代码不自动恢复 SQLite；旧版可展开新长报告                                     | 记录数据能力版本、维护兼容回退构建；完整旧版回退必须恢复一致备份                              |
 | A15 / P2    | 所有数值都冻结为默认容易过拟合开发题     | 8 KiB/64 KiB、会话数、复核次数并非已测最优值                                              | 初始值用于合同测试和容量控制，性能阈值由开发集定、验收集验证                                  |
-| A16 / P1    | “升级最新版底座”并非低成本修补           | 0.84 已换 Session，1.x 已移除本项目使用的 core Harness 出口；迁移还涉及私有 HTML 导出接缝 | U0 必须先选路线；U1 单独迁移，不与协作/预算策略同时上线，不把新版发布说明当项目自动获得的能力 |
+| A16 / P1    | “升级最新版底座”并非低成本修补           | 0.84 已换 Session，1.x 已移除本项目使用的 core Harness 出口；迁移还涉及私有 HTML 导出接缝 | U0 必须先选路线；U1 单独迁移，不与协作/恢复策略同时上线，不把新版发布说明当项目自动获得的能力 |
 
 这些修订不否定原方案，主要把“良好的协作设想”落实为可恢复、可兼容、可验证的工程边界。最应避免的负面优化，是增加更多 Agent、工具和摘要后，系统花更多时间维护自身状态，却没有更快得到平台 accepted。
 
@@ -408,7 +410,7 @@ sequenceDiagram
 
 快照另保存 runtimeProfile：实际 Pi 包版本、完整 lock hash、适配器 ID、Session 格式/迁移版本及已验证能力集合。恢复必须匹配可读取该格式的适配器；不得在同一个 Run 中途静默切换底座。旧记录未保存这些字段时标 unknown，不能从当前安装版本推断历史版本。
 
-恢复沿用原快照。旧 Run 没快照时标 `legacy-resume`，注明历史配置未知；默认按兼容模式恢复，不能自动得到全新预算或已证明的环境复现性。Provider 凭据可轮换，凭据内容不入快照；模型配置中可观测端点/模型/能力发生变化应有诊断，不能声称与旧运行完全相同。
+恢复沿用原快照。旧 Run 没快照时标 `legacy-resume`，注明历史配置未知；默认按兼容模式恢复，不能自动重置目标状态或声称已证明环境复现性。Provider 凭据可轮换，凭据内容不入快照；模型配置中可观测端点/模型/能力发生变化应有诊断，不能声称与旧运行完全相同。
 
 <a id="sec-08"></a>
 
@@ -424,9 +426,7 @@ sequenceDiagram
 | P0   | 数据能力登记                 | 新 `runtime_data_capabilities(name PRIMARY KEY, version INTEGER)`，如 accepted-fact-v1、bounded-report-v2；供受控启动/回退检查                                                          |
 | P1   | `run_subagents` 加列         | `execution_id TEXT NULL`、`result_kind TEXT NULL`；旧非空 result 标 legacy                                                                                                              |
 | P1   | 黑板查询索引                 | `challenge_opportunities(challenge_id,id)`，按查询计划确认有必要后加入                                                                                                                  |
-| P3   | 新 `solve_budgets`           | 第 8.2 节定义的预算投影                                                                                                                                                                 |
-| P3   | 新 `budget_requests`         | 逐模型请求预留/结算，不可关闭；request_id 唯一                                                                                                                                          |
-| P3   | 队列/Run 关联                | `runs.budget_id`、`scheduler_queue.budget_id/resume_run_id/purpose`；nullable 兼容旧数据                                                                                                |
+| P3   | 队列/Run 恢复关联            | 持久化 resume_run_id/purpose 和目标状态，具体 DDL 在阶段 4 冻结；不新增预算表或 budget_id                                                                                               |
 | P4   | 新 `local_process_sessions`  | 请求幂等、身份、状态、截止、日志位置/长度、清理状态；不存原始输出块                                                                                                                     |
 | P5   | `run_subagents` 加协作记账列 | `purpose TEXT NULL`、`review_id TEXT NULL`；旧记录 NULL 表示历史分类未知，新任务使用 explore/verify/review                                                                              |
 
@@ -434,20 +434,16 @@ solveOutcome 的数据库 CHECK 允许第 7.1 节枚举，NULL 表示无可确�
 
 ### 8.2 新投影的字段规格
 
-| 表                       | 必需字段                                                                                                                                                                                                                                                                                               | 唯一性/索引                                                                                  |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `solve_budgets`          | id、challenge_id、created_at、started_at、deadline_at、postprocess_started_at/postprocess_deadline_at nullable、status、limits_json、pricing_snapshot_json、reported_cost_micros、reserved_cost_micros、unknown_usage_count、review_used、version                                                      | PK id；challenge/status 索引；金额以同币种微单位整数存，未知不写成 0；phase 分账由请求表投影 |
-| `budget_requests`        | request_id、budget_id、run_id、execution_id nullable、phase、purpose、provider、model、state、dispatch_state（queued/sending/sent）、sent_at nullable、reserved_cost_micros nullable、reported_cost_micros nullable、usage_json、created_at、settled_at                                                | PK request_id；FK budget/run；budget/state 索引；结算只允许一次有效转换                      |
-| `local_process_sessions` | id、run_id、budget_id、owner_agent_id、execution_id、request_key_hash、fingerprint、state、command_ref、cwd、mode、created_at、started_at、deadline_at、exit_code、stop_reason、stop_requested_at、cleanup_state、cleanup_error、stdout_path/stderr_path、stdout_bytes/stderr_bytes、final_hashes_json | PK id；UNIQUE(run_id,owner_agent_id,request_key_hash)；run/state 与 cleanup 索引             |
+| 表                       | 必需字段                                                                                                                                                                                                                                                                                    | 唯一性/索引                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `local_process_sessions` | id、run_id、owner_agent_id、execution_id、request_key_hash、fingerprint、state、command_ref、cwd、mode、created_at、started_at、deadline_at、exit_code、stop_reason、stop_requested_at、cleanup_state、cleanup_error、stdout_path/stderr_path、stdout_bytes/stderr_bytes、final_hashes_json | PK id；UNIQUE(run_id,owner_agent_id,request_key_hash)；run/state 与 cleanup 索引 |
 
 command_ref 指向受管理的启动描述文件，避免把长命令反复嵌入状态响应；其文件发布成功后才提交可启动记录，失败即不启动。其删除跟随 Run 保留策略。owner 由宿主绑定为 `solver` 或子会话 ID，executionId 用于来源追踪，不使 resume 取得新的 requestKey 命名空间。主模型接手仍保留原 owner 审计。
 
-预算状态拟定为 `active | accepted | exhausted | cancelled | legacy_unmetered`；请求状态为 `reserved | settled | unknown`。预算状态 accepted 只停止 solve 阶段请求，postprocess 使用另行配置的有限额度，全部费用仍汇总到同一目标。
+目标恢复状态在阶段 4 冻结，必须区分求解中、可恢复暂停、人工停止与 accepted；不设置 exhausted 或费用状态。旧预算表设计已撤销，不执行对应 DDL。
 
 ```mermaid
 erDiagram
-  SOLVE_BUDGETS ||--o{ RUNS : covers
-  SOLVE_BUDGETS ||--o{ BUDGET_REQUESTS : reserves
   RUNS ||--o{ RUN_SUBAGENTS : owns
   RUNS ||--o{ RUN_EVENTS : records
   RUNS ||--o{ LOCAL_PROCESS_SESSIONS : owns
@@ -461,14 +457,12 @@ erDiagram
 
 ### 8.3 关键事务
 
-| 操作                 | 同事务内的动作                                                          | 提交后才允许                      |
-| -------------------- | ----------------------------------------------------------------------- | --------------------------------- |
-| recordSolveOutcome   | 首次成功事实/时间 + 有界 accepted 事件；幂等保留首次观察                | 发布 accepted 终态与成功通知      |
-| beginExecution       | 校验旧执行与可恢复状态；更新新 ID，清正文/error/completedAt；写开始事件 | append marker、排队/启动          |
-| commitResult         | 按 executionId CAS 写正文/kind/status；写不含正文的完成事件             | resolve waiters、父通知、SSE 状态 |
-| reserveBudgetRequest | 检查目标状态/截止/余额，插入 requestId，增加预留                        | 真正发起模型请求                  |
-| settleBudgetRequest  | requestId 幂等结算、释放对应预留、累加实际或未知                        | 更新费用展示                      |
-| reserveProcess       | 校验幂等键、归属、活跃配额、预算，插入 starting                         | 启动容器内监督进程                |
+| 操作               | 同事务内的动作                                                          | 提交后才允许                      |
+| ------------------ | ----------------------------------------------------------------------- | --------------------------------- |
+| recordSolveOutcome | 首次成功事实/时间 + 有界 accepted 事件；幂等保留首次观察                | 发布 accepted 终态与成功通知      |
+| beginExecution     | 校验旧执行与可恢复状态；更新新 ID，清正文/error/completedAt；写开始事件 | append marker、排队/启动          |
+| commitResult       | 按 executionId CAS 写正文/kind/status；写不含正文的完成事件             | resolve waiters、父通知、SSE 状态 |
+| reserveProcess     | 校验幂等键、归属、活跃资源配额与目标取消状态，插入 starting             | 启动容器内监督进程                |
 
 报告提交 SQL 必须含 `WHERE run_id=? AND id=? AND execution_id=?`，并限定允许的非终态前态。不同执行不匹配返回 stale_execution；同一执行的 cancel/正常完成竞争时首次终态提交胜出，重复完成幂等返回已保存结果，不覆盖。recordProgress 同样仅更新非终态且不触碰 result/终态字段。beginExecution 同时检查可恢复状态与旧 executionId，legacy NULL 使用 IS NULL。任何 CAS 失败不得降级无条件 upsert。BEGIN/COMMIT 区间内不能等待网络或运行模型；Node 单进程 keyed lock 解决本地异步交错，SQLite 条件更新是持久层兜底。首版仍按现有单后端实例部署，不声称仅靠 keyed lock 支持多个后端同时调度同一数据目录。
 
@@ -476,7 +470,7 @@ erDiagram
 
 1. 停止写入并取得一致备份；使用 SQLite backup 或停服务后连同 WAL 状态正确处理，不能在线只复制主 DB 文件。
 2. 按列存在性执行迁移，并在同批迁移中记录能力版本；重复执行不得改写新执行数据。
-3. 旧已解 Run 标 legacy_success，时间未知；旧报告标 legacy；旧预算关联为空时为 legacy_unmetered，不自动分配满额新预算。
+3. 旧已解 Run 标 legacy_success，时间未知；旧报告标 legacy；旧预算配置只作历史记录，恢复时忽略，不改写快照/hash。
 4. `blocking/writing_writeup` 纳入崩溃恢复检查：当前 markInterruptedRuns 只覆盖 preparing/running，这是静态发现的风险，需专项测试，不宣称已动态复现。
 5. 已有 accepted 事实的 Run 重启后只能做总结/清理或人工明确开启新研究目标，不按普通失败重试求解。
 6. DB 完成记录、Session marker、Skills manifest、进程日志分别校验；一个领域恢复成功不代表其他领域恢复成功。
@@ -523,7 +517,7 @@ erDiagram
 
 `useChallengeDetails` 不再因每次 dashboard snapshot 重拉所有大文本，改为按状态/版本失效更新摘要，正文只在用户查看时读取。SSE 断线后继续从持久接口回读，不把流当唯一数据源。当前 SSE 队列缺少总容量上限，本次至少禁止新增日志流放大该问题；不要宣称已解决全部既有 SSE 背压。
 
-运行配置需同时修改 `types.ts → http/schema.ts → domain/runtime.ts 的 read/update/publicView → Project 装配 → frontend types/forms`。旧 payload 省略 skills/optimization/budgetPolicy 时保留服务端值；显式 `[]` 清技能选择，显式 all 重置选择；null 除非 schema 明确定义，否则拒绝。数组替换、结构对象仅按已声明字段合并；`skills.subagents.roles` 是一个整表替换字段，省略保留，提供 `{}` 删除全部覆盖，提供新的映射删除未列出的旧覆盖。不使用无约束 deep merge 接纳未知键。旧 ChallengeDetails 没有 selectedRunId 参数，本期不新增它，由前端按 Run 索引调独立列表接口。
+运行配置需同时修改 `types.ts → http/schema.ts → domain/runtime.ts 的 read/update/publicView → Project 装配 → frontend types/forms`。旧 payload 省略 skills/optimization 时保留服务端值；budgetPolicy 已撤销，新 API 拒绝该字段；显式 `[]` 清技能选择，显式 all 重置选择；null 除非 schema 明确定义，否则拒绝。数组替换、结构对象仅按已声明字段合并；`skills.subagents.roles` 是一个整表替换字段，省略保留，提供 `{}` 删除全部覆盖，提供新的映射删除未列出的旧覆盖。不使用无约束 deep merge 接纳未知键。旧 ChallengeDetails 没有 selectedRunId 参数，本期不新增它，由前端按 Run 索引调独立列表接口。
 
 <a id="sec-10"></a>
 
@@ -547,7 +541,7 @@ erDiagram
     "fullSubagentReports": false,
     "skillSnapshots": false,
     "localProcesses": false,
-    "review": { "enabled": false, "maxPerBudget": 2, "maxConcurrent": 1 }
+    "review": { "enabled": false, "maxPerGoal": 2, "maxConcurrent": 1 }
   }
 }
 ```
@@ -580,49 +574,31 @@ Compose 可追加 `./ctf-skills:/data/.pi/skills:ro`，保留状态卷和 Docker
 
 <a id="sec-11"></a>
 
-## 11. 整题预算与请求归属
+## 11. 持续求解、故障恢复与测试边界
 
-### 11.1 目标和时间定义
+### 11.1 产品目标与停止语义（P3，修订后待实现）
 
-budgetId 表示一次明确求解目标，覆盖其所有 Run、retry、resume、revival、子模型、压缩和自动复核。人工“重新开始一个独立研究目标”或评测器创建新样本才产生新预算；模型改变任务描述不能刷新。旧无归属运行标 legacy_unmetered，保持自动复核关闭。
+正式求解以判题确认的 accepted 为成功依据，保留人工停止。模型自报 flag、候选字符串、单次尝试结束或固定失败次数均不等于目标完成。暂时的网络、限流、订阅配额或鉴权故障应保存进度，退避或显示需处理状态；条件恢复后继续。不得用极大费用/时长数字模拟“不限”，不新增预算开关或限额模式。
 
-新增 Project 运行配置 `budgetPolicy`，schemaVersion=1，至少包含 enabled、clockMode、wallClockMs、currency、maxCostMicros（可为 null）、maxConcurrentModelRequests、postprocessMs、postprocessMaxCostMicros。初始试验可使用 1—2 小时墙钟，但具体值在评测计划冻结；不能将原每轮 timeout 名字不变而偷偷改变全部用户预期。
+现有单次尝试超时与失败次数仍属旧调度行为，本次删除预算占位不代表已经实现持续求解。阶段 4 须明确把它们转换为恢复、换路或可恢复暂停，避免将未解目标自动判为最终放弃；恢复应保留证据与已尝试路径，防止重复无进展操作。
 
-严格模式 `clockMode=strict_wall_clock`：目标正式入求解队列时设置 startedAt/deadlineAt，排队、限流、网络、实例等待均计时。仅选择题目放入 idle 列表不创建预算；start 将其移到 execution，或手动 dispatch 实际入队时创建/继承预算。Runner 在样本正式调度时同样创建，所有组口径一致。
+### 11.2 请求与工具的可靠性
 
-生产模式可保留现有单轮有效工作超时，但它与严格模式是两个独立计时器；启用整题预算后取更早的实际终止条件。持久化 UTC deadline，进程内用单调时钟安排计时，重启用绝对截止重新计算；不能因为恢复重新发满时长。墙钟调整应记录诊断并采用保守剩余时长，不以本地计时误差伪造平台时间。
+每次实际模型调用携带不可变 Project/Challenge/Run/Execution 身份，覆盖 Solver、子任务、压缩与辅助调用；共享 ProviderGate 仍承担并发、限流和取消，不检查余额、费用预留或整题截止。连续瞬断计数在成功进展后归零；重试可观测，避免 SDK 隐式重试与调度重试叠加。请求超时、流空闲超时和单条命令/作业截止用于释放卡死资源与恢复，不终止整个求解目标。
 
-### 11.2 Gate 接线
+accepted、人工停止及暂停必须在排队后、实际发送前再次检查；取消信号应覆盖所有模型入口。不同 Run 共享 provider 时不得串用归属或取消状态。保留现有 Token Usage 展示和诊断；未知用量不能伪称零成本，也不据此触发产品预算停机。
 
-```text
-创建目标/持久入队
-  -> BudgetContext(projectId, challengeId, budgetId, runId, phase)
-  -> 派发前检查（Solver / 子任务 / process）
-  -> 每次模型调用前预留 requestId 和可能的费用
-  -> ProviderGate 排队与限流
-  -> 实际网络发送前重新检查 deadline 和取消信号
-  -> 完成/异常/取消后幂等结算或标记 unknown
-```
+### 11.3 持久入队、恢复与 accepted 对账
 
-不能仅在 `Agent` 工具派发时检查：已运行的 Pi 循环后续还会调用模型。沿 `model-pool.ts` 的 provider stream gate 和 Agent 请求入口传递每次调用的不可变归属，不能把“当前 budget”放到共享 provider 的可变全局变量。可通过窄 hook/作用域上下文传递，但要测试同时调用同一 provider 的不同 Run 不串账。
+将 `retryRun()` 的 `persisted:false` 内存路径并入统一持久入队，保存恢复 Run、用途与所属求解目标。具体目标身份/表结构在阶段 4 冻结；只管理生命周期，不建立 `solve_budgets`、`budget_requests`、费用预留或累计 deadline。重启先核对 accepted、人工停止、暂停与资源状态，再恢复任务，避免重复派发。
 
-覆盖面必须逐项验收：Solver、子模型、失败重试、compaction、branch summary、求解触发的 TLDR/Web 摘要。Father、独立代码审计、用户事后手工 TLDR 属于独立操作，另记用途，不能强行塞入已结束的求解额度；也不能把求解所必需的辅助模型调用伪装成独立操作逃避统计。
+补齐 `accepted_persistence_failed` 的证据对账：平台当前已解不能证明原 Run 的接受归属或原始接受时间，不伪造历史。成功后停止探索，按现有配置总结和清理，失败可诊断/重试但不抹除 accepted；不另设金额或整题收尾预算。
 
-现有 `model_token_usage` 继续服务 UI。新 budget_requests 始终执行，不受 Token Usage 插件开关控制。模型请求可预留的输入/输出上界按真实模型配置和定价快照计算；不支持精确计费或存在供应商迟到账单时显示软费用上限、reserved、unknown、actualOverrun。超时/取消后的本地 usage=0 不证明上游未收费。
+### 11.4 配置迁移与独立测试
 
-### 11.3 截止、并发、费用与收尾
+产品 `RunSettings`、HTTP 更新/返回和新 Run 快照删除 `budgetPolicy`，请求显式携带废弃字段应报配置错误。读取旧 Project 配置时丢弃旧预算字段；旧 `review.maxPerBudget` 只作为读取迁移别名映射为 `maxPerGoal`，后者只限制自动复核次数，不限制 Solver 继续求解。旧 Run 快照原字节/hash 保留，运行投影忽略预算字段；不得改写历史评测配置或结果。
 
-达到截止时，禁止新 solve 请求和派发，取消在途 Agent 与实验，回收远程资源。poll/write 不延长进程 deadline。费用达到软限制同样阻止新增请求，但不承诺取消已发送请求可撤销费用。请求 dispatch_state 区分 queued/sending/sent：明确未发出的 queued 请求取消可结算为本地零消耗并释放预留；发送前先持久化 sending，传输确认开始后记 sent_at。sending/sent 阶段崩溃且无结果时保守标 unknown，避免把“可能已发出”当作零费用。网络发送和数据库仍不是原子事务，不能宣称 exactly-once 计费。
-
-accepted 后预算 solve 阶段停止；启用 writeup 时，在首次可靠接受事实事务内将 postprocess_started_at 设为首次观察时间、postprocess_deadline_at 设为该时间加冻结的 postprocessMs，只初始化一次。三轮校验、人工 writeup retry、resume 和后端重启共用此截止与 phase 累计费用/预留，不能每轮发新额度。already_solved 需要总结时用第一次该终态观察时间同样初始化；旧目标无计时依据时明确标 legacy。writeup 请求记录 `phase=postprocess`，全部成本统计仍包含它。若用户关闭 writeup，则直接有限清理。清理错误不改变 accepted；一次清理失败也不能跳过其他资源关闭。
-
-复核次数在派发事务内扣除，不能 resume 刷新。初值每 budget 最多 2 次、同时最多 1 次，所有 explore/verify/review 仍共用总预算。标签误分类可以骗过次数归类，不能骗过整题截止和总费用账本。
-
-### 11.4 队列与恢复
-
-将 `retryRun()` 中 `persisted:false` 的内存专用路径并入统一入队函数，持久化 resumeRunId、purpose、budgetId。新 Run 创建、旧 Run 恢复与队列领取必须校验同一 challenge/budget；缺归属不能临时给新预算填洞。补偿重试保留旧请求结算记录，requestId 每个实际网络尝试唯一。所有预算控制链路禁用 adapter/SDK 内部隐式重试，由可观测 wrapper 每次重新检查、预留、结算；若某 adapter 无法禁用，则必须提供每个底层 attempt hook 后才能声称覆盖。锁定 Pi 部分 adapter 默认不重试但允许配置开启，不能把一次 streamFn 调用天然当作一次网络请求；OAuth bridge/不同 provider 也要逐一验收。
-
-重启对 sending/sent 的未结算请求标 unknown，保留预留或按保守上界记账，直到有可核验账单/回执；不归零。queued 已保证未发出，可释放预留或在同预算/原截止内重新排队，不误记未知外部费用。对 active 且过期预算先取消/reconcile 再恢复 Agent。若真实锁定 Pi 不能覆盖每次请求入口，P3 不算完成：仅允许外部评测器强制整题截止，review.enabled 必须保持 false，且文档/界面显示费用强制边界尚未实现。
+测试费用授权、保守对账、余额轮询、在途预留和样本墙钟均放在独立评测器。各组固定同等测试条件，保存原始失败、中断、重跑和未知归账；充值不自动增加测试授权。生产交付不包含预算设置页、预算停机逻辑或预算表迁移。T24—T28 在第 15.1 节按新的持续求解合同重定义，旧预算测试定义撤销，不把已有阶段 3 测试冒称这些未来验收已完成。
 
 <a id="sec-12"></a>
 
@@ -657,7 +633,7 @@ flowchart LR
 | process_stop  | sessionId、graceMs                                                  | state/stopReason/cleanupState；已终态时幂等返回                                  |
 | process_list  | cursor、limit                                                       | 本作用域元数据、nextCursor、omittedCount；连续前缀/总字节有界                    |
 
-projectId/runId/budgetId/ownerAgentId 由宿主绑定。主 Solver 可以 poll/write/stop 本 Run 所有会话，满足“接手继续使用”；子模型只可控制自己创建的会话。原 owner 不因主模型接手而改写。UI 的 Project 认证与读取策略沿既有界面，不把模型 owner 检查冒充多租户用户授权。
+projectId/runId/ownerAgentId 由宿主绑定。主 Solver 可以 poll/write/stop 本 Run 所有会话，满足“接手继续使用”；子模型只可控制自己创建的会话。原 owner 不因主模型接手而改写。UI 的 Project 认证与读取策略沿既有界面，不把模型 owner 检查冒充多租户用户授权。
 
 正常子任务完成可保留其前台服务供主模型接手，仍占会话配额并受原 deadline 限制；显式 cancel 子任务默认回收其进程，整个 Run 收尾回收全部。工具所有权不是 OS 隔离，共享 bash 仍可能影响其他进程。
 
@@ -665,9 +641,9 @@ projectId/runId/budgetId/ownerAgentId 由宿主绑定。主 Solver 可以 poll/w
 
 ### 12.3 幂等启动与状态机
 
-requestKey 必填，长度上限由 schema 固定（建议 128 字符）；作用域为 Run+owner，规范化参数包括 command、解析后的 cwd、mode、请求 deadlineMs。指纹不含 yieldMs、启动时计算的绝对截止或瞬时剩余预算。相同 key 同参数返回原会话，包括已结束/失联状态；不同参数返回 request_key_conflict，不自动重开。指纹对比在重新取当前剩余预算之前处理，避免重试因时间流逝而冲突。
+requestKey 必填，长度上限由 schema 固定（建议 128 字符）；作用域为 Run+owner，规范化参数包括 command、解析后的 cwd、mode、请求 deadlineMs。指纹不含 yieldMs、启动时计算的绝对截止或瞬时资源余量。相同 key 同参数返回原会话，包括已结束/失联状态；不同参数返回 request_key_conflict，不自动重开。指纹只由稳定请求参数组成，避免重试因时间流逝而冲突。
 
-SQLite 事务原子保留唯一键和 starting 元数据，再启动 supervisor。并发本地用 keyed lock，持久层唯一键兜底。预算截止取 `min(startedAt + requestedDeadline, solveBudget.deadlineAt)`；实际启动前再次校验，已过期直接终止占位而不创建进程。
+SQLite 事务原子保留唯一键和 starting 元数据，再启动 supervisor。并发本地用 keyed lock，持久层唯一键兜底。作业截止取 `startedAt + requestedDeadline`，不叠加整题截止；实际启动前再次校验，已过期直接终止占位而不创建进程。
 
 ```mermaid
 stateDiagram-v2
@@ -689,7 +665,7 @@ stateDiagram-v2
 | 参数       | 初始工程值                            | 说明                                               |
 | ---------- | ------------------------------------- | -------------------------------------------------- |
 | yieldMs    | 默认 1000，上限 10000                 | 只控制本次 start 等待，不是作业时长                |
-| deadlineMs | 默认 300000                           | 最终仍受整题剩余时间约束；poll/write 不刷新        |
+| deadlineMs | 默认 300000                           | 仅约束单个作业；poll/write 不刷新                  |
 | waitMs     | 默认 0，上限 10000                    | 取消 poll 只取消等待                               |
 | 活跃会话   | 每 Run 4、每子 owner 2                | 主模型在 Run 总额内使用；starting 也占配额         |
 | 原始页     | 默认 8192，最大 32768 bytes           | 双流合计；编码与 JSON 封套另计                     |
@@ -737,11 +713,11 @@ TERM→有限 grace→KILL 针对托管进程组；故意 setsid/daemonize 脱�
 - 已有构造仅缺一个必要条件：围绕该条件派发，不把完整解题重新交给另一模型。
 - 只有观点不同、经过很久或主模型“不放心”：不自动派发；没有可区分实验就保留不确定性，停止加码。
 
-任务 brief 固定包含目标、原始材料、证据 ID/hash、待区分解释、范围、停止条件、预算、候选优先规则。允许为复现做有目的重叠，不按字符串相似度判断方向独立。resume 复用旧会话，不标成新独立判断。
+任务 brief 固定包含目标、原始材料、证据 ID/hash、待区分解释、范围、停止条件、资源并发约束、候选优先规则。允许为复现做有目的重叠，不按字符串相似度判断方向独立。resume 复用旧会话，不标成新独立判断。
 
 ### 13.3 复核开启条件
 
-review.enabled 只有在 reader/reports、请求预算、费用未知处理和全出口投影验收完成后才允许为 true。派发时使用现有 Agent 工具和生命周期，宿主事务检查 maxPerBudget/maxConcurrent，并在 beginExecution 同一事务保存 purpose/reviewId、对新的复核问题递增 review_used。reviewId 由宿主生成并绑定当前预算和子会话；resume 同一问题沿用该 ID，不重置已用额度，新决策问题须取得新额度。额度提交后即占用，启动失败不自动返还以免形成重试绕过；总请求费用仍据实结算。queued/running 的 review 都占并发，重启按已保存身份与终态恢复，不能只靠进程内计数。任何候选先核验；accepted 中断旁路复核，不等全部完成。
+review.enabled 只有在 reader/reports、取消/恢复和全出口投影验收完成后才允许为 true。派发仍用现有 Agent 工具与生命周期；宿主事务检查 maxPerGoal/maxConcurrent，在 beginExecution 同一事务保存 purpose/reviewId 和 review_used。reviewId 绑定求解目标与子会话，resume 同一问题不重置次数。达到次数上限只停止新增自动复核，Solver 继续求解；不检查费用或整题累计时长。queued/running 的 review 都占并发，重启按已保存身份与终态恢复，不能只靠进程内计数。任何候选先核验；accepted 中断旁路复核，不等全部完成。
 
 如果复核没有产生新证据、必要条件或可复现实验，不再用同方向换名消耗下一额度。重新规划保留失败材料与适用条件，重读目标与附件事实，提出新的可检验问题。此策略是否有效由评测判定；主模型自评“思路更好”不作为成功标准。
 
@@ -751,39 +727,39 @@ review.enabled 只有在 reader/reports、请求预算、费用未知处理和�
 
 ### 14.1 阶段与依赖
 
-| 阶段/建议 PR       | 内容                                                 | 主要负责人角色               | 前置/验收门                                                            | 对原方案 PR 的调整                                       |
-| ------------------ | ---------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------- |
-| U0 运行时选型      | 0.82.1 与候选版本/API/数据格式调查，冻结本期适配路线 | agents/core/部署             | 在 P1-b/P2/P3 的 Pi 接线设计冻结前完成；P0 可并行                      | 新增，第 18 章；不是强制先完成新版生产迁移               |
-| P0-a 基线观测      | 固定环境和题集，采集平台接受事实与全部成本           | 评测/平台                    | 能区分 accepted、already_solved、writeup failure                       | 原 PR00 增加成功口径审计                                 |
-| P0-b 正确性修复    | accepted 持久化、总结解耦、崩溃恢复覆盖              | core/agents                  | T01—T05 通过，旧已解展示兼容                                           | 原方案未充分展开，提前补入                               |
-| P0-c 压缩修复      | 子模型专用提示、权限恢复、真实 Session 用例          | agents/prompts               | T06 的 reader 关闭分支及 T17 基础权限回归通过，不依赖 execution marker | 原 PR01，可独立发布；reader 开启组合留 P1-a，T12 留 P1-b |
-| P1-a 黑板          | reader 工厂、SQL 页、hash、工具/API/UI               | core/backend/frontend        | T07—T10，{} 语义迁移完整                                               | 原 PR02                                                  |
-| P1-b 完整报告      | 执行身份、关键事务、采集、分页、全出口投影           | core/agents/backend/frontend | T11—T19 同批通过                                                       | 原 PR03，内部可拆提交，上线不可拆半套                    |
-| P2 Skills          | 配置冻结、角色选择、快照、部署/保留策略              | core/agents/backend          | T20—T23 通过，不改变 Father                                            | 原 PR04                                                  |
-| P3 预算            | 目标/队列/请求账本、实际模型入口、恢复               | core/backend/评测            | T24—T28 全调用路径有归属                                               | 从原 PR06 提前拆出，成为生产进程前置                     |
-| P4-a 能力样例      | attached pipes、原始流、两轮输入、停止               | sandbox                      | 真 Docker 验证，不依赖模型收益                                         | 原 PR05 的先行可行性试验，可与 P3 并行                   |
-| P4-b 受管进程/实验 | SQL 幂等、quota/deadline、日志/引用、恢复            | sandbox/core/backend         | P3 完成，T29—T38 通过                                                  | 合并原 PR05 与 PR06 的执行证据部分                       |
-| P5 复核策略        | purpose、触发/额度、对照与污染专项                   | prompts/core/评测            | P1—P4 工程合同和 T39—T40；收益门通过                                   | 原 PR07，默认关闭                                        |
+| 阶段/建议 PR       | 内容                                                    | 主要负责人角色               | 前置/验收门                                                            | 对原方案 PR 的调整                                       |
+| ------------------ | ------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------- |
+| U0 运行时选型      | 0.82.1 与候选版本/API/数据格式调查，冻结本期适配路线    | agents/core/部署             | 在 P1-b/P2/P3 的 Pi 接线设计冻结前完成；P0 可并行                      | 新增，第 18 章；不是强制先完成新版生产迁移               |
+| P0-a 基线观测      | 固定环境和题集，采集平台接受事实与全部成本              | 评测/平台                    | 能区分 accepted、already_solved、writeup failure                       | 原 PR00 增加成功口径审计                                 |
+| P0-b 正确性修复    | accepted 持久化、总结解耦、崩溃恢复覆盖                 | core/agents                  | T01—T05 通过，旧已解展示兼容                                           | 原方案未充分展开，提前补入                               |
+| P0-c 压缩修复      | 子模型专用提示、权限恢复、真实 Session 用例             | agents/prompts               | T06 的 reader 关闭分支及 T17 基础权限回归通过，不依赖 execution marker | 原 PR01，可独立发布；reader 开启组合留 P1-a，T12 留 P1-b |
+| P1-a 黑板          | reader 工厂、SQL 页、hash、工具/API/UI                  | core/backend/frontend        | T07—T10，{} 语义迁移完整                                               | 原 PR02                                                  |
+| P1-b 完整报告      | 执行身份、关键事务、采集、分页、全出口投影              | core/agents/backend/frontend | T11—T19 同批通过                                                       | 原 PR03，内部可拆提交，上线不可拆半套                    |
+| P2 Skills          | 配置冻结、角色选择、快照、部署/保留策略                 | core/agents/backend          | T20—T23 通过，不改变 Father                                            | 原 PR04                                                  |
+| P3 持续求解        | 持久重试、目标状态、请求超时/取消、恢复与 accepted 对账 | core/backend                 | 修订后 T24—T28                                                         | 原预算阶段撤销；费用/墙钟仅用于测试                      |
+| P4-a 能力样例      | attached pipes、原始流、两轮输入、停止                  | sandbox                      | 真 Docker 验证，不依赖模型收益                                         | 原 PR05 的先行可行性试验，可与 P3 并行                   |
+| P4-b 受管进程/实验 | SQL 幂等、quota/deadline、日志/引用、恢复               | sandbox/core/backend         | P3 完成，T29—T38 通过                                                  | 合并原 PR05 与 PR06 的执行证据部分                       |
+| P5 复核策略        | purpose、触发/额度、对照与污染专项                      | prompts/core/评测            | P1—P4 工程合同和 T39—T40；收益门通过                                   | 原 PR07，默认关闭                                        |
 
 P1-a/P1-b/P2 在 DTO、配置冻结和能力注入接口确认后可并行。P4-a 样例可以早做，但不得以样例成功代替 P4-b 生产合同。不要让 P3/P4 大工程阻塞独立修复 P0/P1，也不要把 P5 打包为默认升级行为。
 
-U0 若选择当期迁移，则 U1—U3 先独立验收并冻结新运行时，再实施依赖其语义的 P1-b/P2/P3；若选择过渡保留 0.82.1，这些阶段可以基于已冻结的旧适配器继续。不可一边迁移 Session 一边把黑板、完整报告和新预算一起放量，导致故障归因和数据回退无法区分。
+U0 若选择当期迁移，则 U1—U3 先独立验收并冻结新运行时，再实施依赖其语义的 P1-b/P2/P3；若选择过渡保留 0.82.1，这些阶段可以基于已冻结的旧适配器继续。不可一边迁移 Session 一边把黑板、完整报告和新恢复策略一起放量，导致故障归因和数据回退无法区分。
 
 ### 14.2 文件级工作清单
 
 | 修改/新增位置（仓库相对路径）                                                           | 具体任务                                                                              |
 | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `packages/core/src/persistence/run-store.ts`                                            | 幂等迁移、成功事实、scoped 黑板查询、execution CAS、预算/进程投影；进度与报告写入分开 |
+| `packages/core/src/persistence/run-store.ts`                                            | 幂等迁移、成功事实、scoped 黑板查询、execution CAS、恢复/进程投影；进度与报告写入分开 |
 | `packages/core/src/project/project.ts`                                                  | Run 快照装配、能力注入、可靠提交 hook、归属传播、完整 finally 清理                    |
 | `packages/core/src/collaboration/blackboard.ts`                                         | reader 工厂与 v2、标题、输出封套；写工具保留                                          |
 | `packages/core/src/collaboration/subagent-manager.ts`                                   | begin/commit、stopReason、wait/版本、通知去重、取消竞态                               |
 | 新 `core/src/collaboration/subagent-report.ts`                                          | 纯报告版本和码点分页，不依赖 UI                                                       |
 | 新 `core/src/collaboration/subagent-projection.ts`                                      | 单结果/列表/恢复投影与真实字节预算                                                    |
 | 新 `core/src/project/run-config-snapshot.ts`、`run-skill-snapshot.ts`                   | 冻结配置、快照原子发布、恢复验证、角色 resolver                                       |
-| 新 `core/src/orchestration/budget-manager.ts`                                           | 截止、请求预留/结算、review 额度，不新建调度器                                        |
+| 既有调度器与请求适配层                                                                  | 目标恢复、请求超时/取消与可观测重试；不新增 budget-manager                            |
 | 新 `core/src/project/local-process-manager.ts`、`experiment-record.ts`                  | 身份、状态、幂等/配额、日志与引用元数据                                               |
 | 新 `core/src/project/artifact-range-reader.ts`                                          | 真实范围读取、引用完整性和路径校验                                                    |
-| `core/src/orchestration/contest-scheduler.ts`、`contest-runner.ts`、`solver-attempt.ts` | accepted 与收尾分离、retry 持久化、预算继承/截止、汇总口径                            |
+| `core/src/orchestration/contest-scheduler.ts`、`contest-runner.ts`、`solver-attempt.ts` | accepted 与收尾分离、retry 持久化、目标续跑/暂停恢复、汇总口径                        |
 | `packages/agents/src/subagent/subagent-agent.ts`                                        | reader/process 注入、专用压缩、能力白名单                                             |
 | 新 `agents/src/subagent/session-report.ts`                                              | 原始 parent 链与 execution marker，text-only 报告采集                                 |
 | `agents/src/base-agent/session.ts`、`base-agent.ts`                                     | 工具恢复交集、每次模型请求 hook 和压缩归属                                            |
@@ -797,7 +773,7 @@ U0 若选择当期迁移，则 U1—U3 先独立验收并冻结新运行时，�
 | `backend/src/http/routes/{runs,challenges,projects}.ts`                                 | report/list/range 路由，旧端点兼容；不暴露 raw record                                 |
 | `frontend/src/types.ts`、`hooks/useChallengeDetails.ts`、`pages/challenge/*`            | 独立 DTO、按需读取、版本失效、outcome/writeup/cleanup 展示                            |
 | `apps/updater/src/main.ts`、backend 更新相关模块                                        | 最低数据读取能力、排空/unknown cleanup、兼容回退检查                                  |
-| `compose.yml`、`docs/*`                                                                 | Skills 挂载、迁移/快照保留、预算能力和回退操作说明                                    |
+| `compose.yml`、`docs/*`                                                                 | Skills 挂载、迁移/快照保留、持续求解边界和回退操作说明                                |
 
 新增模块通过现有包 index 导出小接口。schema/纯投影函数应尽量有单一实现，前后端不得分别手写相互漂移的字段转换；不要求前端打包 core 中的 Node SQLite 代码。
 
@@ -814,7 +790,7 @@ U0 若选择当期迁移，则 U1—U3 先独立验收并冻结新运行时，�
 | accepted_persistence_failed                      | 平台已响应接受但本地提交失败    | 停止新求解、保留回执、reconcile；不自动重提    |
 | configuration_dependency_error                   | 开关与能力/白名单不满足         | 在启动前修正配置，不能降级 all 或扩权          |
 | skill_snapshot_unavailable / changed             | 固定包不可恢复                  | 修复同一快照；不替换最新包掩盖历史             |
-| budget_exhausted / budget_unattributed           | 已到限/无可确认归属             | 停止派发或转 legacy 受限模式，禁自动 review    |
+| 求解可恢复暂停（错误码在 P3 冻结）               | 外部服务/授权暂不可用           | 保存进度并显示恢复条件，不判为未解目标最终失败 |
 | unsupported_mode / capability_unavailable        | PTY 或底层 process 能力未实现   | 使用明确可用模式或普通 bash，不包装假句柄      |
 | request_key_conflict                             | 同键异参数                      | 核对既有会话；真正新实验用新 key               |
 | resource_limit / output_limit                    | 会话/日志到限                   | 查看活跃或累计占用；不静默杀别人的依赖进程     |
@@ -829,48 +805,48 @@ code 是稳定机器合同，message 用于人读，retryable 必须按场景返
 
 ### 15.1 工程验收矩阵
 
-| 测试 ID | 核心场景                                | 通过条件                                                                      | 主要现有测试入口/新增用例                        |
-| ------- | --------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------ |
-| T01     | accepted 后 writeup 三次失败            | outcome 保留、writeup failed、不会重开求解                                    | core/test/runner/contest-scheduler.test.ts       |
-| T02     | accepted 后 cleanup 抛错                | Runner/Scheduler 都报告成功事实及独立清理错误                                 | contest-runner.test.ts、project.test.ts          |
-| T03     | 平台 accepted、本地写库失败             | 可观察 accepted_persistence_failed，不自动重提                                | agents 工具测试 + Project 故障注入               |
-| T04     | accepted 后崩溃/截止后接受              | 恢复只收尾；late 不算按时成功                                                 | RunStore/Scheduler                               |
-| T05     | 旧 solved/旧 writeup 迁移两次           | legacy 明确，时间不伪造，幂等                                                 | core/test/project/run-store.test.ts              |
-| T06     | reader 开/关各自压缩                    | 必要事实可恢复，不承诺不存在的主快照                                          | agents/test/base-agent/base-agent.test.ts        |
-| T07     | 两类各 256 条最大记录                   | 有限次枚举完整、无跳项/空页循环                                               | core/test/blackboard/blackboard-tools.test.ts    |
-| T08     | 跨题 ID、非法游标、重复 ID              | 归属隔离、缺失不泄露存在性、稳定去重                                          | blackboard-tools.test.ts                         |
-| T09     | 中文/emoji/控制字符/最大来源关系        | full 合法单条必可装，完整封套在字节上限内                                     | 新序列化属性/边界用例                            |
-| T10     | 更新/删除/跨 Run 证据                   | hash/missing/creator 信息正确                                                 | core/test/project/blackboard-store.test.ts       |
-| T11     | >8000 报告尾部哨兵、所有页面            | 全文持久化，拼接逐码点一致，无 thinking                                       | subagent-manager.test.ts、subagent-store.test.ts |
-| T12     | 多次真实 compaction/分支/retainedTail   | 仅本执行原始消息；缺/坏 marker 明确报错                                       | 锁定 Pi 真 Session 集成                          |
-| T13     | resume 同正文、旧回调迟到               | 版本变化，旧完成/进度不能覆盖                                                 | subagent-manager.test.ts                         |
-| T14     | 同执行 cancel/complete 并发             | 首次合法终态提交胜出，其余幂等                                                | subagent-store.test.ts                           |
-| T15     | Pi error/aborted 正常 resolve           | 状态和 resultKind 为失败/partial，不标 final                                  | Manager + 真 Session 返回模拟                    |
-| T16     | 报告保存失败/额度超限                   | wait 不永久悬挂、不发布假完成、无静默截断                                     | 故障注入/大正文用例                              |
-| T17     | 恢复旧工具列表与 writeup 阶段           | 无越权恢复，writeup 仍仅四类文件工具                                          | agents/test/base-agent/base-agent.test.ts        |
-| T18     | 旧前缀后部候选，另一子任务阻塞          | 8000 原前缀可见，不等齐，accepted 停探索                                      | Scheduler/Manager 联合用例                       |
-| T19     | 大量子任务、所有自动出口                | 单结果/集合字节守约、ID 最终可枚举、UI不自动拉全文                            | backend view/runs + frontend cards/hooks         |
-| T20     | all/[]/角色覆盖/旧客户端省略            | 选择、整表替换和保存语义正确                                                  | backend runtime/projects + skills                |
-| T21     | Run 中改源、下一 Run 共用 workspace     | 旧 Run 文件/manifest 不变，新子模型仍用旧快照                                 | skills.test.ts、Project                          |
-| T22     | manifest 缺失/损坏、复制中变更          | 明确失败或 legacy 标注，不加载最新掩盖                                        | 新 run-skill-snapshot.test.ts                    |
-| T23     | Father、图像 read、普通 bash、ShellPoop | 原功能可用，未因快照/工具恢复改变合同                                         | 现有对应模块测试                                 |
-| T24     | retry/resume/revival/重启               | 同 budgetId/deadline，不刷新额度                                              | Scheduler/预算集成                               |
-| T25     | 同 provider 不同预算并发                | 请求不串账，排队后截止阻止真实发送                                            | backend provider-request-gate/model-pool         |
-| T26     | 关闭 Token Usage 插件                   | 强制预算依然执行                                                              | Project/预算集成                                 |
-| T27     | compaction/辅助请求/发送中崩溃          | 所有请求有归属，sending/sent 的 unknown 费用不归零，queued 重启不误计外部费用 | 真请求入口契约测试                               |
-| T28     | retry 内存路径迁移、writeup 后处理      | 入队可恢复；postprocess 独立且计总费用；重试/重启不刷新后处理时长或费用       | Scheduler/RunStore                               |
-| T29     | start yield 后两轮 stdin/EOF            | 作业持续、输入无暗加换行、deadline不延长                                      | 真 Docker process 集成                           |
-| T30     | NUL/非UTF8/多字节拆块/双流              | base64 无损、offset 精确、输出不混控制帧                                      | sandbox/test 新 transport 用例                   |
-| T31     | 同 key 并发、冲突、各崩溃窗口           | 只启动一次或明确 unknown，不自动重跑                                          | Manager + 真 Docker                              |
-| T32     | write ACK 丢失                          | delivery_unknown、客户端不自动重发                                            | transport 故障注入                               |
-| T33     | stop/deadline/cancel/poll abort         | 状态准确，poll abort 不杀进程，其余组回收                                     | 真 Docker process 集成                           |
-| T34     | 日志背压、单会话/累计 Run 超限          | 原始已存前缀可读，确实停止，错误原因明确                                      | quota 和慢消费者测试                             |
-| T35     | 主模型接手/跨 owner/跨 Run              | 主模型可写本 Run，子模型不能越界                                              | process tools 合同测试                           |
-| T36     | writing_writeup/failed 残留进程重启     | 扫描清理，失联不伪报退出；已知进程终态不被 cleanup 失败改写                   | orphan-cleanup.test.ts + Project                 |
-| T37     | artifact 路径/符号链接/换文件/范围读取  | 不能越根，hash 冲突明确，不全文件装内存                                       | workspace-files + range reader                   |
-| T38     | 多步 cleanup 之一失败                   | 仍尝试其余资源与容器关闭                                                      | process-shutdown/solver-agent                    |
-| T39     | review 次数、并发、无新实验             | 代码扣额，不按 resume 重置，不触发无意义循环                                  | Budget/Manager                                   |
-| T40     | 有界版本回退、旧库恢复                  | 不向旧无限出口暴露扩容正文，恢复副本可启动                                    | updater/迁移集成                                 |
+| 测试 ID | 核心场景                                | 通过条件                                                     | 主要现有测试入口/新增用例                        |
+| ------- | --------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------ |
+| T01     | accepted 后 writeup 三次失败            | outcome 保留、writeup failed、不会重开求解                   | core/test/runner/contest-scheduler.test.ts       |
+| T02     | accepted 后 cleanup 抛错                | Runner/Scheduler 都报告成功事实及独立清理错误                | contest-runner.test.ts、project.test.ts          |
+| T03     | 平台 accepted、本地写库失败             | 可观察 accepted_persistence_failed，不自动重提               | agents 工具测试 + Project 故障注入               |
+| T04     | accepted 后崩溃/截止后接受              | 恢复只收尾；late 不算按时成功                                | RunStore/Scheduler                               |
+| T05     | 旧 solved/旧 writeup 迁移两次           | legacy 明确，时间不伪造，幂等                                | core/test/project/run-store.test.ts              |
+| T06     | reader 开/关各自压缩                    | 必要事实可恢复，不承诺不存在的主快照                         | agents/test/base-agent/base-agent.test.ts        |
+| T07     | 两类各 256 条最大记录                   | 有限次枚举完整、无跳项/空页循环                              | core/test/blackboard/blackboard-tools.test.ts    |
+| T08     | 跨题 ID、非法游标、重复 ID              | 归属隔离、缺失不泄露存在性、稳定去重                         | blackboard-tools.test.ts                         |
+| T09     | 中文/emoji/控制字符/最大来源关系        | full 合法单条必可装，完整封套在字节上限内                    | 新序列化属性/边界用例                            |
+| T10     | 更新/删除/跨 Run 证据                   | hash/missing/creator 信息正确                                | core/test/project/blackboard-store.test.ts       |
+| T11     | >8000 报告尾部哨兵、所有页面            | 全文持久化，拼接逐码点一致，无 thinking                      | subagent-manager.test.ts、subagent-store.test.ts |
+| T12     | 多次真实 compaction/分支/retainedTail   | 仅本执行原始消息；缺/坏 marker 明确报错                      | 锁定 Pi 真 Session 集成                          |
+| T13     | resume 同正文、旧回调迟到               | 版本变化，旧完成/进度不能覆盖                                | subagent-manager.test.ts                         |
+| T14     | 同执行 cancel/complete 并发             | 首次合法终态提交胜出，其余幂等                               | subagent-store.test.ts                           |
+| T15     | Pi error/aborted 正常 resolve           | 状态和 resultKind 为失败/partial，不标 final                 | Manager + 真 Session 返回模拟                    |
+| T16     | 报告保存失败/额度超限                   | wait 不永久悬挂、不发布假完成、无静默截断                    | 故障注入/大正文用例                              |
+| T17     | 恢复旧工具列表与 writeup 阶段           | 无越权恢复，writeup 仍仅四类文件工具                         | agents/test/base-agent/base-agent.test.ts        |
+| T18     | 旧前缀后部候选，另一子任务阻塞          | 8000 原前缀可见，不等齐，accepted 停探索                     | Scheduler/Manager 联合用例                       |
+| T19     | 大量子任务、所有自动出口                | 单结果/集合字节守约、ID 最终可枚举、UI不自动拉全文           | backend view/runs + frontend cards/hooks         |
+| T20     | all/[]/角色覆盖/旧客户端省略            | 选择、整表替换和保存语义正确                                 | backend runtime/projects + skills                |
+| T21     | Run 中改源、下一 Run 共用 workspace     | 旧 Run 文件/manifest 不变，新子模型仍用旧快照                | skills.test.ts、Project                          |
+| T22     | manifest 缺失/损坏、复制中变更          | 明确失败或 legacy 标注，不加载最新掩盖                       | 新 run-skill-snapshot.test.ts                    |
+| T23     | Father、图像 read、普通 bash、ShellPoop | 原功能可用，未因快照/工具恢复改变合同                        | 现有对应模块测试                                 |
+| T24     | retry/resume/revival/重启               | 目标、证据与人工停止状态保持，固定尝试数不终止未解目标       | Scheduler/恢复集成                               |
+| T25     | 同 provider 多 Run 并发                 | 请求归属不串；排队后 accepted/取消阻止真实发送               | provider-request-gate/model-pool                 |
+| T26     | 请求超时、流空闲、瞬断与限流            | 可取消并保存进度后恢复；连续失败计数在进展后清零             | Project/请求恢复集成                             |
+| T27     | compaction/辅助请求/发送中崩溃          | 所有入口可取消与诊断；暂停后可恢复；未知用量不伪称零         | 真请求入口契约测试                               |
+| T28     | retry 持久化、writeup、接受事实对账     | 队列重启不丢；accepted 不因收尾失败抹除；不伪造接受归属/时间 | Scheduler/RunStore                               |
+| T29     | start yield 后两轮 stdin/EOF            | 作业持续、输入无暗加换行、deadline不延长                     | 真 Docker process 集成                           |
+| T30     | NUL/非UTF8/多字节拆块/双流              | base64 无损、offset 精确、输出不混控制帧                     | sandbox/test 新 transport 用例                   |
+| T31     | 同 key 并发、冲突、各崩溃窗口           | 只启动一次或明确 unknown，不自动重跑                         | Manager + 真 Docker                              |
+| T32     | write ACK 丢失                          | delivery_unknown、客户端不自动重发                           | transport 故障注入                               |
+| T33     | stop/deadline/cancel/poll abort         | 状态准确，poll abort 不杀进程，其余组回收                    | 真 Docker process 集成                           |
+| T34     | 日志背压、单会话/累计 Run 超限          | 原始已存前缀可读，确实停止，错误原因明确                     | quota 和慢消费者测试                             |
+| T35     | 主模型接手/跨 owner/跨 Run              | 主模型可写本 Run，子模型不能越界                             | process tools 合同测试                           |
+| T36     | writing_writeup/failed 残留进程重启     | 扫描清理，失联不伪报退出；已知进程终态不被 cleanup 失败改写  | orphan-cleanup.test.ts + Project                 |
+| T37     | artifact 路径/符号链接/换文件/范围读取  | 不能越根，hash 冲突明确，不全文件装内存                      | workspace-files + range reader                   |
+| T38     | 多步 cleanup 之一失败                   | 仍尝试其余资源与容器关闭                                     | process-shutdown/solver-agent                    |
+| T39     | review 次数、并发、无新实验             | 仅约束自动复核；resume 不刷新次数；不停止 Solver             | Goal/Manager                                     |
+| T40     | 有界版本回退、旧库恢复                  | 不向旧无限出口暴露扩容正文，恢复副本可启动                   | updater/迁移集成                                 |
 
 优先测试公开行为和故障恢复，而非仅断言内部数组长度。纯函数测试覆盖序列化/码点/游标；真 Pi 测试覆盖压缩边界；真 Docker 测试覆盖真实 stdin、信号、子进程组、挂载与重启。不得只用 mock 宣称传输或恢复合同成立。
 
@@ -900,7 +876,7 @@ vp build
 | D          | C + 同等预算下的进程/实验证据 | 新执行能力效果                                                                 |
 | E          | D + 有界定向复核              | 复核策略净收益                                                                 |
 
-预算 P3 是各组应保持一致的实验约束，不应只有实验组使用更宽松时间。A-original 若无法从独立平台取得回执，需增加同等只读观测适配，并明确叫 A-observed，而不是声称完全未经改动；观测不能改变 prompt、派发或停止行为。关键效果出现后再做去除消融，不一开始穷举全部开关组合。
+独立评测器的费用/墙钟限制是各组应保持一致的实验约束，不能因此在产品加入预算能力，不应只有实验组使用更宽松时间。A-original 若无法从独立平台取得回执，需增加同等只读观测适配，并明确叫 A-observed，而不是声称完全未经改动；观测不能改变 prompt、派发或停止行为。关键效果出现后再做去除消融，不一开始穷举全部开关组合。
 
 每组、每题、每次重复使用独立 RunStore、黑板、原生 Session、workspace、实例与平台已解状态；不能复用上一轮脚本/flag/accepted。固定模型版本与实际思考档位、provider 限流、缓存策略、时间/费用/并发、CPU/RAM、镜像 digest、附件 hash 和外部资料范围。模型升级单独实验，不归因到工作流。
 
@@ -928,19 +904,18 @@ vp build
 | blackboardReaderV2       | reader 所有消费者、角色白名单、旧无参调用提示同步适配          |
 | fullSubagentReports      | execution marker/CAS、存储错误合同、分页、工具/HTTP/UI全部有界 |
 | skillSnapshots           | 配置往返、包发布/恢复、容器路径和保留策略                      |
-| budgetPolicy.enabled     | 每次模型入口、队列/重试继承、未知费用/重启用例                 |
-| localProcesses           | 真实 pipes 验收，预算与 Run quota，重启/取消/accepted 清理     |
-| review.enabled           | 前述信息和预算合同、计数/并发、对照与污染专项                  |
+| localProcesses           | 真实 pipes、Run 资源配额、重启/取消/accepted 清理；无预算依赖  |
+| review.enabled           | 信息和恢复合同、复核次数/并发、对照与污染专项；无费用/时长依赖 |
 
 先在固定测试项目启用 P1，再少量 Skills 项目，随后受限进程任务，最后复核。Run 记录冻结能力和配置 hash；中途关闭项目开关只影响新 Run。遇到错误应显式停止受影响旧 Run，并从已保存状态诊断，不能在运行中切换一半新旧返回协议。
 
 ### 16.2 观测事件与诊断
 
-新增有界事件：`solve_outcome_recorded`、`subagent_execution_started`、`subagent_result_committed`、`run_configuration_frozen`、`run_skill_snapshot`、`budget_reserved/settled/exhausted`、`process_started/exited/interrupted`、`artifact_registered`。事件保存身份、时间、版本、长度、hash、错误码，不重复完整正文、逐 chunk 日志或凭据。
+新增有界事件：`solve_outcome_recorded`、`subagent_execution_started`、`subagent_result_committed`、`run_configuration_frozen`、`run_skill_snapshot`、`process_started/exited/interrupted`、`artifact_registered`。事件保存身份、时间、版本、长度、hash、错误码，不重复完整正文、逐 chunk 日志或凭据。
 
-统计黑板调用/字节、报告分页/自动投递字节、Skills 数量、压缩前后估计、请求预留与结算、unknown 用量、review 次数、日志累计大小、cleanup unknown。模型 Token 估计标 estimated；磁盘、DB WAL 和后端事件循环延迟用于发现大报告同步处理的负担。监控日志不能带 secrets、完整鉴权配置或未脱敏命令参数。
+统计黑板调用/字节、报告分页/自动投递字节、Skills 数量、压缩前后估计、请求超时/恢复、unknown 用量、review 次数、日志累计大小、cleanup unknown。模型 Token 估计标 estimated；磁盘、DB WAL 和后端事件循环延迟用于发现大报告同步处理的负担。监控日志不能带 secrets、完整鉴权配置或未脱敏命令参数。
 
-立即停止对应新增能力的条件：跨题数据返回、报告串 execution、完整正文进入自动广播、同 requestKey 重复启动、重试刷新预算、accepted 后持续无界探索。成功事实不因处置过程改变。
+立即停止对应新增能力的条件：跨题数据返回、报告串 execution、完整正文进入自动广播、同 requestKey 重复启动、重试丢失目标状态、accepted 后持续无界探索。成功事实不因处置过程改变。
 
 ### 16.3 回退操作
 
@@ -950,7 +925,7 @@ vp build
 4. 若必须回退完全不认识扩容报告的旧二进制，恢复与它匹配的一致数据副本；升级后新增数据另存只读归档，不能直接继续使用，不得将新库原样交给旧无限展开路径。备份之后的 accepted 不会凭空出现在旧副本中，恢复调度前必须与平台当前已解状态重新核对，防止重复求解。
 5. 在副本按回退分支验证：兼容构建检查有界列表、新报告分页、独立 accepted 事实；完全旧版只检查它支持的旧接口及匹配备份内事实，并确认升级后归档可由兼容工具读取。两者均检查活跃状态无悬挂、资源清理可核实，之后再恢复调度。
 
-当前 updater 主要切换源码软链接、重启与健康检查，没有自动 DB 备份/数据兼容回滚。需要增加最低数据能力检查，并避免维护模式只看 activeSolvers/Father/Audit 而忽略残留 process。普通 health=200 不证明报告和预算迁移正确；将上述读取/恢复烟测加入发布验收。[E14](#e14)
+当前 updater 主要切换源码软链接、重启与健康检查，没有自动 DB 备份/数据兼容回滚。需要增加最低数据能力检查，并避免维护模式只看 activeSolvers/Father/Audit 而忽略残留 process。普通 health=200 不证明报告和恢复迁移正确；将上述读取/恢复烟测加入发布验收。[E14](#e14)
 
 <a id="sec-17"></a>
 
@@ -962,7 +937,7 @@ vp build
 | --------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------- |
 | Pi 原生执行边界       | 官方锁定包 API 静态确认               | 真 Session 跨压缩/分支/坏链测试通过                                                         |
 | Pi 版本与适配路线     | 已核实 0.82.1 基线及 1.4.0 破坏性变化 | 所有路线完成 U0 决策；选择迁移时追加 U01—U10 的当期适用检查，新版本独立验收后才成为生产基线 |
-| 逐请求预算覆盖        | 已定位共享 ProviderGate 和 Agent 入口 | 所有模型/压缩/辅助调用可归属且发送前检查                                                    |
+| 逐请求恢复覆盖        | 已定位共享 ProviderGate 和 Agent 入口 | 所有模型/压缩/辅助调用可归属、可取消与恢复                                                  |
 | Docker attached pipes | 当前 exec 不具备此能力                | Linux Docker 及项目支持的 Windows→WSL 路径真实交互测试                                      |
 | 合法最大封套          | 已给初始字节合同                      | 最坏 JSON 转义/Unicode/元数据组合验证                                                       |
 | 4 MiB 报告存储初值    | 本设计工程建议，无分布数据            | 原始报告长度、DB 延迟/内存观测后冻结                                                        |
@@ -995,11 +970,11 @@ vp build
 | ---------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
 | R0 暂留精确 0.82.1，建立适配边界         | 现有模型可用，旧 API 能满足本期合同，无已确认必须升级的阻塞 | 短期低；长期要承担旧依赖与自维护成本                                                 | 默认的交付连续性方案，P0 不必等待迁移；U0 仍必做              |
 | R1 经验证的小步版本/局部修复             | 某一明确问题确有目标版本修复，且 API/格式兼容已证明         | 不预设为低；即使 0.x 小版本也可能破坏语义                                            | 不为“版本号更新”专门绕路；0.83 等仅是可调查候选，不是推荐目标 |
-| R2 1.4.0 系列配合 pi-durable             | 维护/模型需求足以支付迁移成本，原型满足领域合同             | 高：Harness、存储、工具、事件、预算、历史兼容跨模块迁移；Experimental 有额外维护成本 | 优先调查的长期候选，未通过 U1/U2 前不定为生产目标             |
+| R2 1.4.0 系列配合 pi-durable             | 维护/模型需求足以支付迁移成本，原型满足领域合同             | 高：Harness、存储、工具、事件、恢复、历史兼容跨模块迁移；Experimental 有额外维护成本 | 优先调查的长期候选，未通过 U1/U2 前不定为生产目标             |
 | R3 新 pi-agent-core Agent + 自建持久适配 | 经证明 durable 不适合且团队愿长期维护 Session/恢复          | 高到很高，会把框架职责转给项目                                                       | 首版不推荐，不因少一个依赖就误判更简单                        |
 | R4 只升级 pi-ai，保留旧 core             | 必须证明依赖版本、消息结构、类型和协议均可桥接              | 中到高；可能出现两个 pi-ai 版本，隐式转换难定位                                      | 不作为省事默认；禁止靠强制 overrides 压平版本证明兼容         |
 
-条件性升级触发包括：当前业务需要的 provider/模型协议旧版不支持、确认的上游缺陷阻塞报告/恢复/预算合同、已证实需升级的依赖风险，或长期维护成本明显超过迁移成本。U0 要记录具体证据和对应测试；“最新”“更多功能”不作为单独验收标准。
+条件性升级触发包括：当前业务需要的 provider/模型协议旧版不支持、确认的上游缺陷阻塞报告/恢复/取消合同、已证实需升级的依赖风险，或长期维护成本明显超过迁移成本。U0 要记录具体证据和对应测试；“最新”“更多功能”不作为单独验收标准。
 
 ### 18.3 本项目的兼容性影响矩阵
 
@@ -1009,7 +984,7 @@ vp build
 | 原生 Session            | `session.ts` 用 Session、JsonlSessionStorage 和 core/node；报告设计依赖原始父链                                    | 新建/恢复/分支/压缩、execution 边界、旧 JSONL 读取；不修改原历史文件冒充无损迁移 | 高     |
 | DockerExecutionEnv      | 实现旧 core 的 ExecutionEnv，文件和 bash 工具绑定到它                                                              | 新工具运行环境、原子 rename、文件/二进制/图像、超时/取消、容器路径语义           | 高     |
 | 事件与终态              | Manager/Project/SSE 消费 Pi 事件，提交工具使用 terminate                                                           | accepted 后停止、同批工具结果、错误/aborted、steer 队列、报告最终选择            | 高     |
-| 请求与预算              | model-pool 注册 provider、直接调用各 streamSimple，另有 OAuth 适配                                                 | 真实发送前 gate、内部重试、usage/cost、取消、压缩辅助请求、响应格式              | 高     |
+| 请求与恢复              | model-pool 注册 provider、直接调用各 streamSimple，另有 OAuth 适配                                                 | 真实发送前 gate、内部重试、usage/cost、取消、压缩辅助请求、响应格式              | 高     |
 | 私有 HTML 导出与会话 UI | `html-export.ts` 直接动态导入包内 `dist/core/export-html/index.js`，并用 coding-agent SessionManager 读 core JSONL | 私有路径和函数即使仍存在，也不能证明能读新存储；需独立 reader/export adapter     | 高     |
 | Skills/工具恢复         | loadSkills、formatSkillsForSystemPrompt、setActiveTools                                                            | 发现/注册/恢复白名单和 writeup 降权，不能顺带改变角色策略                        | 中到高 |
 | 模型配置/鉴权           | provider registry、OAuth、URL fragment 哨兵和自定义 endpoint                                                       | 发出的实际 URL/header/body、登录刷新、旧配置；类型检查不足                       | 中到高 |
@@ -1026,12 +1001,12 @@ vp build
 
 - `AgentRuntimeAdapter`：启动输入、steer、取消、等待空闲、事件订阅、当前工具集合、压缩；保留既有 BaseAgent 对业务的稳定表面。
 - `ExecutionTranscriptReader`：开始执行标记、冻结读取边界、选取本执行 text-only 报告；0.82.1 实现使用父链，新实现按目标存储合同实现，不要求伪造相同内部结构。
-- `ModelRequestPolicy`：请求归属、发送前预算、逐次重试和结算；不能仅依赖“新版提供一个 hook”就宣称覆盖所有辅助调用。
+- `ModelRequestPolicy`：请求归属、发送前取消、逐次重试和超时；不能仅依赖“新版提供一个 hook”就宣称覆盖所有辅助调用。
 - `ConversationReader/Exporter`：按记录的 runtimeProfile/sessionFormat 读取或导出，历史 0.82.1 与新格式显式分流；不靠文件扩展名判断兼容。
 
 这四项是收窄当前依赖接缝，不是建设可插拔市场。首版允许只存在一个生产执行适配器和一个旧历史只读 reader，不要求所有版本同时运行或动态切换。
 
-若选 pi-durable，其内部任务执行属于 Agent 运行时；ContestScheduler/Project/SubagentManager 仍是比赛、Run、预算与子任务业务的唯一控制入口。必须定义恢复顺序：先恢复 RunStore 的 accepted/截止/取消与资源事实，再决定允许哪些底层任务恢复，不能框架启动自动重放后才发现目标已解或预算已尽。平台提交、process_start/process_write、实例创建等有副作用工具不声明为可任意安全重放；底层“持久”不等于外部动作恰好一次。
+若选 pi-durable，其内部任务执行属于 Agent 运行时；ContestScheduler/Project/SubagentManager 仍是比赛、Run、求解目标与子任务业务的唯一控制入口。必须定义恢复顺序：先恢复 RunStore 的 accepted/暂停/取消与资源事实，再决定允许哪些底层任务恢复，不能框架启动自动重放后才发现目标已解或已人工停止。平台提交、process_start/process_write、实例创建等有副作用工具不声明为可任意安全重放；底层“持久”不等于外部动作恰好一次。
 
 工具通道、terminate、取消和等待语义也须映射到现有领域合同；不得因新 Harness 的默认行为而等待整批探索完成、恢复黑板写权限或再次提交已接受候选。两个存储系统仍有提交间隙，沿第 7—8 章定义可靠提交、幂等和 reconcile，不复制一套 RunStore 到新框架。[E19](#e19)
 
@@ -1060,7 +1035,7 @@ vp build
 | U04  | accepted/同批工具/取消/崩溃重启              | 原行为不新增回归，终态/取消适配可行；P0/P1 已实现时 T01—T05/T18 回归，恢复不重提                                                                       |
 | U05  | Docker 文件/bash/图像/RTK/新环境方法         | 原路径、字节、stderr、deadline、abort 和原子文件操作一致                                                                                               |
 | U06  | 生产所需 provider/API key/OAuth/代理         | 实际请求 URL/body/header、工具 schema、思考档位和流式事件符合配置，不只跑一个默认模型                                                                  |
-| U07  | 请求重试/限流/压缩/usage                     | P3 未实现时证明各请求入口可拦截/归属、重试可控制；已实现时 T24—T28 回归，新内部行为不绕过预算                                                          |
+| U07  | 请求重试/限流/压缩/usage                     | P3 未实现时验证入口归属、取消与重试可控；实现后回归修订 T24—T28，确认不绕过暂停/停止                                                                   |
 | U08  | Skills/角色/Father/TLDR/Web Access/ShellPoop | 权限、取消、选择与资源共享边界保持，旧配置省略语义不变                                                                                                 |
 | U09  | 新旧运行时与数据降级                         | 新格式不会被旧 reader 静默误读；回退构建、原始归档及 active Run 处置可执行                                                                             |
 | U10  | 同预算受控对照                               | 先固定旧工作流比较运行时，再固定运行时比较优化功能；失败、成本和延迟全部纳入                                                                           |
@@ -1069,7 +1044,7 @@ U01 的构建遵从 `vp install → vp check → vp run typecheck → vp test �
 
 ### 18.7 历史数据、回退和评测口径
 
-兼容性需区分三件事：旧 Session 可浏览、旧 Session 可续跑、旧运行时可读取新写入的 Session。前者成功不证明后两者。默认策略是保留旧原件只读、让新 Run 使用新格式；用户需要续跑旧 Run 时，在副本做显式迁移并验证执行边界、工具权限与预算归属，否则明确不支持，而非降为新任务并悄悄刷新预算。
+兼容性需区分三件事：旧 Session 可浏览、旧 Session 可续跑、旧运行时可读取新写入的 Session。前者成功不证明后两者。默认策略是保留旧原件只读、让新 Run 使用新格式；用户需要续跑旧 Run 时，在副本做显式迁移并验证执行边界、工具权限与请求归属，否则明确不支持，而非降为新任务并丢失原目标状态。
 
 升级前备份 DB、session、配置和必要 artifact；新格式第一次落盘后，回退 package.json/lock 不等于恢复可运行状态。兼容回退构建仍需具备报告有界、成功事实和正确 Session reader。若回到完全旧版，恢复匹配副本、保留升级后只读归档、同步平台已解状态，沿第 16.3 节的分支操作执行。
 
