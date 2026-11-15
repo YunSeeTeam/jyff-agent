@@ -26,7 +26,7 @@ export type SolverPromptOutcome =
 export async function runSolverPrompt(options: {
   solver: CtfSolverAgent
   prompt: string
-  timeoutMs: number
+  timeoutMs?: number
   abortGraceMs: number
   signal?: AbortSignal
   ignoreExistingSubmission?: boolean
@@ -43,7 +43,7 @@ export async function runSolverPrompt(options: {
   let timeout: NodeJS.Timeout | undefined
   let onAbort: (() => void) | undefined
   const stop = new Promise<{ kind: "timeout" } | { kind: "cancelled" }>((resolve) => {
-    let remainingMs = timeoutMs
+    let remainingMs = timeoutMs ?? 0
     let observedAt = Date.now()
     const tick = () => {
       const now = Date.now()
@@ -52,7 +52,7 @@ export async function runSolverPrompt(options: {
       if (remainingMs <= 0) resolve({ kind: "timeout" })
       else timeout = setTimeout(tick, Math.min(remainingMs, 250))
     }
-    timeout = setTimeout(tick, Math.min(remainingMs, 250))
+    if (timeoutMs !== undefined) timeout = setTimeout(tick, Math.min(remainingMs, 250))
     if (signal) {
       onAbort = () => resolve({ kind: "cancelled" })
       signal.addEventListener("abort", onAbort, { once: true })
@@ -82,7 +82,7 @@ export async function runSolverPrompt(options: {
   await solver.abort()
   await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, abortGraceMs))])
   if (outcome.kind === "cancelled") throw new ContestRunnerCancelledError()
-  throw new ChallengeTimeoutError(timeoutMs)
+  throw new ChallengeTimeoutError(timeoutMs!)
 }
 
 export async function latestAgentError(solver: CtfSolverAgent): Promise<string | undefined> {

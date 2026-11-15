@@ -35,6 +35,12 @@ export class CtfTldrAgent extends BaseAgent {
     const model = options.agent.initialState?.model
     if (!model) throw new Error("TLDR Agent 缺少可用模型")
     const prepared = await prepareBaseAgent({
+      requestScope: () => ({
+        projectId: options.projectId,
+        challengeId: options.challenge.id,
+        agentId: "tldr",
+        purpose: "tldr",
+      }),
       session: {
         path: options.sessionPath,
         id: `tldr-${options.challenge.id}`,

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import type {
   AgentEvent,
   AgentMessage,
@@ -19,6 +20,7 @@ import { createPiSession } from "./runtime.ts"
 import { type NativeSessionOptions, openAgentSession, recordActiveTools } from "./session.ts"
 import type { AgentSkill } from "./skills.ts"
 import { resolveThinkingLevel } from "./thinking.ts"
+import { type ModelRequestScope, withModelRequestScope } from "./request-scope.ts"
 
 /** Pi 0.82's harness default, kept for agents that do not supply a prompt. */
 const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
@@ -28,6 +30,7 @@ const DEFAULT_WORKING_DIRECTORY = "/workspace"
 export type CompactResult = CompactionResult
 
 export interface BaseAgentOptions {
+  requestScope?: () => ModelRequestScope
   session: NativeSessionOptions
   models: Models
   model: Model<Api>
@@ -45,6 +48,7 @@ export interface BaseAgentOptions {
 }
 
 export interface PreparedBaseAgent {
+  requestScope?: () => ModelRequestScope
   piSession: AgentSession
   sessionManager: SessionManager
   sessionPath: string
@@ -142,6 +146,7 @@ export async function prepareBaseAgent(options: BaseAgentOptions): Promise<Prepa
   })
   return {
     piSession,
+    requestScope: options.requestScope,
     sessionManager: opened.sessionManager,
     sessionPath: options.session.path,
     restored: opened.restored,
@@ -170,9 +175,12 @@ export abstract class BaseAgent {
   private steerQueue: readonly string[] = []
   private followUpQueue: readonly string[] = []
   private lastAssistantMessage?: AssistantMessage
+  private readonly requestScope?: () => ModelRequestScope
 
   protected constructor(prepared: PreparedBaseAgent, options: BaseAgentRuntimeOptions = {}) {
     this.piSession = prepared.piSession
+    const executionId = randomUUID()
+    this.requestScope = () => ({ executionId, ...prepared.requestScope?.() })
     this.sessionManager = prepared.sessionManager
     this.sessionPath = prepared.sessionPath
     this.restored = prepared.restored
@@ -221,6 +229,13 @@ export abstract class BaseAgent {
 
   /** Run one prompt to completion and return its final assistant message. */
   async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
+    return withModelRequestScope(this.requestScope?.(), () => this.promptInScope(text, options))
+  }
+
+  private async promptInScope(
+    text: string,
+    options?: { images?: ImageContent[] },
+  ): Promise<AssistantMessage> {
     await this.compactIfNeeded()
     // nextTurn messages travel with the prompt that consumes them, so they stay
     // ordinary visible user content instead of hidden custom entries.
@@ -308,7 +323,10 @@ export abstract class BaseAgent {
   async compact(customInstructions?: string): Promise<CompactResult> {
     const pressure = await this.contextPressure()
     await this.compactionHooks?.before?.(pressure)
-    const result = await this.piSession.compact(customInstructions ?? this.compactionInstructions)
+    const result = await withModelRequestScope(
+      { ...this.requestScope?.(), purpose: "compaction" },
+      () => this.piSession.compact(customInstructions ?? this.compactionInstructions),
+    )
     const entry = this.sessionManager.getLeafEntry()
     if (entry?.type === "compaction") {
       this.publish({
@@ -330,7 +348,10 @@ export abstract class BaseAgent {
       label?: string
     },
   ): Promise<NavigateTreeResult> {
-    const result = await this.piSession.navigateTree(targetId, options)
+    const result = await withModelRequestScope(
+      { ...this.requestScope?.(), purpose: "branch_summary" },
+      () => this.piSession.navigateTree(targetId, options),
+    )
     if (!result.cancelled) {
       this.publish({
         type: "session_tree",
@@ -348,6 +369,8 @@ export abstract class BaseAgent {
   /** Stop the current run and drop queued steering, like Pi 0.82's harness. */
   async abort(): Promise<void> {
     this.piSession.clearQueue()
+    this.piSession.abortCompaction()
+    this.piSession.abortBranchSummary()
     await this.piSession.abort()
     await this.settleNotifications()
   }

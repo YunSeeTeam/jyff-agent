@@ -45,7 +45,7 @@ interface SchedulerWorkbenchProps {
 function queueStateHint(snapshot: DashboardSnapshot): string {
   const scheduler = snapshot.scheduler
   if (!scheduler) return "比赛与 Solver 模型就绪后可编排题目"
-  if (scheduler.state === "suspended") return "系统已停止领取任务；当前顺序会保留到恢复后"
+  if (scheduler.state === "suspended") return "存在等待恢复的任务；求解进度和队列顺序已保留"
   if (scheduler.mode === "automatic") return "自动发现并执行可调度题目"
   if (scheduler.mode === "manual") return "按执行队列顺序创建 Solver；暂停后可重新编排"
   return "可调整空闲队列与执行顺序"
@@ -307,6 +307,10 @@ export function SchedulerWorkbench({
 }: SchedulerWorkbenchProps) {
   const scheduler = snapshot.scheduler
   const active = scheduler?.active ?? []
+  const pendingGoals = (scheduler?.goals ?? []).filter(
+    (goal) => goal.state === "paused" || (goal.state === "active" && goal.retryAt),
+  )
+  const pausedGoals = pendingGoals.filter((goal) => goal.state === "paused")
   const [idle, setIdle] = useState(scheduler?.idle ?? [])
   const [execution, setExecution] = useState(scheduler?.queued ?? [])
   const [removing, setRemoving] = useState("")
@@ -360,6 +364,22 @@ export function SchedulerWorkbench({
             ? cause.message
             : String(cause),
       )
+    }
+  }
+
+  async function resumeGoals() {
+    onBusyChange(true)
+    try {
+      onSnapshot(
+        await apiMutation<DashboardSnapshot>(
+          projectApi(projectId, "/api/scheduler/resume"),
+          "POST",
+        ),
+      )
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      onBusyChange(false)
     }
   }
 
@@ -460,9 +480,22 @@ export function SchedulerWorkbench({
               调度计划
             </p>
             <h2 className="mt-0.5 font-semibold">调度队列</h2>
-            <span className="sr-only">{stateHint}</span>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {stateHint}。求解持续到判题确认或人工停止。
+            </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {pausedGoals.length > 0 && operationsAvailable ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={queueBusy}
+                onClick={() => void resumeGoals()}
+              >
+                <Icon icon="lucide:play" width="13" aria-hidden="true" />
+                恢复求解
+              </Button>
+            ) : null}
             {planning && operationsAvailable && stageableCount > 0 ? (
               <Tooltip label={`加入全部 ${stageableCount} 道可调度题`}>
                 <Button
@@ -480,6 +513,24 @@ export function SchedulerWorkbench({
             ) : null}
           </div>
         </header>
+
+        {pendingGoals.length > 0 ? (
+          <div
+            role="status"
+            aria-label="求解恢复状态"
+            className="max-h-36 overflow-y-auto border-b border-border px-4 py-2 text-xs"
+          >
+            {pendingGoals.map((goal) => (
+              <p key={goal.id} className="py-1 break-words">
+                <strong>{challenges.get(goal.challengeId)?.title ?? goal.challengeId}</strong>
+                {goal.state === "paused"
+                  ? "：等待处理，修复后可恢复求解。"
+                  : `：自动恢复时间 ${new Date(goal.retryAt!).toLocaleTimeString()}。`}
+                <span className="text-muted-foreground">{goal.reason}</span>
+              </p>
+            ))}
+          </div>
+        ) : null}
 
         {notice ? (
           <div

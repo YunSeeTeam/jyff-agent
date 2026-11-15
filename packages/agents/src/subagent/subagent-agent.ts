@@ -15,11 +15,13 @@ import {
   modelsFromAgentOptions,
   type PreparedBaseAgent,
   prepareBaseAgent,
+  type ModelRequestScope,
 } from "../base-agent/index.ts"
 import { createSubagentTools } from "../solver/sandbox/tools.ts"
 import type { SubagentRole } from "./registry.ts"
 
 export interface CreateCtfSubagentOptions {
+  requestScope?: () => ModelRequestScope
   projectId: string
   runId: string
   runDirectory: string
@@ -99,6 +101,14 @@ export class CtfSubagent extends BaseAgent {
       }
     }
     const prepared = await prepareBaseAgent({
+      requestScope: () => ({
+        ...options.requestScope?.(),
+        projectId: options.projectId,
+        challengeId: options.challenge.id,
+        runId: options.runId,
+        agentId: options.subagentId,
+        purpose: "subagent",
+      }),
       session: {
         path: join(options.runDirectory, "subagents", options.subagentId, "session.jsonl"),
         id: options.subagentId,

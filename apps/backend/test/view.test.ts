@@ -3,10 +3,31 @@ import {
   agentCacheStats,
   buildChallengeDetails,
   buildDashboardSnapshot,
+  unknownRequestUsage,
 } from "../src/domain/view.ts"
 import { FakeDashboardProject, FakeDashboardScheduler } from "./fake-project.ts"
 
 describe("WebUI dashboard model", () => {
+  it("用量统计显式区分未知发送、完成请求与未发送取消", () => {
+    const states = [
+      { requestId: "a", state: "sending", sent: true, usageKnown: false },
+      { requestId: "a", state: "completed", sent: true, usageKnown: true },
+      { requestId: "b", state: "failed", sent: true, usageKnown: false },
+      { requestId: "c", state: "failed", sent: false, usageKnown: true },
+    ]
+    expect(
+      unknownRequestUsage(
+        states.map((data, index) => ({
+          id: index,
+          runId: "r",
+          type: "model_request",
+          data,
+          createdAt: "2026-11-15T00:00:00Z",
+        })),
+      ),
+    ).toBe(1)
+  })
+
   it("按 cacheRead / (input + cacheRead) 聚合 Run 缓存率", () => {
     const cache = agentCacheStats([
       {
@@ -135,6 +156,10 @@ describe("WebUI dashboard model", () => {
         manualOverride: true,
         enqueuedAt: "2026-08-10T00:00:00.000Z",
         version: 3,
+        resumeRunId: null,
+        retryPrompt: null,
+        writeupRetry: false,
+        requiresAuto: false,
       },
     ]
 

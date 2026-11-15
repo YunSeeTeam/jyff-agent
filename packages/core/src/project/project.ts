@@ -80,6 +80,7 @@ import {
   writeRunConfigSnapshot,
 } from "./run-config-snapshot.ts"
 import { openRunSkills, SkillSnapshotError } from "./run-skill-snapshot.ts"
+import { persistAcceptedReceipt, recoverAcceptedReceipts } from "./accepted-receipt.ts"
 import {
   readBlackboard,
   createBlackboardReadTool,
@@ -252,6 +253,7 @@ export interface RunSessionExportMetadata {
 }
 
 export interface CreateSolverOptions {
+  requestGuard?: import("@ctf-agent/agents").ModelRequestGuard
   agent: AgentOptions
   /** 使用 Pi 原生 session-tree compaction；默认开启。 */
   compaction?: boolean
@@ -395,6 +397,8 @@ export class Project {
       const agentDirectory = resolve(options.stateDirectory ?? join(root, ".ctf-agent"))
       await mkdir(agentDirectory, { recursive: true })
       runStore = await RunStore.open(join(agentDirectory, "runs.sqlite"))
+      await recoverAcceptedReceipts(runStore, agentDirectory, config.project.id)
+      runStore.markInterruptedModelRequests()
       // Project.open 只可能发生在新进程/新控制面中；遗留活跃记录不可继续信任。
       const interruptedRuns = runStore.markInterruptedRuns()
       runStore.markInterruptedSubagents()
@@ -413,6 +417,17 @@ export class Project {
             message: `遗留 Docker Sandbox 回收失败: ${errorText(error)}`,
             createdAt: new Date().toISOString(),
           })
+          for (const run of interruptedRuns) {
+            const goal =
+              runStore.solveGoals.get(run.challengeId) ??
+              runStore.solveGoals.begin(run.challengeId, true)
+            runStore.solveGoals.update(goal.id, {
+              state: "paused",
+              runId: run.id,
+              reason: `遗留 Sandbox 回收失败: ${errorText(error)}`,
+              retryAt: null,
+            })
+          }
         }
       }
       const remoteEnvironments = new RemoteEnvironmentCoordinator(
@@ -1096,6 +1111,9 @@ export class Project {
   schedulerState(): SchedulerStateRecord {
     return this.runStore.schedulerState()
   }
+  get solveGoals() {
+    return this.runStore.solveGoals
+  }
   setSchedulerMode(mode: SchedulerMode): SchedulerStateRecord {
     return this.runStore.setSchedulerMode(mode)
   }
@@ -1263,6 +1281,9 @@ export class Project {
     ) {
       throw new Error(`Run ${runId} 不存在或当前不可恢复`)
     }
+    // A previous process may have died before cleanup. Never create a replacement
+    // Sandbox until the old Run's managed containers have been reclaimed.
+    await this.removeManagedSandboxes?.([runId])
     return this.createSolverForRun(run.challengeId, options, run)
   }
 
@@ -1445,6 +1466,10 @@ export class Project {
       }
 
       subagentManager = new CtfSubagentManager({
+        requestGuard: {
+          ...options.requestGuard,
+          onEvent: (event) => this.runStore.appendEvent(runId, "model_request", { ...event }),
+        },
         projectId: this.config.project.id,
         runId,
         runDirectory,
@@ -1560,14 +1585,30 @@ export class Project {
           compaction: options.compaction,
           closeOnSubmission: options.writeup !== true,
         },
+        requestGuard: {
+          ...options.requestGuard,
+          onEvent: (event) => this.runStore.appendEvent(runId, "model_request", { ...event }),
+        },
         onTerminalSubmission: () => subagentManager?.close(),
         recordSolveOutcome: async (submission, observedAt) => {
+          let journalError: unknown
+          try {
+            await persistAcceptedReceipt(
+              runDirectory,
+              { projectId: this.config.project.id, challengeId, runId },
+              submission,
+              observedAt,
+            )
+          } catch (error) {
+            journalError = error
+          }
           this.runStore.recordSolveOutcome({
             runId,
             outcome: submission.status === "accepted" ? "accepted" : "already_solved",
             observedAt,
             message: submission.message,
           })
+          if (journalError) this.recordDiagnostic("telemetry", journalError, runId)
         },
         onBeforeCleanup: async () => {
           webAccessSignal.abort()
@@ -1734,9 +1775,13 @@ export class Project {
       const configurationFailure =
         error instanceof RunConfigurationError || error instanceof SkillSnapshotError
       const blockImmediately =
-        !resumed && attempt === 1 && !attachmentFailure && !configurationFailure
+        !options.requestGuard &&
+        !resumed &&
+        attempt === 1 &&
+        !attachmentFailure &&
+        !configurationFailure
       const retryable = attachmentFailure
-        ? !resumed && attempt === 1
+        ? Boolean(options.requestGuard) || (!resumed && attempt === 1)
         : !blockImmediately && isRetryablePlatformError(error)
       try {
         if (blockImmediately) {

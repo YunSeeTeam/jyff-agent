@@ -6,6 +6,11 @@ import {
   normalizeContext,
 } from "@earendil-works/pi-ai"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
+import {
+  currentModelRequestScope,
+  withModelRequestScope,
+  type ModelRequestEvent,
+} from "@ctf-agent/agents"
 import { gateProviderStream, ProviderRequestGate } from "../src/domain/provider-request-gate.ts"
 
 const context = normalizeContext({ systemPrompt: "test", messages: [], tools: [] })
@@ -15,6 +20,123 @@ afterEach(() => {
 })
 
 describe("ProviderRequestGate", () => {
+  it("T25: shared provider keeps immutable Run identity and blocks accepted queued requests before sending", async () => {
+    vi.useFakeTimers()
+    const events: ModelRequestEvent[] = []
+    const sent: string[] = []
+    const source = vi.fn((candidate: Model<Api>) => {
+      sent.push(currentModelRequestScope()?.runId ?? "missing")
+      return completedStream(message(candidate))
+    })
+    const stream = gateProviderStream(new ProviderRequestGate({ minimumIntervalMs: 100 }), source)
+    const scope = (runId: string) => ({
+      projectId: "p",
+      challengeId: runId,
+      runId,
+      executionId: `exec-${runId}`,
+      onEvent: (event: ModelRequestEvent) => events.push(event),
+    })
+    let accepted = false
+    const first = withModelRequestScope(scope("first"), () => stream(model("shared", "m"), context))
+    const second = withModelRequestScope({ ...scope("second"), canSend: () => !accepted }, () =>
+      stream(model("shared", "m"), context),
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    await first.result()
+    accepted = true
+    await vi.advanceTimersByTimeAsync(100)
+    expect((await second.result()).stopReason).toBe("aborted")
+    expect(sent).toEqual(["first"])
+    expect(
+      events.find((event) => event.runId === "second" && event.state === "failed"),
+    ).toMatchObject({ executionId: "exec-second", sent: false, usageKnown: true })
+    expect(new Set(events.map((event) => event.requestId)).size).toBe(2)
+    const third = withModelRequestScope(scope("third"), () => stream(model("shared", "m"), context))
+    await vi.advanceTimersByTimeAsync(100)
+    await third.result()
+    expect(sent).toEqual(["first", "third"])
+  })
+
+  it("T26/T27: a non-cooperative stream times out and late tool calls are never forwarded", async () => {
+    vi.useFakeTimers()
+    const events: ModelRequestEvent[] = []
+    const upstream = createAssistantMessageEventStream()
+    const source = vi.fn<import("../src/domain/provider-request-gate.ts").ProviderStream>(
+      () => upstream,
+    )
+    const stream = gateProviderStream(
+      new ProviderRequestGate({ minimumIntervalMs: 0, requestTimeoutMs: 500, idleTimeoutMs: 50 }),
+      source,
+    )
+    const output = withModelRequestScope(
+      { runId: "r", onEvent: (event) => events.push(event) },
+      () => stream(model("p", "m"), context),
+    )
+    const forwarded: unknown[] = []
+    const consume = (async () => {
+      for await (const event of output) forwarded.push(event)
+    })()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(await output.result()).toMatchObject({
+      stopReason: "error",
+      errorMessage: expect.stringContaining("idle"),
+    })
+    await consume
+    expect(source).toHaveBeenCalledOnce()
+    expect(source.mock.calls[0]?.[2]).toMatchObject({ maxRetries: 0, timeoutMs: 500 })
+    expect(events.at(-1)).toMatchObject({ sent: true, usageKnown: false, state: "failed" })
+    const late = message(model("p", "m"))
+    late.content = [
+      { type: "toolCall", id: "late", name: "ctf_submit_flag", arguments: { flag: "late" } },
+    ]
+    upstream.push({ type: "done", reason: "toolUse", message: { ...late, stopReason: "toolUse" } })
+    upstream.end(late)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(forwarded).toHaveLength(1)
+    expect(forwarded[0]).toMatchObject({ type: "error" })
+  })
+
+  it("T26: chunks reset the idle timer but cannot extend the per-request timeout", async () => {
+    vi.useFakeTimers()
+    const upstream = createAssistantMessageEventStream()
+    const partial = message(model("p", "m"))
+    const stream = gateProviderStream(
+      new ProviderRequestGate({ minimumIntervalMs: 0, requestTimeoutMs: 100, idleTimeoutMs: 50 }),
+      () => upstream,
+    )
+    const output = stream(model("p", "m"), context)
+    await vi.advanceTimersByTimeAsync(40)
+    upstream.push({ type: "start", partial })
+    await vi.advanceTimersByTimeAsync(40)
+    upstream.push({ type: "start", partial })
+    await vi.advanceTimersByTimeAsync(20)
+    expect(await output.result()).toMatchObject({
+      stopReason: "error",
+      errorMessage: expect.stringContaining("request, 100ms"),
+    })
+    upstream.end(partial)
+  })
+
+  it("T25: cancelling one in-flight Run does not cancel another Run using the same provider", async () => {
+    const controller = new AbortController()
+    const hanging = createAssistantMessageEventStream()
+    const source = vi.fn((candidate: Model<Api>) =>
+      candidate.id === "hanging" ? hanging : completedStream(message(candidate)),
+    )
+    const stream = gateProviderStream(new ProviderRequestGate({ minimumIntervalMs: 0 }), source)
+    const first = withModelRequestScope({ signal: controller.signal, runId: "a" }, () =>
+      stream(model("shared", "hanging"), context),
+    )
+    const second = withModelRequestScope({ runId: "b" }, () =>
+      stream(model("shared", "normal"), context),
+    )
+    await second.result()
+    controller.abort()
+    expect((await first.result()).stopReason).toBe("aborted")
+    expect((await second.result()).stopReason).toBe("stop")
+    hanging.end(message(model("shared", "hanging")))
+  })
+
   it("错开同一 Provider 的请求，同时允许不同 Provider 独立启动", async () => {
     vi.useFakeTimers()
     const starts: string[] = []

@@ -205,6 +205,8 @@ export interface DashboardRun extends RunRecord {
   subagentsNextCursor?: string
   cache: AgentCacheStats
   hasConversation: boolean
+  /** Sent requests without a trustworthy provider usage receipt (includes in-flight requests). */
+  unknownUsageRequests?: number
 }
 
 /** Bounded metadata only: no prompt, report text, or host paths. */
@@ -235,6 +237,7 @@ export interface ChallengeDetails {
 }
 
 export interface DashboardProject {
+  readonly solveGoals?: { list(): import("@ctf-agent/core").SolveGoal[] }
   refresh(): Promise<ContestOverview>
   overview(): Promise<ContestOverview>
   challenges(): Promise<ChallengeSummary[]>

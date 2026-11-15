@@ -302,7 +302,7 @@ export class ControlPlane {
       return
     }
     runtime.lastError = null
-    runtime.scheduler?.resume()
+    runtime.scheduler?.resume({ configuration: false })
     this.setRuntimePhase(runtime, "ready")
   }
 
@@ -689,7 +689,7 @@ export class ControlPlane {
           await project.syncAnnouncements()
           if (runtime.phase === "degraded") {
             runtime.lastError = null
-            runtime.scheduler?.resume()
+            runtime.scheduler?.resume({ configuration: false })
             this.setRuntimePhase(runtime, "ready")
           }
         },

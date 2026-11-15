@@ -82,6 +82,7 @@ export interface SubagentLifecyclePersistence {
 }
 
 export interface SubagentManagerOptions {
+  requestGuard?: import("@ctf-agent/agents").ModelRequestGuard
   projectId: string
   runId: string
   runDirectory: string
@@ -526,6 +527,14 @@ export class CtfSubagentManager {
         })
         if (!created.ok) throw created.error
         managed.agent = await CtfSubagent.create({
+          requestScope: () => ({
+            ...this.options.requestGuard,
+            executionId: managed.record.executionId,
+            canSend: () =>
+              this.current(managed) &&
+              !TERMINAL.has(managed.record.status) &&
+              (this.options.requestGuard?.canSend?.() ?? true),
+          }),
           projectId: this.options.projectId,
           runId: this.options.runId,
           runDirectory: this.options.runDirectory,

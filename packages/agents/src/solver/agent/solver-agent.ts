@@ -11,6 +11,7 @@ import {
   modelsFromAgentOptions,
   type PreparedBaseAgent,
   prepareBaseAgent,
+  type ModelRequestGuard,
 } from "../../base-agent/index.ts"
 import { createSolverTools } from "../sandbox/tools.ts"
 
@@ -23,6 +24,7 @@ export interface SolverIdentity {
 }
 
 export interface CreateCtfSolverAgentOptions {
+  requestGuard?: ModelRequestGuard
   identity: SolverIdentity
   capability: ChallengeCapability
   sandbox: Sandbox
@@ -154,6 +156,15 @@ export class CtfSolverAgent extends BaseAgent {
     ]
     const model = options.agent.initialState?.model ?? FALLBACK_MODEL
     const prepared = await prepareBaseAgent({
+      requestScope: () => ({
+        ...options.requestGuard,
+        projectId: options.identity.projectId,
+        challengeId: options.identity.challenge.id,
+        runId: options.identity.runId,
+        agentId: "solver",
+        purpose: "solver",
+        canSend: () => !solver?.isClosed && (options.requestGuard?.canSend?.() ?? true),
+      }),
       session: {
         path: join(options.identity.runDirectory, "session.jsonl"),
         id: options.identity.runId,

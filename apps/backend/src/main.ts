@@ -46,9 +46,6 @@ interface WebUiProcessOptions {
   port: number
   pollIntervalMs: number
   maxConcurrent: number
-  maxAttempts: number
-  maxSessionInterruptions: number
-  challengeTimeoutMs: number
   retryDelayMs: number
   workspaceVolume?: string
   authFile: string
@@ -256,10 +253,7 @@ const controlPlane = await ControlPlane.create({
     const runtime = await projectRuntimeConfiguration(context)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: runtime.snapshot().maxConcurrent,
-      maxAttempts: options.maxAttempts,
-      maxSessionInterruptions: options.maxSessionInterruptions,
       writeup: true,
-      challengeTimeoutMs: options.challengeTimeoutMs,
       retryDelayMs: options.retryDelayMs,
       availability: () => {
         const model = modelConfiguration.snapshot(runtime.snapshot())
@@ -408,9 +402,6 @@ function parseOptions(args: string[]): WebUiProcessOptions {
     "--port",
     "--poll-interval-ms",
     "--max-concurrent",
-    "--max-attempts",
-    "--max-session-interruptions",
-    "--challenge-timeout-ms",
     "--retry-delay-ms",
     "--workspace-volume",
     "--auth-file",
@@ -424,14 +415,6 @@ function parseOptions(args: string[]): WebUiProcessOptions {
     port: positiveInteger(values, "--port", 3_000, 65_535),
     pollIntervalMs: positiveInteger(values, "--poll-interval-ms", 1_000, 60_000),
     maxConcurrent: positiveInteger(values, "--max-concurrent", 8, 64),
-    maxAttempts: positiveInteger(values, "--max-attempts", 2, 100),
-    maxSessionInterruptions: positiveInteger(values, "--max-session-interruptions", 3, 100),
-    challengeTimeoutMs: positiveInteger(
-      values,
-      "--challenge-timeout-ms",
-      30 * 60_000,
-      24 * 60 * 60_000,
-    ),
     retryDelayMs: positiveInteger(values, "--retry-delay-ms", 2_000, 60 * 60_000),
     ...(values.get("--workspace-volume")
       ? { workspaceVolume: values.get("--workspace-volume") }

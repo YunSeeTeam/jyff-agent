@@ -232,8 +232,7 @@ function readOnlySchedulerSnapshot(project: DashboardProject): ContestSchedulerS
     idleVersion: state.idleVersion,
     executionVersion: state.executionVersion,
     maxConcurrent: 0,
-    maxAttempts: 0,
-    maxSessionInterruptions: 0,
+    goals: project.solveGoals?.list() ?? [],
     idle: entries.filter((item) => item.stage === "idle"),
     queued: entries.filter((item) => item.stage === "execution"),
     active: [],
@@ -293,6 +292,7 @@ export async function buildChallengeDetails(
       events: compactTimelineEvents(events),
       ...subagentIndex(run.id, project.subagents(run.id)),
       cache: agentCacheStats(events),
+      unknownUsageRequests: unknownRequestUsage(events),
       hasConversation: events.some((event) =>
         ["agent_message", "agent_usage", "tool_started"].includes(event.type),
       ),
@@ -315,6 +315,16 @@ export async function buildChallengeDetails(
     writeup: await project.challengeWriteup(challengeId),
     tldr: project.tldr(challengeId) ?? null,
   }
+}
+
+export function unknownRequestUsage(events: readonly RunEvent[]): number {
+  const latest = new Map<string, Record<string, unknown>>()
+  for (const event of events) {
+    if (event.type !== "model_request" || !isRecord(event.data)) continue
+    if (typeof event.data.requestId === "string") latest.set(event.data.requestId, event.data)
+  }
+  return [...latest.values()].filter((event) => event.sent === true && event.usageKnown !== true)
+    .length
 }
 
 /**

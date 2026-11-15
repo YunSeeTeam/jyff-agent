@@ -28,6 +28,51 @@ afterEach(() => {
 })
 
 describe("ProjectPage", () => {
+  it("显示持久暂停原因并通过项目范围接口恢复求解", async () => {
+    const paused = snapshot()
+    paused.scheduler!.state = "suspended"
+    paused.scheduler!.goals = [
+      {
+        id: "goal",
+        challengeId: "web/1",
+        state: "paused",
+        runId: null,
+        requiresAuto: false,
+        retryAt: null,
+        failures: 0,
+        reason: "供应商配额暂不可用",
+        updatedAt: "2026-11-15T00:00:00Z",
+      },
+    ]
+    vi.stubGlobal("EventSource", FakeEventSource)
+    const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
+      if (init?.method === "POST") return jsonResponse(snapshot())
+      return jsonResponse(paused)
+    })
+    vi.stubGlobal("fetch", fetcher)
+    render(
+      createElement(
+        MemoryRouter,
+        { initialEntries: ["/projects/demo"] },
+        createElement(
+          Routes,
+          null,
+          createElement(Route, {
+            path: "/projects/:projectId",
+            element: createElement(ProjectPage),
+          }),
+        ),
+      ),
+    )
+    expect(await screen.findByText("供应商配额暂不可用")).toBeTruthy()
+    await userEvent.setup().click(await screen.findByRole("button", { name: "恢复求解" }))
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/projects/demo/scheduler/resume",
+      expect.objectContaining({ method: "POST" }),
+    )
+    await waitFor(() => expect(screen.queryByText("供应商配额暂不可用")).toBeNull())
+  })
+
   it("为未开始比赛提供手动开始按钮，并提供项目范围的 Writeup 导出", async () => {
     let started = false
     const pending = {
@@ -652,8 +697,7 @@ function snapshot(): DashboardSnapshot {
       idleVersion: 1,
       executionVersion: 1,
       maxConcurrent: 2,
-      maxAttempts: 2,
-      maxSessionInterruptions: 3,
+      goals: [],
       idle: [],
       queued: [],
       active: [],

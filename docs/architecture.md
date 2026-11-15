@@ -146,17 +146,17 @@ Project 对 Solver 暴露题目级能力：题目详情、附件下载、Flag �
 
 - 优化开关与 Skills 选择；
 - SubAgent 角色，含系统提示词 hash；新快照同时保存角色定义，以便恢复原提示词、工具与模型选择；
-- 模型与限额；
+- 模型、并发与存储约束；
 - runtimeProfile：适配器 ID、会话格式、Pi 包版本和锁文件 hash。
 
-开关依赖不满足、或选择了不存在的 Skill/角色时，拒绝创建 Run。这类拒绝是项目级配置问题：题目不会被阻塞，被拒绝的 Run 不计入尝试次数，调度器暂停并提示“Run 配置需要人工处理”，保存运行配置后恢复；ContestRunner 以 `reason: "configuration"` 结束该题，不重试。
+开关依赖不满足、或选择了不存在的 Skill/角色时，拒绝创建 Run。题目不会被阻塞，目标持久化为可恢复暂停；保存配置或“恢复求解”后继续。同一 Run 从未成功冻结配置时可按修复后的设置重试；已经冻结的快照仍保持不变。独立测试器 ContestRunner 以 `reason: "configuration"` 结束该测试样本。
 
 续跑同一 Run 时使用原快照，不读当前配置；当前运行时无法恢复快照中的会话格式时，拒绝续跑。没有快照时分两种情况：
 
 - Run 从未启动（在冻结时就被拒绝）：按新 Run 冻结，依赖检查照常进行；
 - Run 在有快照之前就已运行：固定为全部开关关闭，写入 `origin: "legacy_resume"` 的快照并记录 `run_configuration_legacy_resume` 事件，之后的续跑与其他 Run 一样恢复该快照。
 
-当前构建支持 `blackboard-reader-v2`、`full-subagent-reports`、`skill-snapshots` 三项能力，默认仍全部关闭。设置页提供对应开关及技能选择，保存只影响新 Run。本地进程与自动复核的能力检查仍会拒绝提前开启。产品预算设计已于 2026-11-15 撤销：新配置/API/Run 快照不含 `budgetPolicy`，旧 Project 配置读取时忽略旧字段，旧 Run 快照字节与 hash 保留，只在运行投影中去掉旧字段。`review.maxPerBudget` 仅作历史读取别名迁移为 `maxPerGoal`，次数只约束自动复核。费用/整题墙钟限制仅在独立测试器执行；持续求解及旧单次超时/失败次数的恢复语义留阶段 4 实现。旧配置只有角色 hash 时，恢复验证现有角色；角色已经变化则明确拒绝，不偷偷加载新提示词。
+当前构建支持 `blackboard-reader-v2`、`full-subagent-reports`、`skill-snapshots` 三项能力，默认仍全部关闭。设置页提供对应开关及技能选择，保存只影响新 Run。本地进程与自动复核的能力检查仍会拒绝提前开启。产品预算设计已于 2026-11-15 撤销：新配置/API/Run 快照不含 `budgetPolicy`，旧 Project 配置读取时忽略旧字段，旧 Run 快照字节与 hash 保留，只在运行投影中去掉旧字段。`review.maxPerBudget` 仅作历史读取别名迁移为 `maxPerGoal`，次数只约束自动复核。费用/整题墙钟限制仅在独立测试器执行；阶段 4 已实现持久持续求解与请求恢复，见下文及 scheduling.md。旧配置只有角色 hash 时，恢复验证现有角色；角色已经变化则明确拒绝，不偷偷加载新提示词。
 
 Solver 的关闭顺序在 `packages/agents/src/solver/agent/solver-agent.ts`：
 
@@ -185,9 +185,11 @@ Flag 被平台接受后会记录 terminal submission。生产调度会进入 Wri
 - 同一题在 idle/execution/active 阶段互斥；直接派发可以显式 `force` 绕过 solved 或 blocked 检查。
 - `maxConcurrent` 是活跃 Solver/Sandbox 的硬上限；等待远程环境的 Run 仍占一个容器槽。
 - 远程槽满时跳过无附件环境题，但允许纯本地题和有附件可本地分析的题越过它。
-- 历史 Run 参与 attempt 预算；`interrupted` 和 `blocked` 不消耗普通重试预算。调度来源的非 `blocked` 终态 Run 恢复时复用原 attempt/session，并发送默认 continuation prompt，不创建新的 attempt。
-- 网络/限流/服务端错误按可重试分类处理；Session 连续异常超过阈值后将题目设为 blocked。
-- 鉴权、余额不足和 Run 配置被拒绝都需要人工处理：调度器暂停，不计入阻塞分。
+- `solve_goals` 保存 active/paused/stopped/accepted、原 Run、连续失败计数和恢复时间；请求超时、模型结束、长度截断、压缩和固定失败次数不结束目标。生产入口移除整题超时与尝试次数参数。
+- 网络/限流/服务端错误按连续失败数退避，有进展清零；退避达到 300 秒后保持该间隔续跑。进程关闭保留目标，人工停止持久化且不能由自动发现复活。
+- 鉴权、供应商配额、Run 配置及反复非瞬态错误进入可恢复暂停；页面显示原因，修复后显式恢复。平台恢复不能自行解除这些暂停。
+- 模型请求默认总超时 5 分钟、流空闲 90 秒；身份与取消信号覆盖 Solver/SubAgent/压缩/分支摘要，实际发送前再次检查生命周期，SDK/Pi 隐式重试关闭。未知发送用量不当作零统计。
+- 实际接受响应先保存独立 receipt，再写 SQLite；重启按原身份/观察时间恢复。平台当前已解只用于停止探索，不伪造 Run 的接受归属。
 - 平台暂不可用时停止领取，但不删除持久化队列和自动调度意图；恢复后继续 reconcile。
 - 空闲整队排序使用 `idleVersion`，执行队列排序校验条目版本；冲突时拒绝陈旧拖拽请求，前端重新读取服务端快照。
 - `AnnouncementPoller` 定期拉取公告；`announcement-matcher.ts` 按 ID、标题、内容和关键词生成题目候选，候选先由 WebUI 审核，之后才写入 Run 的上下文。

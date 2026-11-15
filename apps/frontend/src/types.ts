@@ -129,6 +129,7 @@ export interface AgentCacheStats {
 }
 
 export interface DashboardRun extends RunRecord {
+  unknownUsageRequests?: number
   events: RunEvent[]
   /** First page of the Run's SubAgents in creation order; the rest load on request. */
   subagents: DashboardSubagent[]

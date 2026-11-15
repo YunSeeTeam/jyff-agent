@@ -8,6 +8,7 @@ import type {
   RemoteEnvironment,
 } from "@ctf-agent/platform"
 import { SUBAGENT_REPORT_MAX_STORED_BYTES } from "../contracts/index.ts"
+import { SOLVE_GOALS_SCHEMA, SolveGoalStore } from "./solve-goals.ts"
 import type { SubagentRecord } from "../collaboration/subagent-manager.ts"
 import type {
   RemoteEnvironmentLeaseRecord,
@@ -62,6 +63,7 @@ const WRITEUP_STATUS_SQL = WRITEUP_STATUSES.map((status) => `'${status}'`).join(
 export const RUN_STORE_DATA_CAPABILITIES = {
   "accepted-fact": 1,
   "bounded-subagent-reports": 1,
+  "continuous-solve-goals": 1,
 } as const
 
 export type RunCloseReason =
@@ -287,6 +289,10 @@ export interface SchedulerQueueRecord {
   manualOverride: boolean
   enqueuedAt: string
   version: number
+  resumeRunId: string | null
+  retryPrompt: string | null
+  writeupRetry: boolean
+  requiresAuto: boolean
 }
 
 export interface EnqueueSchedulerChallenge {
@@ -296,6 +302,10 @@ export interface EnqueueSchedulerChallenge {
   lane?: SchedulerQueueLane
   manualOverride?: boolean
   enqueuedAt?: string
+  resumeRunId?: string
+  retryPrompt?: string
+  writeupRetry?: boolean
+  requiresAuto?: boolean
 }
 
 export interface MoveSchedulerChallenge {
@@ -546,6 +556,10 @@ interface SchedulerQueueRow {
   manual_override: number
   enqueued_at: string
   version: number
+  resume_run_id: string | null
+  retry_prompt: string | null
+  writeup_retry: number
+  requires_auto: number
 }
 
 interface ChallengeRuntimeStateRow {
@@ -688,6 +702,10 @@ function schedulerQueueFromRow(row: SchedulerQueueRow): SchedulerQueueRecord {
     manualOverride: row.manual_override === 1,
     enqueuedAt: row.enqueued_at,
     version: row.version,
+    resumeRunId: row.resume_run_id,
+    retryPrompt: row.retry_prompt,
+    writeupRetry: row.writeup_retry === 1,
+    requiresAuto: row.requires_auto === 1,
   }
 }
 
@@ -881,6 +899,11 @@ function normalizedUsageIdentity(value: string, field: string): string {
  */
 export class RunStore {
   private closed = false
+
+  get solveGoals(): SolveGoalStore {
+    this.assertOpen()
+    return new SolveGoalStore(this.database)
+  }
 
   private constructor(
     readonly path: string,
@@ -1169,6 +1192,16 @@ export class RunStore {
         "ALTER TABLE scheduler_queue ADD COLUMN stage TEXT NOT NULL DEFAULT 'execution' CHECK (stage IN ('idle', 'execution'))",
       )
     }
+    database.exec(SOLVE_GOALS_SCHEMA)
+    for (const [name, definition] of [
+      ["resume_run_id", "TEXT REFERENCES runs(id) ON DELETE CASCADE"],
+      ["retry_prompt", "TEXT"],
+      ["writeup_retry", "INTEGER NOT NULL DEFAULT 0 CHECK (writeup_retry IN (0, 1))"],
+      ["requires_auto", "INTEGER NOT NULL DEFAULT 1 CHECK (requires_auto IN (0, 1))"],
+    ]) {
+      if (!schedulerQueueColumns.has(name!))
+        database.exec(`ALTER TABLE scheduler_queue ADD COLUMN ${name} ${definition}`)
+    }
     database.exec(`
       DROP INDEX IF EXISTS scheduler_queue_order;
       CREATE INDEX scheduler_queue_order
@@ -1220,7 +1253,8 @@ export class RunStore {
         ON CONFLICT(name) DO UPDATE SET version = MAX(version, excluded.version)
       `)
       for (const [name, version] of Object.entries(RUN_STORE_DATA_CAPABILITIES)) {
-        if (name !== "bounded-subagent-reports") registerCapability.run(name, version)
+        if (name !== "bounded-subagent-reports" && name !== "continuous-solve-goals")
+          registerCapability.run(name, version)
       }
       database.exec("COMMIT")
     } catch (error) {
@@ -1669,6 +1703,11 @@ export class RunStore {
     try {
       const current = this.getRunOrThrow(input.runId)
       const previous = current.solveOutcome
+      this.database
+        .prepare(
+          "UPDATE solve_goals SET state = 'accepted', reason = NULL, retry_at = NULL, updated_at = ? WHERE challenge_id = ?",
+        )
+        .run(timestamp, current.challengeId)
       const upgradesToAccepted = input.outcome === "accepted" && previous !== "accepted"
       const fillsEmpty = input.outcome === "already_solved" && previous === undefined
       if (upgradesToAccepted || fillsEmpty) {
@@ -1751,6 +1790,30 @@ export class RunStore {
     return row.attempt + 1
   }
 
+  /** A process died without a terminal provider receipt. Sent usage remains unknown. */
+  markInterruptedModelRequests(): void {
+    this.assertOpen()
+    for (const run of this.listRuns()) {
+      const latest = new Map<string, Record<string, unknown>>()
+      for (const event of this.events(run.id)) {
+        if (event.type !== "model_request" || !event.data || typeof event.data !== "object")
+          continue
+        const data = event.data as Record<string, unknown>
+        if (typeof data.requestId === "string") latest.set(data.requestId, data)
+      }
+      for (const data of latest.values()) {
+        if (data.state !== "sending" && data.state !== "queued") continue
+        this.appendEvent(run.id, "model_request", {
+          ...data,
+          state: "failed",
+          sent: data.state === "sending",
+          usageKnown: data.state === "queued",
+          reason: "Process restarted before request completion; sent usage is unknown",
+        })
+      }
+    }
+  }
+
   schedulerAttemptCount(challengeId: string): number {
     this.assertOpen()
     const row = this.database
@@ -1765,7 +1828,7 @@ export class RunStore {
           FROM run_events
           WHERE run_events.run_id = runs.id
             AND (
-              run_events.type = 'run_creation_failed'
+              (run_events.type = 'run_creation_failed' AND runs.started_at IS NULL)
               OR (
                 run_events.type = 'run_transient_failure'
                 AND COALESCE(
@@ -2100,9 +2163,22 @@ export class RunStore {
   setSchedulerMode(mode: SchedulerMode): SchedulerStateRecord {
     this.assertOpen()
     const updatedAt = new Date().toISOString()
-    this.database
-      .prepare("UPDATE scheduler_control SET mode = ?, updated_at = ? WHERE singleton = 1")
-      .run(mode, updatedAt)
+    this.database.exec("BEGIN IMMEDIATE")
+    try {
+      this.database
+        .prepare("UPDATE scheduler_control SET mode = ?, updated_at = ? WHERE singleton = 1")
+        .run(mode, updatedAt)
+      if (mode === "stopped") {
+        this.database.prepare("UPDATE scheduler_queue SET requires_auto = 1").run()
+        this.database
+          .prepare("UPDATE solve_goals SET requires_auto = 1 WHERE state IN ('active', 'paused')")
+          .run()
+      }
+      this.database.exec("COMMIT")
+    } catch (error) {
+      this.database.exec("ROLLBACK")
+      throw error
+    }
     return this.schedulerState()
   }
 
@@ -2161,6 +2237,11 @@ export class RunStore {
     this.database.exec("BEGIN IMMEDIATE")
     try {
       for (const input of inputs) {
+        if (input.resumeRunId) {
+          const run = this.getRunOrThrow(input.resumeRunId)
+          if (run.challengeId !== input.challengeId)
+            throw new Error("Queued Run belongs to another challenge")
+        }
         const existing = this.database
           .prepare("SELECT * FROM scheduler_queue WHERE challenge_id = ?")
           .get(input.challengeId) as unknown as SchedulerQueueRow | undefined
@@ -2180,8 +2261,8 @@ export class RunStore {
           .prepare(`
             INSERT INTO scheduler_queue (
               challenge_id, source, stage, lane, position, manual_override,
-              enqueued_at, version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+              enqueued_at, version, resume_run_id, retry_prompt, writeup_retry, requires_auto
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
           `)
           .run(
             input.challengeId,
@@ -2191,6 +2272,10 @@ export class RunStore {
             next.position,
             input.manualOverride ? 1 : 0,
             input.enqueuedAt ?? new Date().toISOString(),
+            input.resumeRunId ?? null,
+            input.retryPrompt ?? null,
+            input.writeupRetry ? 1 : 0,
+            input.requiresAuto === false ? 0 : 1,
           )
         const row = this.database
           .prepare("SELECT * FROM scheduler_queue WHERE challenge_id = ?")
@@ -2199,6 +2284,11 @@ export class RunStore {
         changed.add(stage)
       }
       if (changed.size > 0) {
+        this.database
+          .prepare(
+            "INSERT OR IGNORE INTO runtime_data_capabilities (name, version) VALUES ('continuous-solve-goals', 1)",
+          )
+          .run()
         this.database
           .prepare(`
             UPDATE scheduler_control
@@ -2758,6 +2848,7 @@ export class RunStore {
       // challenge_opportunities(+sources) / challenge_block_events /
       // remote_environment_leases / announcement_deliveries
       this.database.prepare("DELETE FROM runs WHERE challenge_id = ?").run(challengeId)
+      this.database.prepare("DELETE FROM solve_goals WHERE challenge_id = ?").run(challengeId)
       // 题目级状态不随 Run 级联，必须显式清理
       this.database.prepare("DELETE FROM challenge_tldr WHERE challenge_id = ?").run(challengeId)
       this.database

@@ -388,7 +388,6 @@ describe("ContestScheduler", () => {
     faux.setResponses(Array.from({ length: 8 }, () => respond))
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
         initialState: { model: faux.getModel(), thinkingLevel: "off" },
@@ -506,7 +505,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       writeup: true,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
@@ -561,7 +559,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 2,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
         initialState: { model: faux.getModel(), thinkingLevel: "off" },
@@ -611,7 +608,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 2,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
         initialState: { model: faux.getModel(), thinkingLevel: "off" },
@@ -632,6 +628,28 @@ describe("ContestScheduler", () => {
       expect(JSON.stringify(result?.data)).toContain("accepted_persistence_failed")
       expect(faux.state.callCount).toBe(1)
       expect(project.isChallengeSolved(item.id)).toBe(true)
+      const receipt = JSON.parse(
+        await readFile(
+          join(dirname(project.runSessionPath(runs[0]!.id)), "accepted-receipt.json"),
+          "utf8",
+        ),
+      ) as { receipt: { observedAt: string } }
+      recordSolveOutcome.mockRestore()
+      await scheduler.shutdown()
+      await project.close()
+      const reopened = await reopenFixture(project.root, tracker)
+      try {
+        expect(reopened.runs({ challengeId: item.id })[0]).toMatchObject({
+          id: runs[0]!.id,
+          solveOutcome: "accepted",
+          observedAcceptedAt: receipt.receipt.observedAt,
+        })
+        expect(reopened.runEvents(runs[0]!.id).map((event) => event.type)).toContain(
+          "accepted_receipt_recovered",
+        )
+      } finally {
+        await reopened.close()
+      }
     } finally {
       recordSolveOutcome.mockRestore()
       await scheduler.shutdown()
@@ -657,7 +675,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       writeup: true,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
@@ -779,7 +796,6 @@ describe("ContestScheduler", () => {
 
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: () => solvingAgent(item),
     })
 
@@ -825,7 +841,6 @@ describe("ContestScheduler", () => {
       await original.close(closeReason, `测试 ${closeReason}`)
       const scheduler = new ContestScheduler(project, {
         maxConcurrent: 1,
-        maxAttempts: 1,
         createAgentOptions: () => solvingAgent(item),
       })
 
@@ -896,7 +911,6 @@ describe("ContestScheduler", () => {
     let sessions = 0
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       retryDelayMs: 0,
       infrastructureRetryDelayMs: 0,
       transientRetryDelaysMs: [0, 0, 0],
@@ -954,7 +968,7 @@ describe("ContestScheduler", () => {
       )
       expect(continuedSession).toContain(INCOMPLETE_CONTINUATION_PROMPT)
       expect(project.sessionInterruptionCount(item.id)).toBe(0)
-      expect(project.challengeBlockEvents(item.id)).toHaveLength(stopReason === "error" ? 0 : 1)
+      expect(project.challengeBlockEvents(item.id)).toHaveLength(0)
       expect(
         project
           .runEvents(continuedRun?.id ?? "")
@@ -967,7 +981,7 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("Request aborted 耗尽瞬时重试后恢复原 attempt，而不是创建新 attempt", async () => {
+  it("T26: Request aborted 超过旧重试次数仍继续原 Run", async () => {
     const item = challenge(105)
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
@@ -987,7 +1001,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       retryDelayMs: 0,
       infrastructureRetryDelayMs: 0,
       transientRetryDelaysMs: [0, 0, 0],
@@ -1013,7 +1026,7 @@ describe("ContestScheduler", () => {
       ])
       expect(faux.state.callCount).toBe(5)
       expect(project.runEvents(runs[0]?.id ?? "").map((event) => event.type)).toContain(
-        "run_resumed",
+        "run_transient_failure",
       )
       expect(await readFile(project.runSessionPath(runs[0]?.id ?? ""), "utf8")).toContain(
         INCOMPLETE_CONTINUATION_PROMPT,
@@ -1024,23 +1037,25 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("同一 attempt 对连续 fetch failed 仅提供三次退避重试", async () => {
+  it("T26: 连续 fetch failed 超过三次仍退避恢复直到判题接受", async () => {
     expect(DEFAULT_TRANSIENT_RETRY_DELAYS_MS).toEqual([10_000, 60_000, 300_000])
     const item = challenge(96)
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
     const faux = createFauxCore({ provider: "transient-exhaustion" })
-    faux.setResponses(
-      Array.from({ length: 4 }, () =>
+    faux.setResponses([
+      ...Array.from({ length: 6 }, () =>
         fauxAssistantMessage("network unavailable", {
           stopReason: "error",
           errorMessage: "fetch failed",
         }),
       ),
-    )
+      fauxAssistantMessage(fauxToolCall("ctf_submit_flag", { flag: item.flag }), {
+        stopReason: "toolUse",
+      }),
+    ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       transientRetryDelaysMs: [0, 0, 0],
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
@@ -1054,19 +1069,18 @@ describe("ContestScheduler", () => {
       const [run] = project.runs({ challengeId: item.id })
       expect(run).toMatchObject({
         attempt: 1,
-        status: "failed",
-        closeReason: "failed",
+        status: "solved",
+        closeReason: "submitted",
       })
-      expect(faux.state.callCount).toBe(4)
+      expect(faux.state.callCount).toBe(7)
       const failures = project
         .runEvents(run?.id ?? "")
         .filter((event) => event.type === "run_transient_failure")
-      expect(failures.map((event) => event.data)).toEqual([
-        expect.objectContaining({ failureNumber: 1, retryScheduled: true }),
-        expect.objectContaining({ failureNumber: 2, retryScheduled: true }),
-        expect.objectContaining({ failureNumber: 3, retryScheduled: true }),
-        expect.objectContaining({ failureNumber: 4, retryScheduled: false }),
-      ])
+      expect(failures.map((event) => event.data)).toEqual(
+        Array.from({ length: 6 }, (_, i) =>
+          expect.objectContaining({ failureNumber: i + 1, retryScheduled: true }),
+        ),
+      )
       expect(project.challengeBlockEvents(item.id)).toHaveLength(0)
     } finally {
       await scheduler.shutdown()
@@ -1081,17 +1095,19 @@ describe("ContestScheduler", () => {
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
     const faux = createFauxCore({ provider: "sdk-connection-error" })
-    faux.setResponses(
-      Array.from({ length: 4 }, () =>
+    faux.setResponses([
+      ...Array.from({ length: 4 }, () =>
         fauxAssistantMessage("connection dropped", {
           stopReason: "error",
           errorMessage: "Connection error.",
         }),
       ),
-    )
+      fauxAssistantMessage(fauxToolCall("ctf_submit_flag", { flag: item.flag }), {
+        stopReason: "toolUse",
+      }),
+    ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       transientRetryDelaysMs: [0, 0, 0],
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
@@ -1111,7 +1127,7 @@ describe("ContestScheduler", () => {
         expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
         expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
         expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
-        expect.objectContaining({ reason: "network_transient", retryScheduled: false }),
+        expect.objectContaining({ reason: "network_transient", retryScheduled: true }),
       ])
       expect(project.challengeBlockEvents(item.id)).toHaveLength(0)
       expect(project.isChallengeBlocked(item.id)).toBe(false)
@@ -1121,13 +1137,13 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("瞬时 Provider 故障耗尽后仍受 attempt 预算限制，不会无限创建新 Run", async () => {
+  it("T24: 连续 Provider 故障保持同一目标和 Run，人工停止后不再重发", async () => {
     const item = challenge(95)
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
     const faux = createFauxCore({ provider: "bounded-transient-retries" })
     faux.setResponses(
-      Array.from({ length: 12 }, () =>
+      Array.from({ length: 100 }, () =>
         fauxAssistantMessage("network unavailable", {
           stopReason: "error",
           errorMessage: "fetch failed",
@@ -1136,7 +1152,6 @@ describe("ContestScheduler", () => {
     )
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 2,
       retryDelayMs: 0,
       infrastructureRetryDelayMs: 0,
       transientRetryDelaysMs: [0, 0, 0],
@@ -1147,12 +1162,17 @@ describe("ContestScheduler", () => {
     })
     try {
       await scheduler.dispatch(item.id)
-      await waitUntil(() => scheduler.snapshot().active.length === 0)
+      await waitUntil(() => faux.state.callCount >= 9)
+      await scheduler.cancel(item.id)
 
-      expect(faux.state.callCount).toBe(8)
+      const calls = faux.state.callCount
+      expect(calls).toBeGreaterThanOrEqual(9)
       expect(project.runs({ challengeId: item.id })).toEqual([
-        expect.objectContaining({ attempt: 1, status: "failed" }),
+        expect.objectContaining({ attempt: 1, status: "cancelled" }),
       ])
+      await scheduler.reconcile()
+      expect(faux.state.callCount).toBe(calls)
+      expect(project.solveGoals.get(item.id)?.state).toBe("stopped")
       expect(scheduler.snapshot().queued).toEqual([])
     } finally {
       await scheduler.shutdown()
@@ -1170,7 +1190,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(items, tracker, { runSettings: () => settings })
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 2,
       retryDelayMs: 0,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(byId.get(summary.id))),
@@ -1179,12 +1198,13 @@ describe("ContestScheduler", () => {
       await scheduler.startAuto()
       await waitUntil(() => project.runs().length > 0 && scheduler.snapshot().active.length === 0)
       expect(scheduler.snapshot()).toMatchObject({
-        available: false,
-        unavailableReason: expect.stringContaining("Run 配置需要人工处理"),
+        available: true,
+        state: "suspended",
       })
-      // Suspended after the first rejection, instead of failing every challenge in turn.
+      // Each durable goal pauses without spending a model request or blocking the challenge.
       const runs = project.runs()
-      expect(runs).toHaveLength(1)
+      expect(runs).toHaveLength(2)
+      expect(project.solveGoals.list().every((goal) => goal.state === "paused")).toBe(true)
       const rejected = runs[0]
       if (!rejected) throw new Error("the rejected Run was not recorded")
       expect(rejected.status).toBe("failed")
@@ -1195,9 +1215,9 @@ describe("ContestScheduler", () => {
       scheduler.resume()
       await scheduler.reconcile()
       await waitUntil(() => items.every((item) => project.isChallengeSolved(item.id)), 5_000)
-      // The rejected Run stays on record; it never started, so only the solving Run counts.
+      // A rejected, never-started Run resumes after the configuration is corrected.
       const history = project.runs({ challengeId: rejected.challengeId })
-      expect(history.find((run) => run.id === rejected.id)?.status).toBe("failed")
+      expect(history.find((run) => run.id === rejected.id)?.status).toBe("solved")
       expect(project.schedulerAttemptCount(rejected.challengeId)).toBe(1)
     } finally {
       await scheduler.shutdown()
@@ -1219,7 +1239,6 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 3,
       retryDelayMs: 0,
       transientRetryDelaysMs: [0, 0, 0],
       createAgentOptions: () => ({
@@ -1234,8 +1253,14 @@ describe("ContestScheduler", () => {
       expect(faux.state.callCount).toBe(1)
       expect(project.runs({ challengeId: item.id })).toHaveLength(1)
       expect(scheduler.snapshot()).toMatchObject({
-        available: false,
-        unavailableReason: expect.stringContaining("LLM 服务需要人工处理"),
+        available: true,
+        state: "suspended",
+        goals: [
+          expect.objectContaining({
+            state: "paused",
+            reason: expect.stringContaining("FreeUsageLimitError"),
+          }),
+        ],
       })
     } finally {
       await scheduler.shutdown()
@@ -1243,7 +1268,7 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("在 compact 边界记录 delta=2 并继续同一 Run", async () => {
+  it("T27: compact 不累积阻塞分，保留恢复证据并继续同一 Run", async () => {
     const item = challenge(97)
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
@@ -1268,6 +1293,7 @@ describe("ContestScheduler", () => {
     ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
+      retryDelayMs: 0,
       createAgentOptions: () => ({
         streamFn: faux.streamSimple as AgentOptions["streamFn"],
         initialState: {
@@ -1313,14 +1339,13 @@ describe("ContestScheduler", () => {
             line.includes(INCOMPLETE_CONTINUATION_PROMPT),
         )
       expect(recoveredTurn).toBeDefined()
-      expect(project.challengeBlockEvents(item.id)).toEqual([
-        expect.objectContaining({ delta: 1, reason: "model_stop" }),
+      expect(project.challengeBlockEvents(item.id)).toEqual([])
+      expect(project.runEvents(run!.id)).toContainEqual(
         expect.objectContaining({
-          delta: 2,
-          reason: "context_pressure",
-          compactPerformed: true,
+          type: "solver_compaction",
+          data: { compactPerformed: true, blockDelta: 0 },
         }),
-      ])
+      )
       expect(faux.state.callCount).toBe(3)
     } finally {
       await scheduler.shutdown()
@@ -1328,65 +1353,42 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("连续 Session 中断超过阈值后 blocked，并可由人工 force 重置", async () => {
+  it("T24: 模型自称完成和连续正常结束不终止目标，只有真实判题接受才完成", async () => {
     const item = challenge(98)
     const tracker = new SandboxTracker()
     const project = await fixture([item], tracker)
-    let solveAfterIntervention = false
+    const faux = createFauxCore({ provider: "continuous-solve" })
+    faux.setResponses([
+      ...Array.from({ length: 8 }, () => fauxAssistantMessage("已完成，猜测答案为 candidate")),
+      fauxAssistantMessage(fauxToolCall("ctf_submit_flag", { flag: "WRONG" }), {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage("换一个方向继续。"),
+      fauxAssistantMessage(fauxToolCall("ctf_submit_flag", { flag: item.flag }), {
+        stopReason: "toolUse",
+      }),
+    ])
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
-      maxSessionInterruptions: 1,
-      createAgentOptions: () => {
-        if (solveAfterIntervention) return solvingAgent(item, 0)
-        const faux = createFauxCore({ provider: "always-interrupted" })
-        faux.setResponses([fauxAssistantMessage("还没有 flag")])
-        return {
-          streamFn: faux.streamSimple as AgentOptions["streamFn"],
-          initialState: { model: faux.getModel(), thinkingLevel: "off" },
-        }
-      },
+      retryDelayMs: 0,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
     })
 
     try {
       await scheduler.dispatch(item.id)
       await waitUntil(
-        () =>
-          project.runs({ challengeId: item.id }).at(-1)?.status === "blocked" &&
-          scheduler.snapshot().active.length === 0,
-      )
-
-      expect(project.runs({ challengeId: item.id })).toEqual([
-        expect.objectContaining({ status: "blocked", closeReason: "blocked" }),
-      ])
-      expect(project.sessionInterruptionCount(item.id)).toBe(0)
-      expect(project.challengeBlockEvents(item.id)).toHaveLength(2)
-      const blockedRun = project.runs({ challengeId: item.id })[0]
-      expect(project.runEvents(blockedRun?.id ?? "").map((event) => event.type)).toEqual(
-        expect.arrayContaining(["run_blocking", "block_finalization_failed"]),
-      )
-      expect(project.isChallengeBlocked(item.id)).toBe(true)
-      expect(project.challengeRuntimeState(item.id).blockScore).toBe(2)
-      expect(project.schedulerAttemptCount(item.id)).toBe(0)
-      await expect(scheduler.dispatch(item.id)).rejects.toMatchObject({
-        code: "blocked",
-      })
-
-      solveAfterIntervention = true
-      await scheduler.dispatch(item.id, { force: true })
-      await waitUntil(
         () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
       )
+      expect(faux.state.callCount).toBe(11)
       expect(project.sessionInterruptionCount(item.id)).toBe(0)
-      expect(project.challengeRuntimeState(item.id)).toMatchObject({
-        revivalCount: 1,
-        effectiveBlockThreshold: 14,
-        blocked: false,
-      })
+      expect(project.challengeBlockEvents(item.id)).toEqual([])
+      expect(project.solveGoals.get(item.id)?.state).toBe("accepted")
       expect(project.isChallengeBlocked(item.id)).toBe(false)
       expect(project.runs({ challengeId: item.id })).toEqual([
-        expect.objectContaining({ attempt: 1, status: "blocked" }),
-        expect.objectContaining({ attempt: 2, status: "solved" }),
+        expect.objectContaining({ attempt: 1, status: "solved", solveOutcome: "accepted" }),
       ])
     } finally {
       await scheduler.shutdown()
@@ -1401,7 +1403,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 2,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(byId.get(summary.id))),
     })
@@ -1467,7 +1468,6 @@ describe("ContestScheduler", () => {
     const releaseLocal = deferred()
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) => {
         if (summary.id === holder.id) {
           return environmentAgent(holder, {
@@ -1532,7 +1532,6 @@ describe("ContestScheduler", () => {
     const localStarted = deferred()
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) => {
         if (summary.id === holder.id) {
           return environmentAgent(holder, {
@@ -1589,7 +1588,6 @@ describe("ContestScheduler", () => {
     let queuedStarted = false
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) => {
         if (summary.id === first.id) {
           return controlledSolvingAgent(first, releaseFirst.promise, firstStarted.resolve)
@@ -1641,7 +1639,6 @@ describe("ContestScheduler", () => {
     const localStarted = deferred()
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) => {
         if (summary.id === local.id) {
           return controlledSolvingAgent(local, releaseLocal.promise, localStarted.resolve)
@@ -1680,7 +1677,6 @@ describe("ContestScheduler", () => {
     const neverSubmit = deferred()
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         environmentAgent(
           requiredChallenge(remote.find((candidate) => candidate.id === summary.id)),
@@ -1740,7 +1736,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id)), 100),
     })
@@ -1832,7 +1827,6 @@ describe("ContestScheduler", () => {
     let project = await fixture(challenges, tracker)
     let scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id))),
     })
@@ -1848,7 +1842,6 @@ describe("ContestScheduler", () => {
       project = await reopenFixture(root, tracker)
       scheduler = new ContestScheduler(project, {
         maxConcurrent: 1,
-        maxAttempts: 1,
         createAgentOptions: ({ challenge: summary }) =>
           controlledSolvingAgent(
             requiredChallenge(challenges.find((item) => item.id === summary.id)),
@@ -1887,7 +1880,6 @@ describe("ContestScheduler", () => {
     const project = await fixture([item], tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 2,
       createAgentOptions: () => solvingAgent(item, 500),
     })
 
@@ -1920,7 +1912,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id)), 500),
     })
@@ -1957,7 +1948,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 2,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id)), 500),
     })
@@ -1989,7 +1979,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id)), 500),
     })
@@ -2031,7 +2020,6 @@ describe("ContestScheduler", () => {
     })
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: () => solvingAgent(item, 300),
     })
 
@@ -2077,7 +2065,6 @@ describe("ContestScheduler", () => {
     const project = await fixture([item], tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: () => solvingAgent(item),
     })
 
@@ -2113,7 +2100,6 @@ describe("ContestScheduler", () => {
     })
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: () => solvingAgent(item),
     })
 
@@ -2137,7 +2123,6 @@ describe("ContestScheduler", () => {
     const project = await fixture(challenges, tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       createAgentOptions: ({ challenge: summary }) =>
         solvingAgent(requiredChallenge(challenges.find((item) => item.id === summary.id)), 500),
     })
@@ -2182,7 +2167,6 @@ describe("ContestScheduler", () => {
     const persisted: number[] = []
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       onMaxConcurrentChange: (value) => {
         persisted.push(value)
       },
@@ -2301,7 +2285,349 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("首次创建时附件下载失败可重试且不消耗解题预算", async () => {
+  it("T24: 人工停止跨重启保留，automatic 和平台刷新不能复活；显式调度才恢复", async () => {
+    const item = challenge(401)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item], tracker)
+    let scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: () => solvingAgent(item),
+    })
+    try {
+      await scheduler.cancel(item.id)
+      const stopped = project.solveGoals.get(item.id)!
+      project.startScheduler("automatic")
+      await scheduler.shutdown()
+      const root = project.root
+      await project.close()
+      project = await reopenFixture(root, tracker)
+      scheduler = new ContestScheduler(project, {
+        maxConcurrent: 1,
+        createAgentOptions: () => solvingAgent(item),
+      })
+      await scheduler.restore()
+      await scheduler.reconcile()
+      expect(project.runs()).toEqual([])
+      expect(project.solveGoals.get(item.id)).toMatchObject({ id: stopped.id, state: "stopped" })
+      await scheduler.dispatch(item.id)
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      expect(project.solveGoals.get(item.id)?.id).not.toBe(stopped.id)
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24: 入队刷新期间的人工停止优先于晚到的 dispatch", async () => {
+    const item = challenge(402)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: () => solvingAgent(item),
+    })
+    const gate = deferred()
+    const refresh = project.refresh.bind(project)
+    const spy = vi.spyOn(project, "refresh").mockImplementationOnce(async () => {
+      await gate.promise
+      return refresh()
+    })
+    try {
+      const dispatch = scheduler.dispatch(item.id)
+      const rejected = expect(dispatch).rejects.toMatchObject({ code: "unavailable" })
+      await scheduler.cancel(item.id)
+      gate.resolve()
+      await rejected
+      expect(project.runs()).toEqual([])
+      expect(project.solveGoals.get(item.id)?.state).toBe("stopped")
+    } finally {
+      gate.resolve()
+      spy.mockRestore()
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T28: 显式 retry 提示词与原 Run 持久入队，重启后不丢失", async () => {
+    const item = challenge(403)
+    const blocker = challenge(404)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item, blocker], tracker)
+    const original = await project.createSolver(item.id, {
+      agent: solvingAgent(item),
+      source: "manual",
+    })
+    await original.close("interrupted")
+    const gate = deferred()
+    let scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: () => controlledSolvingAgent(blocker, gate.promise),
+    })
+    try {
+      await scheduler.dispatch(blocker.id)
+      await waitUntil(() => scheduler.snapshot().active[0]?.phase === "running")
+      await scheduler.retryAttempt(original.runId, {
+        prompt: "恢复附件中尚未验证的路径 evidence-403",
+      })
+      expect(project.schedulerQueue("execution")).toContainEqual(
+        expect.objectContaining({
+          resumeRunId: original.runId,
+          retryPrompt: expect.stringContaining("evidence-403"),
+          requiresAuto: false,
+        }),
+      )
+      const closing = scheduler.shutdown()
+      gate.resolve()
+      await closing
+      const root = project.root
+      await project.close()
+      project = await reopenFixture(root, tracker)
+      scheduler = new ContestScheduler(project, {
+        maxConcurrent: 1,
+        createAgentOptions: ({ challenge: value }) =>
+          value.id === item.id
+            ? solvingAgent(item)
+            : controlledSolvingAgent(blocker, Promise.resolve()),
+      })
+      await scheduler.restore()
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      expect(project.runs({ challengeId: item.id })).toEqual([
+        expect.objectContaining({ id: original.runId, status: "solved" }),
+      ])
+      expect(await readFile(project.runSessionPath(original.runId), "utf8")).toContain(
+        "evidence-403",
+      )
+    } finally {
+      gate.resolve()
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24/T26: 配额暂停跨重启保留，平台恢复不触发重发；用户恢复继续同一 Run", async () => {
+    const item = challenge(405)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: `scheduler-${item.id}` })
+    faux.setResponses([
+      fauxAssistantMessage("not available", {
+        stopReason: "error",
+        errorMessage: "insufficient quota",
+      }),
+    ])
+    let scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(
+        () =>
+          scheduler.snapshot().active.length === 0 &&
+          project.solveGoals.get(item.id)?.state === "paused",
+      )
+      const goal = project.solveGoals.get(item.id)!
+      const root = project.root
+      await scheduler.shutdown()
+      await project.close()
+      project = await reopenFixture(root, tracker)
+      const create = vi.fn(() => solvingAgent(item))
+      scheduler = new ContestScheduler(project, { maxConcurrent: 1, createAgentOptions: create })
+      await scheduler.restore()
+      scheduler.resume({ configuration: false })
+      await scheduler.reconcile()
+      expect(create).not.toHaveBeenCalled()
+      expect(project.solveGoals.get(item.id)).toMatchObject({
+        id: goal.id,
+        state: "paused",
+        runId: goal.runId,
+      })
+      scheduler.resume()
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      expect(project.runs({ challengeId: item.id })).toEqual([
+        expect.objectContaining({ id: goal.runId, status: "solved" }),
+      ])
+      expect(project.solveGoals.get(item.id)?.id).toBe(goal.id)
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24/T27: 重启保留退避时间与原 Run，并将未完成发送标为用量未知", async () => {
+    const item = challenge(407)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: `scheduler-${item.id}` })
+    faux.setResponses([
+      fauxAssistantMessage("connection", { stopReason: "error", errorMessage: "fetch failed" }),
+    ])
+    let scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      transientRetryDelaysMs: [1200, 1200, 1200],
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(() => Boolean(project.solveGoals.get(item.id)?.retryAt))
+      const goal = project.solveGoals.get(item.id)!
+      project.appendRunEvent(goal.runId!, "model_request", {
+        requestId: "killed-request",
+        runId: goal.runId,
+        state: "sending",
+        sent: true,
+        usageKnown: false,
+      })
+      const root = project.root
+      await scheduler.shutdown()
+      await project.close()
+      project = await reopenFixture(root, tracker)
+      const create = vi.fn(() => solvingAgent(item))
+      scheduler = new ContestScheduler(project, { maxConcurrent: 1, createAgentOptions: create })
+      await scheduler.restore()
+      expect(create).not.toHaveBeenCalled()
+      expect(project.solveGoals.get(item.id)).toMatchObject({
+        id: goal.id,
+        runId: goal.runId,
+        retryAt: goal.retryAt,
+        failures: 1,
+      })
+      expect(
+        project
+          .runEvents(goal.runId!)
+          .filter((event) => event.type === "model_request")
+          .at(-1)?.data,
+      ).toMatchObject({
+        requestId: "killed-request",
+        state: "failed",
+        sent: true,
+        usageKnown: false,
+      })
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+        3000,
+      )
+      expect(project.runs()).toEqual([
+        expect.objectContaining({ id: goal.runId, solveOutcome: "accepted" }),
+      ])
+      expect(create).toHaveBeenCalledOnce()
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T26: 恢复进展清零连续失败计数，不累加整题历史错误", async () => {
+    const item = challenge(406)
+    const tracker = new SandboxTracker()
+    const project = await fixture([item], tracker)
+    const faux = createFauxCore({ provider: "consecutive-failures" })
+    const failure = () =>
+      fauxAssistantMessage("network", { stopReason: "error", errorMessage: "fetch failed" })
+    faux.setResponses([
+      failure(),
+      failure(),
+      fauxAssistantMessage("已验证一条路径，继续分析。"),
+      failure(),
+      fauxAssistantMessage(fauxToolCall("ctf_submit_flag", { flag: item.flag }), {
+        stopReason: "toolUse",
+      }),
+    ])
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      retryDelayMs: 0,
+      transientRetryDelaysMs: [0, 0, 0],
+      createAgentOptions: () => ({
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      }),
+    })
+    try {
+      await scheduler.dispatch(item.id)
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      const run = project.runs()[0]!
+      expect(
+        project
+          .runEvents(run.id)
+          .filter((event) => event.type === "run_transient_failure")
+          .map((event) => (event.data as { failureNumber: number }).failureNumber),
+      ).toEqual([1, 2, 1])
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24: 遗留容器清理失败时暂停，确认清理成功后才恢复同一 Run", async () => {
+    const item = challenge(408)
+    const tracker = new SandboxTracker()
+    let project = await fixture([item], tracker)
+    const solver = await project.createSolver(item.id, {
+      source: "manual",
+      agent: solvingAgent(item),
+    })
+    const goal = project.solveGoals.begin(item.id, false)
+    project.solveGoals.update(goal.id, { runId: solver.runId })
+    await solver.close("interrupted")
+    const root = project.root
+    await project.close()
+    const store = await RunStore.open(join(root, ".ctf-agent", "runs.sqlite"))
+    store.updateRun(solver.runId, { status: "running" })
+    store.close()
+    let cleanupReady = false
+    const cleanup = vi.fn(async () => {
+      if (!cleanupReady) throw new Error("Docker temporarily unavailable")
+    })
+    project = await Project.open({
+      root,
+      platforms: [new TestPlatformPlugin()],
+      sandboxFactory: tracker.create,
+      removeManagedSandboxes: cleanup,
+    })
+    const create = vi.fn(() => solvingAgent(item))
+    const scheduler = new ContestScheduler(project, {
+      maxConcurrent: 1,
+      createAgentOptions: create,
+    })
+    try {
+      await scheduler.restore()
+      expect(project.solveGoals.get(item.id)).toMatchObject({
+        id: goal.id,
+        state: "paused",
+        reason: expect.stringContaining("Sandbox"),
+      })
+      expect(create).not.toHaveBeenCalled()
+      cleanupReady = true
+      scheduler.resume()
+      await waitUntil(
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
+      )
+      expect(cleanup).toHaveBeenCalledTimes(2)
+      expect(project.runs()).toEqual([
+        expect.objectContaining({ id: solver.runId, solveOutcome: "accepted" }),
+      ])
+      expect(tracker.active).toBe(0)
+    } finally {
+      await scheduler.shutdown()
+      await project.close()
+    }
+  })
+
+  it("T24: 首次创建时附件下载失败恢复原 Run 与目标", async () => {
     const item = challenge(1, {
       attachments: [{ id: "chall", name: "chall", content: "payload" }],
       failures: { download: 1 },
@@ -2310,9 +2636,9 @@ describe("ContestScheduler", () => {
     const project = await fixture([item], tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 1,
       retryDelayMs: 0,
       infrastructureRetryDelayMs: 0,
+      transientRetryDelaysMs: [0, 0, 0],
       createAgentOptions: () => solvingAgent(item),
     })
     try {
@@ -2322,12 +2648,7 @@ describe("ContestScheduler", () => {
       )
 
       expect(project.runs({ challengeId: item.id })).toEqual([
-        expect.objectContaining({
-          attempt: 1,
-          status: "failed",
-          error: expect.stringContaining("测试故障"),
-        }),
-        expect.objectContaining({ attempt: 2, status: "solved" }),
+        expect.objectContaining({ attempt: 1, status: "solved" }),
       ])
       expect(project.schedulerAttemptCount(item.id)).toBe(1)
     } finally {
@@ -2336,7 +2657,7 @@ describe("ContestScheduler", () => {
     }
   })
 
-  it("首次创建时非附件错误直接阻塞且不创建新 attempt", async () => {
+  it("T24: 首次绑定失败不阻塞题目，恢复原 Run 直到接受", async () => {
     const item = challenge(2, {
       failures: { bind: 1 },
       retryableFailures: { bind: true },
@@ -2345,21 +2666,22 @@ describe("ContestScheduler", () => {
     const project = await fixture([item], tracker)
     const scheduler = new ContestScheduler(project, {
       maxConcurrent: 1,
-      maxAttempts: 3,
       retryDelayMs: 0,
       infrastructureRetryDelayMs: 0,
+      transientRetryDelaysMs: [0, 0, 0],
       createAgentOptions: () => solvingAgent(item),
     })
     try {
       await scheduler.dispatch(item.id)
       await waitUntil(
-        () => project.isChallengeBlocked(item.id) && scheduler.snapshot().active.length === 0,
+        () => project.isChallengeSolved(item.id) && scheduler.snapshot().active.length === 0,
       )
 
       const runs = project.runs({ challengeId: item.id })
-      expect(runs).toEqual([expect.objectContaining({ attempt: 1, status: "blocked" })])
+      expect(runs).toEqual([expect.objectContaining({ attempt: 1, status: "solved" })])
+      expect(project.isChallengeBlocked(item.id)).toBe(false)
       expect(project.runEvents(runs[0]?.id ?? "").map((event) => event.type)).toContain(
-        "run_creation_blocked",
+        "run_creation_failed",
       )
     } finally {
       await scheduler.shutdown()

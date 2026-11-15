@@ -1,4 +1,6 @@
 import { classifySolverStop } from "@ctf-agent/core"
+import { randomUUID } from "node:crypto"
+import { currentModelRequestScope, type ModelRequestEvent } from "@ctf-agent/agents"
 import {
   type Api,
   type AssistantMessage,
@@ -15,6 +17,8 @@ export const DEFAULT_PROVIDER_TRANSIENT_COOLDOWN_MS = 15_000
 export interface ProviderRequestGateOptions {
   minimumIntervalMs?: number
   transientCooldownMs?: number
+  requestTimeoutMs?: number
+  idleTimeoutMs?: number
 }
 
 export type ProviderStream = (
@@ -29,11 +33,17 @@ interface ProviderState {
 
 /** Shared start pacing and transient-failure cooldown keyed by model provider. */
 export class ProviderRequestGate {
+  readonly requestTimeoutMs: number
+  readonly idleTimeoutMs: number
   private readonly states = new Map<string, ProviderState>()
   private readonly minimumIntervalMs: number
   private readonly transientCooldownMs: number
 
   constructor(options: ProviderRequestGateOptions = {}) {
+    this.requestTimeoutMs = duration(options.requestTimeoutMs ?? 5 * 60_000, "requestTimeoutMs")
+    this.idleTimeoutMs = duration(options.idleTimeoutMs ?? 90_000, "idleTimeoutMs")
+    if (!this.requestTimeoutMs || !this.idleTimeoutMs)
+      throw new Error("Request timeouts must be positive")
     this.minimumIntervalMs = duration(
       options.minimumIntervalMs ?? DEFAULT_PROVIDER_REQUEST_INTERVAL_MS,
       "minimumIntervalMs",
@@ -90,24 +100,119 @@ export function gateProviderStream(
 ): ProviderStream {
   return (model, context, options) => {
     const output = createAssistantMessageEventStream()
-    void (async () => {
+    const scope = currentModelRequestScope()
+    const requestId = randomUUID()
+    const controller = new AbortController()
+    const signals = [controller.signal, options?.signal, scope?.signal].filter(
+      (signal): signal is AbortSignal => signal !== undefined,
+    )
+    const signal = AbortSignal.any(signals)
+    let sent = false
+    let settled = false
+    let totalTimer: NodeJS.Timeout | undefined
+    let idleTimer: NodeJS.Timeout | undefined
+    const notify = (state: ModelRequestEvent["state"], usageKnown: boolean, reason?: string) => {
       try {
-        await gate.acquire(model.provider, options?.signal)
-        const upstream = source(model, context, options)
-        for await (const event of upstream) output.push(event)
-        const message = await upstream.result()
+        scope?.onEvent?.({
+          requestId,
+          projectId: scope.projectId,
+          challengeId: scope.challengeId,
+          runId: scope.runId,
+          agentId: scope.agentId,
+          executionId: scope.executionId,
+          purpose: scope.purpose,
+          provider: model.provider,
+          model: model.id,
+          state,
+          sent,
+          usageKnown,
+          ...(reason ? { reason } : {}),
+        })
+      } catch {
+        /* Observability must not turn a finished request into a duplicate send. */
+      }
+    }
+    const check = () => {
+      throwIfAborted(signal)
+      if (scope?.canSend?.() === false)
+        throw new DOMException("Request cancelled by solve lifecycle", "AbortError")
+    }
+    const timeout = (kind: string, milliseconds: number) =>
+      controller.abort(
+        Object.assign(
+          new Error(`Request timed out (${kind}, ${milliseconds}ms); provider usage unknown`),
+          { code: "ETIMEDOUT" },
+        ),
+      )
+    const resetIdle = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => timeout("idle", gate.idleTimeoutMs), gate.idleTimeoutMs)
+    }
+    void (async () => {
+      let onAbort: (() => void) | undefined
+      try {
+        check()
+        notify("queued", false)
+        await gate.acquire(model.provider, signal)
+        check() // Acceptance or cancellation while waiting must prevent the actual send.
+        const aborted = new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(abortReason(signal))
+          signal.addEventListener("abort", onAbort, { once: true })
+        })
+        void aborted.catch(() => {})
+        totalTimer = setTimeout(
+          () => timeout("request", gate.requestTimeoutMs),
+          gate.requestTimeoutMs,
+        )
+        resetIdle()
+        sent = true
+        notify("sending", false)
+        check()
+        const upstream = source(model, context, {
+          ...options,
+          signal,
+          maxRetries: 0,
+          timeoutMs: gate.requestTimeoutMs,
+        })
+        const consume = (async () => {
+          for await (const event of upstream) {
+            if (settled || signal.aborted) break
+            resetIdle()
+            output.push(event)
+          }
+          return upstream.result()
+        })()
+        const message = await Promise.race([consume, aborted])
+        settled = true
         gate.observeResult(model.provider, message)
+        notify(
+          message.stopReason === "error" || message.stopReason === "aborted"
+            ? "failed"
+            : "completed",
+          message.stopReason !== "error" && message.stopReason !== "aborted",
+          message.errorMessage,
+        )
         output.end(message)
       } catch (error) {
-        const aborted = options?.signal?.aborted === true || isAbortError(error)
+        settled = true
+        const aborted =
+          options?.signal?.aborted === true ||
+          scope?.signal?.aborted === true ||
+          isAbortError(error)
         if (!aborted) gate.observeError(model.provider, error)
         const message = failureMessage(model, error, aborted)
+        notify("failed", !sent, message.errorMessage)
         output.push({
           type: "error",
           reason: aborted ? "aborted" : "error",
           error: message,
         })
         output.end(message)
+      } finally {
+        clearTimeout(totalTimer)
+        clearTimeout(idleTimer)
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        controller.abort()
       }
     })()
     return output

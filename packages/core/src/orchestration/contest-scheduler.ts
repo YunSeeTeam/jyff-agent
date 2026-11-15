@@ -1,16 +1,7 @@
-import type { CtfSolverAgent, SolverCloseReason } from "@ctf-agent/agents"
+import type { CtfSolverAgent } from "@ctf-agent/agents"
 import type { ChallengeSummary } from "@ctf-agent/platform"
-import {
-  BLOCKED_FINALIZATION_PROMPT,
-  INCOMPLETE_CONTINUATION_PROMPT,
-  WRITEUP_PROMPT,
-} from "@ctf-agent/prompts"
+import { INCOMPLETE_CONTINUATION_PROMPT, WRITEUP_PROMPT } from "@ctf-agent/prompts"
 import type { AgentOptions } from "@earendil-works/pi-agent-core"
-import {
-  SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
-  subagentSnapshot,
-  subagentSnapshotPrompt,
-} from "../collaboration/subagent-projection.ts"
 import type {
   RunRecord,
   RunSource,
@@ -19,12 +10,7 @@ import type {
   SchedulerQueueStage,
 } from "../persistence/run-store.ts"
 import type { CreateSolverOptions, Project } from "../project/project.ts"
-import {
-  ChallengeTimeoutError,
-  hasTerminalSubmission,
-  runSolverPrompt,
-  sessionInterruptionMessage,
-} from "./solver-attempt.ts"
+import { hasTerminalSubmission, runSolverPrompt } from "./solver-attempt.ts"
 import { classifySolverStop } from "./stop-classifier.ts"
 import { validateChallengeWriteup } from "./writeup-validator.ts"
 
@@ -34,9 +20,6 @@ export type SchedulerRuntimeState = "stopped" | "running" | "automatic" | "suspe
 
 export interface ContestSchedulerOptions {
   maxConcurrent: number
-  maxAttempts?: number
-  maxSessionInterruptions?: number
-  challengeTimeoutMs?: number
   abortGraceMs?: number
   retryDelayMs?: number
   infrastructureRetryDelayMs?: number
@@ -94,12 +77,11 @@ export interface ContestSchedulerSnapshot {
   idleVersion: number
   executionVersion: number
   maxConcurrent: number
-  maxAttempts: number
-  maxSessionInterruptions: number
   idle: SchedulerQueueEntry[]
   queued: SchedulerQueueEntry[]
   active: SchedulerActiveEntry[]
   lastError?: string
+  goals: import("../persistence/solve-goals.ts").SolveGoal[]
 }
 
 export class ContestSchedulerError extends Error {
@@ -112,7 +94,6 @@ export class ContestSchedulerError extends Error {
       | "already_queued"
       | "already_active"
       | "already_solved"
-      | "attempts_exhausted"
       | "blocked"
       | "excluded"
       | "auto_enabled"
@@ -134,8 +115,6 @@ interface QueueItem {
   requiresAuto: boolean
   enqueuedAt: string
   version: number
-  /** retryAttempt() 的恢复项只存在内存；自动恢复项仍需跟随持久队列。 */
-  persisted?: boolean
   resumeRun?: RunRecord
   retryPrompt?: string
   writeupRetry?: boolean
@@ -152,12 +131,13 @@ interface ActiveItem {
   runId: string | null
   solver?: CtfSolverAgent
   cancelRequested: boolean
-  queueGeneration: number
   operation?: Promise<void>
   resumeRun?: RunRecord
   retryPrompt?: string
   writeupRetry?: boolean
   cancelRetryDelay?: () => void
+  controller: AbortController
+  postprocessing?: boolean
 }
 
 export const DEFAULT_TRANSIENT_RETRY_DELAYS_MS = [10_000, 60_000, 300_000] as const
@@ -169,6 +149,7 @@ const RECOVERABLE_TERMINAL_RUN_STATUSES = new Set<RunRecord["status"]>([
   "cancelled",
   "closed",
   "interrupted",
+  "blocked",
 ])
 
 /**
@@ -176,7 +157,7 @@ const RECOVERABLE_TERMINAL_RUN_STATUSES = new Set<RunRecord["status"]>([
  * - manual 模式只执行用户从空闲队列提交的题目；automatic 模式持续补充全部可调度题；
  * - 暂停保留空闲/执行队列且不取消已经运行的任务；
  * - 同题在 idle/execution/active 阶段互斥；
- * - 失败按调度来源计入重试预算，direct/test Run 不消耗预算。
+ * - 求解意图跨 Run/重启保存，只有判题确认或人工停止才结束目标。
  */
 export class ContestScheduler {
   private readonly idleQueue: QueueItem[] = []
@@ -188,11 +169,12 @@ export class ContestScheduler {
   private pumping = false
   private lastError?: string
   private maxConcurrent: number
-  private queueGeneration = 0
+  private wakeTimer?: NodeJS.Timeout
   private suspensionReason?: string
   private discoveringAdmission = false
   /** 正在被 resetChallenge 清空的题目：任何在途 reconcile/pump 都必须跳过，避免 wipe 期间重建 Run。 */
   private readonly resetting = new Set<string>()
+  private readonly stopVersions = new Map<string, number>()
   private readonly admissionDiscoveryRetryAt = new Map<string, number>()
   private readonly unsubscribeRemoteEnvironmentCapacity: () => void
 
@@ -203,9 +185,6 @@ export class ContestScheduler {
     positiveInteger(options.maxConcurrent, "maxConcurrent")
     this.mode = project.schedulerState().mode
     this.maxConcurrent = options.maxConcurrent
-    positiveInteger(options.maxAttempts ?? 2, "maxAttempts")
-    positiveInteger(options.maxSessionInterruptions ?? 3, "maxSessionInterruptions")
-    positiveInteger(options.challengeTimeoutMs ?? 30 * 60_000, "challengeTimeoutMs")
     nonNegativeInteger(options.abortGraceMs ?? 5_000, "abortGraceMs")
     nonNegativeInteger(options.retryDelayMs ?? 2_000, "retryDelayMs")
     nonNegativeInteger(options.infrastructureRetryDelayMs ?? 15_000, "infrastructureRetryDelayMs")
@@ -253,13 +232,15 @@ export class ContestScheduler {
     const queued = usePersistedFallback
       ? this.project.schedulerQueue("execution").map(persistedEntry)
       : this.queue.map(entry)
-    const runtimeState: SchedulerRuntimeState = this.suspensionReason
-      ? "suspended"
-      : this.mode === "automatic"
-        ? "automatic"
-        : this.mode === "manual"
-          ? "running"
-          : "stopped"
+    const paused = this.project.solveGoals.list().find((goal) => goal.state === "paused")
+    const runtimeState: SchedulerRuntimeState =
+      this.suspensionReason || paused
+        ? "suspended"
+        : this.mode === "automatic"
+          ? "automatic"
+          : this.mode === "manual"
+            ? "running"
+            : "stopped"
     return {
       available: availability.available,
       ...(availability.unavailableReason
@@ -271,8 +252,6 @@ export class ContestScheduler {
       idleVersion: state.idleVersion,
       executionVersion: state.executionVersion,
       maxConcurrent: this.maxConcurrent,
-      maxAttempts: this.options.maxAttempts ?? 2,
-      maxSessionInterruptions: this.options.maxSessionInterruptions ?? 3,
       idle,
       queued,
       active: [...this.active.values()].map((item) => ({
@@ -283,7 +262,10 @@ export class ContestScheduler {
         phase: item.phase,
         startedAt: item.startedAt,
       })),
-      ...(this.lastError ? { lastError: this.lastError } : {}),
+      ...((this.lastError ?? paused?.reason)
+        ? { lastError: this.lastError ?? paused!.reason! }
+        : {}),
+      goals: this.project.solveGoals.list(),
     }
   }
 
@@ -330,8 +312,20 @@ export class ContestScheduler {
   }
 
   /** 平台恢复后继续处理挂起前保留的队列。 */
-  resume(): ContestSchedulerSnapshot {
+  resume(options: { configuration?: boolean } = {}): ContestSchedulerSnapshot {
     this.suspensionReason = undefined
+    if (options.configuration !== false) {
+      for (const goal of this.project.solveGoals.list()) {
+        if (goal.state === "paused")
+          this.project.solveGoals.update(goal.id, {
+            state: "active",
+            failures: 0,
+            reason: null,
+            retryAt: null,
+          })
+      }
+      this.lastError = undefined
+    }
     this.pump()
     return this.snapshot()
   }
@@ -352,6 +346,7 @@ export class ContestScheduler {
     if (this.shuttingDown || !this.availability().available) return this.snapshot()
     await this.project.refresh()
     const challenges = deduplicate(await this.project.challenges())
+    if (this.shuttingDown || !this.availability().available) return this.snapshot()
     const byId = new Map(challenges.map((challenge) => [challenge.id, challenge]))
     const invalid = (challengeId: string): boolean => {
       const challenge = byId.get(challengeId)
@@ -367,21 +362,32 @@ export class ContestScheduler {
     for (const items of [this.idleQueue, this.queue]) {
       for (let index = items.length - 1; index >= 0; index--) {
         const item = items[index]
-        if (!item || !invalid(item.challenge.id)) continue
+        if (!item || item.writeupRetry || !invalid(item.challenge.id)) continue
         items.splice(index, 1)
-        if (item.persisted !== false) this.project.removeSchedulerChallenge(item.challenge.id)
+        this.project.removeSchedulerChallenge(item.challenge.id)
       }
     }
 
     for (const persisted of this.project.schedulerQueue()) {
       if (this.resetting.has(persisted.challengeId)) continue
       const challenge = byId.get(persisted.challengeId)
-      if (!challenge || invalid(persisted.challengeId)) {
+      if (!challenge || (!persisted.writeupRetry && invalid(persisted.challengeId))) {
         this.project.removeSchedulerChallenge(persisted.challengeId)
         continue
       }
       if (this.hasChallenge(persisted.challengeId)) continue
-      const resumeRun = recoverableRuns.get(persisted.challengeId)
+      if (this.project.solveGoals.get(persisted.challengeId)?.state === "stopped") {
+        this.project.removeSchedulerChallenge(persisted.challengeId)
+        continue
+      }
+      const resumeRun = persisted.resumeRunId
+        ? this.project
+            .runs({ challengeId: persisted.challengeId })
+            .find((run) => run.id === persisted.resumeRunId)
+        : (this.project
+            .runs({ challengeId: persisted.challengeId })
+            .find((run) => run.id === this.project.solveGoals.get(persisted.challengeId)?.runId) ??
+          recoverableRuns.get(persisted.challengeId))
       if (resumeRun) recoverableRuns.delete(persisted.challengeId)
       const item: QueueItem = {
         challenge,
@@ -389,14 +395,58 @@ export class ContestScheduler {
         stage: persisted.stage,
         lane: persisted.lane,
         manualOverride: persisted.manualOverride,
-        requiresAuto: true,
+        requiresAuto: persisted.requiresAuto,
         enqueuedAt: persisted.enqueuedAt,
         version: persisted.version,
-        persisted: true,
         ...(resumeRun ? { resumeRun } : {}),
+        ...(persisted.retryPrompt ? { retryPrompt: persisted.retryPrompt } : {}),
+        ...(persisted.writeupRetry ? { writeupRetry: true } : {}),
       }
       if (persisted.stage === "idle") this.idleQueue.push(item)
       else this.queue.push(item)
+    }
+
+    for (const goal of this.project.solveGoals.list()) {
+      const challenge = byId.get(goal.challengeId)
+      if (!challenge || this.resetting.has(goal.challengeId)) continue
+      if (invalid(goal.challengeId)) {
+        if (challenge.solved || this.project.isChallengeSolved(goal.challengeId)) {
+          this.project.solveGoals.update(goal.id, {
+            state: "accepted",
+            retryAt: null,
+            reason: null,
+          })
+          const active = this.active.get(goal.challengeId)
+          if (
+            active &&
+            !active.postprocessing &&
+            !(active.solver && hasTerminalSubmission(active.solver)) &&
+            !this.hasRecordedSolveOutcome(goal.challengeId, active.runId ?? "")
+          ) {
+            active.controller.abort()
+            active.cancelRetryDelay?.()
+          }
+        }
+        continue
+      }
+      if (
+        (goal.state !== "active" && goal.state !== "paused") ||
+        this.hasChallenge(goal.challengeId)
+      )
+        continue
+      const runs = this.project.runs({ challengeId: goal.challengeId })
+      const resumeRun = goal.runId
+        ? runs.find((run) => run.id === goal.runId)
+        : latestRecoverableRun(runs)
+      this.enqueueChallenge(
+        challenge,
+        "retry",
+        "execution",
+        "normal",
+        false,
+        goal.requiresAuto,
+        resumeRun ? { resumeRun } : {},
+      )
     }
 
     if (this.mode !== "stopped") {
@@ -405,6 +455,7 @@ export class ContestScheduler {
         if (
           !challenge ||
           invalid(challenge.id) ||
+          this.project.solveGoals.get(challenge.id)?.state === "stopped" ||
           this.project.isChallengeBlocked(challenge.id) ||
           this.hasChallenge(challenge.id)
         ) {
@@ -418,6 +469,7 @@ export class ContestScheduler {
       for (const challenge of challenges) {
         if (
           this.resetting.has(challenge.id) ||
+          this.project.solveGoals.get(challenge.id)?.state === "stopped" ||
           challenge.solved ||
           this.project.isChallengeSolved(challenge.id) ||
           this.project.isChallengeSchedulingExcluded(challenge.id) ||
@@ -432,6 +484,7 @@ export class ContestScheduler {
       const ordinaryOutstanding = challenges.some(
         (challenge) =>
           !this.resetting.has(challenge.id) &&
+          this.project.solveGoals.get(challenge.id)?.state !== "stopped" &&
           !challenge.solved &&
           !this.project.isChallengeSolved(challenge.id) &&
           !this.project.isChallengeSchedulingExcluded(challenge.id) &&
@@ -442,6 +495,7 @@ export class ContestScheduler {
           .filter(
             (challenge) =>
               !this.resetting.has(challenge.id) &&
+              this.project.solveGoals.get(challenge.id)?.state !== "stopped" &&
               !challenge.solved &&
               !this.project.isChallengeSchedulingExcluded(challenge.id) &&
               this.project.isChallengeBlocked(challenge.id) &&
@@ -466,6 +520,7 @@ export class ContestScheduler {
     this.assertNotShuttingDown()
     this.assertPlanningStopped()
     const uniqueIds = [...new Set(challengeIds)]
+    const versions = new Map(uniqueIds.map((id) => [id, this.stopVersions.get(id)]))
     if (uniqueIds.length === 0) return this.snapshot()
     await this.reconcile()
     const challenges = new Map((await this.project.challenges()).map((item) => [item.id, item]))
@@ -484,6 +539,8 @@ export class ContestScheduler {
     }> = []
 
     for (const challengeId of uniqueIds) {
+      if (this.stopVersions.get(challengeId) !== versions.get(challengeId))
+        throw new ContestSchedulerError("unavailable", "编排期间该题已被停止")
       if (this.active.has(challengeId)) {
         throw new ContestSchedulerError("already_active", `${challengeId} 已有正在运行的 Agent`)
       }
@@ -528,6 +585,7 @@ export class ContestScheduler {
       if (challenge) additions.push({ challenge, record })
     }
     for (const { challenge, record } of additions) {
+      this.project.solveGoals.begin(challenge.id, true)
       if (this.hasChallenge(challenge.id)) continue
       this.idleQueue.push({
         challenge,
@@ -538,7 +596,6 @@ export class ContestScheduler {
         requiresAuto: true,
         enqueuedAt: record.enqueuedAt,
         version: record.version,
-        persisted: true,
       })
     }
     return this.snapshot()
@@ -551,7 +608,20 @@ export class ContestScheduler {
     this.project.removeSchedulerChallenges([...ids], "idle")
     for (let index = this.idleQueue.length - 1; index >= 0; index--) {
       const item = this.idleQueue[index]
-      if (item && ids.has(item.challenge.id)) this.idleQueue.splice(index, 1)
+      if (item && ids.has(item.challenge.id)) {
+        this.stopVersions.set(
+          item.challenge.id,
+          (this.stopVersions.get(item.challenge.id) ?? 0) + 1,
+        )
+        const goal = this.project.solveGoals.get(item.challenge.id)
+        if (goal)
+          this.project.solveGoals.update(goal.id, {
+            state: "stopped",
+            reason: "已移出空闲队列",
+            retryAt: null,
+          })
+        this.idleQueue.splice(index, 1)
+      }
     }
     return this.snapshot()
   }
@@ -586,6 +656,7 @@ export class ContestScheduler {
   ): Promise<ContestSchedulerSnapshot> {
     this.assertAvailable()
     this.assertNotShuttingDown()
+    const stopVersion = this.stopVersions.get(challengeId)
     if (this.active.has(challengeId)) {
       throw new ContestSchedulerError("already_active", "该题已有正在运行的 Agent")
     }
@@ -599,6 +670,7 @@ export class ContestScheduler {
     const challenge = (await this.project.challenges()).find(
       (candidate) => candidate.id === challengeId,
     )
+    this.assertAdmissionCurrent(challengeId, stopVersion)
     if (!challenge) {
       throw new ContestSchedulerError("challenge_not_found", `平台不存在题目: ${challengeId}`)
     }
@@ -623,6 +695,7 @@ export class ContestScheduler {
       )
     }
     const resumeRun = blocked ? undefined : latestRecoverableRun(this.project.runs({ challengeId }))
+    this.project.solveGoals.begin(challenge.id, false)
     this.enqueueChallenge(
       challenge,
       blocked ? "revival" : "manual",
@@ -665,10 +738,12 @@ export class ContestScheduler {
     if (prompt && prompt.length > 32_000) {
       throw new Error("重试提示词长度不能超过 32000")
     }
+    const stopVersion = this.stopVersions.get(run.challengeId)
     await this.project.refresh()
     const challenge = (await this.project.challenges()).find(
       (candidate) => candidate.id === run.challengeId,
     )
+    this.assertAdmissionCurrent(run.challengeId, stopVersion)
     if (!challenge) {
       throw new ContestSchedulerError("challenge_not_found", `平台不存在题目: ${run.challengeId}`)
     }
@@ -684,20 +759,21 @@ export class ContestScheduler {
       throw new ContestSchedulerError("already_solved", "该题已经解出")
     }
     const blocked = this.project.isChallengeBlocked(run.challengeId)
-    this.queue.unshift({
+    if (!writeupRetry || !this.project.solveGoals.get(challenge.id))
+      this.project.solveGoals.begin(challenge.id, false)
+    this.enqueueChallenge(
       challenge,
-      source: "retry",
-      stage: "execution",
-      lane: blocked ? "blocked" : "normal",
-      manualOverride: true,
-      requiresAuto: false,
-      enqueuedAt: new Date().toISOString(),
-      version: 1,
-      persisted: false,
-      resumeRun: run,
-      ...(prompt ? { retryPrompt: prompt } : {}),
-      ...(writeupRetry ? { writeupRetry: true } : {}),
-    })
+      "retry",
+      "execution",
+      blocked ? "blocked" : "normal",
+      true,
+      false,
+      {
+        resumeRun: run,
+        ...(prompt ? { retryPrompt: prompt } : {}),
+        ...(writeupRetry ? { writeupRetry: true } : {}),
+      },
+    )
     this.pump()
     return this.snapshot()
   }
@@ -713,20 +789,6 @@ export class ContestScheduler {
     const item = this.queue.find((candidate) => candidate.challenge.id === challengeId)
     if (!item) {
       throw new ContestSchedulerError("challenge_not_found", `题目不在调度队列中: ${challengeId}`)
-    }
-    if (item.resumeRun && item.persisted === false) {
-      if (item.version !== options.expectedVersion) {
-        throw new ContestSchedulerError(
-          "queue_version_conflict",
-          `queue version conflict: expected ${options.expectedVersion}, actual ${item.version}`,
-        )
-      }
-      const from = this.queue.indexOf(item)
-      this.queue.splice(from, 1)
-      const target = Math.max(0, Math.min(this.queue.length, options.position - 1))
-      this.queue.splice(target, 0, item)
-      item.version += 1
-      return this.snapshot()
     }
     let moved: SchedulerQueueRecord
     try {
@@ -744,7 +806,7 @@ export class ContestScheduler {
     }
     item.manualOverride = moved.manualOverride
     item.version = moved.version
-    item.requiresAuto = item.requiresAuto && !moved.manualOverride
+    item.requiresAuto = moved.requiresAuto
     const persisted = this.project.schedulerQueue("execution")
     this.syncPersistedQueueMetadata(persisted)
     const order = new Map(persisted.map((record, index) => [record.challengeId, index]))
@@ -767,7 +829,6 @@ export class ContestScheduler {
   ): void {
     const byId = new Map(records.map((record) => [record.challengeId, record]))
     for (const item of [...this.idleQueue, ...this.queue]) {
-      if (item.resumeRun && item.persisted === false) continue
       const record = byId.get(item.challenge.id)
       if (!record) continue
       item.stage = record.stage
@@ -775,11 +836,20 @@ export class ContestScheduler {
       item.manualOverride = record.manualOverride
       item.enqueuedAt = record.enqueuedAt
       item.version = record.version
-      item.requiresAuto = item.requiresAuto && !record.manualOverride
+      item.requiresAuto = record.requiresAuto
     }
   }
 
   async cancel(challengeId: string): Promise<ContestSchedulerSnapshot> {
+    this.stopVersions.set(challengeId, (this.stopVersions.get(challengeId) ?? 0) + 1)
+    const goal =
+      this.project.solveGoals.get(challengeId) ?? this.project.solveGoals.begin(challengeId, false)
+    this.project.solveGoals.update(goal.id, {
+      state: "stopped",
+      reason: "由控制面停止",
+      retryAt: null,
+    })
+    this.project.removeSchedulerChallenge(challengeId)
     const idleIndex = this.idleQueue.findIndex((item) => item.challenge.id === challengeId)
     if (idleIndex >= 0) {
       this.idleQueue.splice(idleIndex, 1)
@@ -788,15 +858,13 @@ export class ContestScheduler {
     }
     const queueIndex = this.queue.findIndex((item) => item.challenge.id === challengeId)
     if (queueIndex >= 0) {
-      const [removed] = this.queue.splice(queueIndex, 1)
-      if (removed && removed.persisted !== false) {
-        this.project.removeSchedulerChallenge(challengeId)
-      }
+      this.queue.splice(queueIndex, 1)
       return this.snapshot()
     }
     const active = this.active.get(challengeId)
     if (!active) return this.snapshot()
     active.cancelRequested = true
+    active.controller.abort()
     active.phase = "cancelling"
     active.cancelRetryDelay?.()
     const failures: unknown[] = []
@@ -838,6 +906,7 @@ export class ContestScheduler {
 
   /** 完全重置单题：终止活跃/排队 Run，清空本地状态，自动模式开启则按新题重新入队。 */
   async resetChallenge(challengeId: string): Promise<ContestSchedulerSnapshot> {
+    this.stopVersions.set(challengeId, (this.stopVersions.get(challengeId) ?? 0) + 1)
     this.resetting.add(challengeId)
     try {
       // (a) 摘除内存队列项 + 持久化 scheduler_queue 行（含 resumeRun：其指向的 Run 即将被删）
@@ -851,6 +920,7 @@ export class ContestScheduler {
       const active = this.active.get(challengeId)
       if (active) {
         active.cancelRequested = true
+        active.controller.abort()
         active.phase = "cancelling"
         active.cancelRetryDelay?.()
         await active.solver?.abort()
@@ -878,6 +948,7 @@ export class ContestScheduler {
 
   private async performShutdown(): Promise<void> {
     this.shuttingDown = true
+    clearTimeout(this.wakeTimer)
     this.unsubscribeRemoteEnvironmentCapacity()
     this.mode = "stopped"
     this.idleQueue.length = 0
@@ -885,6 +956,7 @@ export class ContestScheduler {
     const active = [...this.active.values()]
     for (const item of active) {
       item.cancelRequested = true
+      item.controller.abort()
       item.phase = "cancelling"
       item.cancelRetryDelay?.()
     }
@@ -923,6 +995,14 @@ export class ContestScheduler {
     )
   }
 
+  private assertAdmissionCurrent(challengeId: string, stopVersion: number | undefined): void {
+    this.assertNotShuttingDown()
+    if (this.resetting.has(challengeId) || this.stopVersions.get(challengeId) !== stopVersion)
+      throw new ContestSchedulerError("unavailable", "入队期间该题已被停止或重置")
+    if (this.hasChallenge(challengeId))
+      throw new ContestSchedulerError("already_queued", "该题已有正在执行或排队的求解目标")
+  }
+
   private pump(): void {
     if (this.pumping || this.shuttingDown || !this.availability().available) return
     this.pumping = true
@@ -949,11 +1029,13 @@ export class ContestScheduler {
           startedAt: new Date().toISOString(),
           runId: null,
           cancelRequested: false,
-          queueGeneration: this.queueGeneration,
+          controller: new AbortController(),
           ...(item.resumeRun ? { resumeRun: item.resumeRun } : {}),
           ...(item.retryPrompt ? { retryPrompt: item.retryPrompt } : {}),
           ...(item.writeupRetry ? { writeupRetry: true } : {}),
         }
+        if (!item.writeupRetry || !this.project.solveGoals.get(item.challenge.id))
+          this.project.solveGoals.begin(item.challenge.id, item.requiresAuto)
         this.active.set(item.challenge.id, active)
         const operation = this.runItem(active)
           .catch((error: unknown) => {
@@ -962,505 +1044,309 @@ export class ContestScheduler {
           .finally(() => {
             this.active.delete(item.challenge.id)
             this.pump()
-            if (this.mode !== "stopped") void this.reconcile()
+            void this.reconcile().catch((error: unknown) => {
+              this.lastError = errorText(error)
+            })
           })
         active.operation = operation
       }
     } finally {
       this.pumping = false
+      clearTimeout(this.wakeTimer)
+      const next = this.project.solveGoals
+        .list()
+        .filter(
+          (goal) =>
+            goal.state === "active" &&
+            goal.retryAt &&
+            this.queue.some((item) => item.challenge.id === goal.challengeId),
+        )
+        .map((goal) => Date.parse(goal.retryAt!))
+        .filter((at) => at > Date.now())
+        .sort((a, b) => a - b)[0]
+      if (next !== undefined)
+        this.wakeTimer = setTimeout(() => this.pump(), Math.min(next - Date.now(), 2_147_483_647))
     }
   }
 
   private async runItem(active: ActiveItem): Promise<void> {
-    const schedulerAttemptsBefore = this.project.schedulerAttemptCount(active.challenge.id)
-    let failureReason: SolverCloseReason | undefined
-    let failureMessage: string | undefined
-    let retryableFailure = false
-    let continuation = active.source === "retry" || active.resumeRun !== undefined
     let solver: CtfSolverAgent | undefined
-    let sameRunStops = 0
-    let compactRecovery: string | undefined
-    let transientRetries = 0
-    let transientRetriesExhausted = false
-    const transientRetryDelays =
-      this.options.transientRetryDelaysMs ?? DEFAULT_TRANSIENT_RETRY_DELAYS_MS
-
-    if (active.lane === "blocked" && this.project.isChallengeBlocked(active.challenge.id)) {
-      this.project.reviveChallenge(active.challenge.id)
-    }
-
-    while (!active.cancelRequested && !this.shuttingDown) {
-      let context: SchedulerAttemptContext | undefined
-      try {
-        if (!solver) {
-          const resumed = active.resumeRun
-          active.attempt = resumed?.attempt ?? this.project.nextAttempt(active.challenge.id)
-          const source: SchedulerQueueSource = resumed
-            ? "retry"
-            : continuation
-              ? "retry"
-              : active.source
-          active.source = source
-          context = {
-            challenge: active.challenge,
-            attempt: active.attempt,
-            source,
+    let continuation = active.source === "retry" || active.resumeRun !== undefined
+    let failures = this.project.solveGoals.get(active.challenge.id)?.failures ?? 0
+    let progress = 0
+    let unsubscribe: (() => void) | undefined
+    const delays = this.options.transientRetryDelaysMs ?? DEFAULT_TRANSIENT_RETRY_DELAYS_MS
+    const goal = this.project.solveGoals.get(active.challenge.id)!
+    const canContinue = () =>
+      !active.cancelRequested &&
+      !this.shuttingDown &&
+      this.project.solveGoals.get(active.challenge.id)?.id === goal.id &&
+      this.project.solveGoals.get(active.challenge.id)?.state === "active"
+    try {
+      while (
+        canContinue() ||
+        ((active.writeupRetry || (solver && hasTerminalSubmission(solver))) &&
+          !active.cancelRequested &&
+          !this.shuttingDown)
+      ) {
+        const before = progress
+        try {
+          if (!solver) {
+            const resumed = active.resumeRun
+            if (this.project.isChallengeBlocked(active.challenge.id))
+              this.project.reviveChallenge(active.challenge.id)
+            const agent = await this.options.createAgentOptions({
+              challenge: active.challenge,
+              attempt: active.attempt,
+              source: active.source,
+            })
+            if (active.cancelRequested || this.shuttingDown) return
+            const options: CreateSolverOptions = {
+              agent,
+              compaction: false,
+              writeup: this.options.writeup === true,
+              executionGate: this.executionGate(active),
+              requestGuard: {
+                signal: active.controller.signal,
+                canSend: () =>
+                  !active.cancelRequested &&
+                  !this.shuttingDown &&
+                  !this.suspensionReason &&
+                  (active.postprocessing ||
+                    this.project.solveGoals.get(active.challenge.id)?.state === "active"),
+              },
+            }
+            solver = resumed
+              ? await this.project.resumeSolver(resumed.id, options)
+              : await this.project.createSolver(active.challenge.id, {
+                  ...options,
+                  attempt: active.attempt,
+                  source: active.source,
+                })
+            active.resumeRun = undefined
+            active.solver = solver
+            active.runId = solver.runId
+            active.phase = "running"
+            this.project.solveGoals.update(goal.id, {
+              runId: solver.runId,
+              reason: null,
+              retryAt: null,
+            })
+            // Explicit retry instructions remain durable until the first prompt
+            // has reached the session, including crashes during preparation/compaction.
+            if (!active.retryPrompt && !active.writeupRetry)
+              this.project.removeSchedulerChallenge(active.challenge.id)
+            unsubscribe = solver.subscribe((event) => {
+              if (
+                event.type === "tool_execution_end" ||
+                (event.type === "message_end" &&
+                  event.message.role === "assistant" &&
+                  event.message.stopReason !== "error" &&
+                  event.message.stopReason !== "aborted")
+              )
+                progress++
+            })
+            if (active.cancelRequested || this.shuttingDown) return
           }
-          const agent = await this.options.createAgentOptions(context)
-          if (active.cancelRequested) return
-          solver = resumed
-            ? await this.project.resumeSolver(resumed.id, {
-                agent,
-                // Supervisor 统一管理 compact 边界，BaseAgent 不得隐式 compact。
-                compaction: false,
-                writeup: this.options.writeup === true,
-                executionGate: this.executionGate(active),
-              })
-            : await this.project.createSolver(active.challenge.id, {
-                agent,
-                compaction: false,
-                attempt: active.attempt,
-                source,
-                writeup: this.options.writeup === true,
-                executionGate: this.executionGate(active),
-              })
-          active.resumeRun = undefined
-          this.lastError = undefined
-          active.solver = solver
-          active.runId = solver.runId
-          active.phase = "running"
-          this.project.removeSchedulerChallenge(active.challenge.id)
-          if (active.cancelRequested) {
-            await solver.close("cancelled", "在沙箱准备阶段被控制面取消")
-            return
-          }
-          if (active.writeupRetry) {
+          if (
+            active.writeupRetry ||
+            hasTerminalSubmission(solver) ||
+            this.hasRecordedSolveOutcome(active.challenge.id, solver.runId)
+          ) {
             active.writeupRetry = false
-            const retryPrompt = active.retryPrompt
-            active.retryPrompt = undefined
-            await this.writeupAfterSubmission(active, solver, retryPrompt)
+            active.postprocessing = true
+            this.project.solveGoals.update(goal.id, {
+              state: "accepted",
+              reason: null,
+              retryAt: null,
+            })
+            if (this.options.writeup)
+              await this.writeupAfterSubmission(active, solver, active.retryPrompt)
+            else await solver.close("submitted")
             return
           }
-        }
-        const pressure = await solver.contextPressure()
-        if (pressure.shouldCompact) {
-          const runtime = this.project.challengeRuntimeState(active.challenge.id)
-          const eventKey = `${solver.runId}:compact:${this.project.runEvents(solver.runId).length}`
-          const canCompact =
-            !runtime.blocked && runtime.blockScore + 2 <= runtime.effectiveBlockThreshold
-          if (!canCompact) {
-            const blockEvent = this.project.recordChallengeBlockEvent({
-              challengeId: active.challenge.id,
-              runId: solver.runId,
-              eventKey,
-              delta: 2,
-              reason: "context_pressure",
-              compactPerformed: false,
-            })
-            this.project.appendRunEvent(solver.runId, "solver_compaction", {
-              eventKey,
-              compactPerformed: false,
-              scoreAfter: blockEvent.scoreAfter,
-            })
-            await this.finalizeBlockedRun(
-              active,
-              solver,
-              "Context pressure exceeded the block threshold before compaction",
-            )
-            solver = undefined
-            active.solver = undefined
-            return
-          }
-          try {
+          if (!this.availability().available) return
+          let recovery = ""
+          if ((await solver.contextPressure()).shouldCompact) {
             await solver.compact()
-          } catch (error) {
-            const blockEvent = this.project.recordChallengeBlockEvent({
-              challengeId: active.challenge.id,
-              runId: solver.runId,
-              eventKey,
-              delta: 2,
-              reason: "compaction_failed",
-              compactPerformed: false,
+            progress++
+            this.project.appendRunEvent(solver.runId, "solver_compaction", {
+              compactPerformed: true,
+              blockDelta: 0,
             })
-            this.project.appendRunEvent(solver.runId, "block_finalization_failed", {
-              eventKey,
-              scoreAfter: blockEvent.scoreAfter,
-              error: errorText(error),
-            })
-            await this.finalizeBlockedRun(active, solver, errorText(error))
-            solver = undefined
-            active.solver = undefined
-            return
+            recovery = this.project.compactRecoveryPrompt(active.challenge.id, solver.runId)
           }
-          const blockEvent = this.project.recordChallengeBlockEvent({
-            challengeId: active.challenge.id,
-            runId: solver.runId,
-            eventKey,
-            delta: 2,
-            reason: "context_pressure",
-            compactPerformed: true,
-          })
-          this.project.appendRunEvent(solver.runId, "solver_compaction", {
-            eventKey,
-            compactPerformed: true,
-            scoreAfter: blockEvent.scoreAfter,
-          })
-          compactRecovery = this.project.compactRecoveryPrompt(active.challenge.id, solver.runId)
-        }
-        const retryPrompt = active.retryPrompt
-        active.retryPrompt = undefined
-        const nextPrompt =
-          retryPrompt ??
-          (continuation
-            ? INCOMPLETE_CONTINUATION_PROMPT
-            : typeof this.options.prompt === "function"
-              ? await this.options.prompt(
-                  context ?? {
+          const prompt =
+            active.retryPrompt ??
+            (continuation
+              ? INCOMPLETE_CONTINUATION_PROMPT
+              : typeof this.options.prompt === "function"
+                ? await this.options.prompt({
                     challenge: active.challenge,
                     attempt: active.attempt,
                     source: active.source,
-                  },
-                )
-              : (this.options.prompt ?? "Start solving this CTF challenge."))
-        const prompt = compactRecovery ? `${compactRecovery}\n\n${nextPrompt}` : nextPrompt
-        compactRecovery = undefined
-        const promptRunId = solver.runId
-        const outcome = await runSolverPrompt({
-          solver,
-          prompt,
-          timeoutMs: this.options.challengeTimeoutMs ?? 30 * 60_000,
-          abortGraceMs: this.options.abortGraceMs ?? 5_000,
-          pauseTimeout: () =>
-            active.phase === "waiting_environment" ||
-            this.project.isWaitingForRemoteEnvironment(promptRunId),
-        })
-        if (outcome.kind === "submitted" || hasTerminalSubmission(solver)) {
-          if (this.options.writeup === true) {
-            await this.writeupAfterSubmission(active, solver)
-          } else {
-            await solver.close("submitted")
-          }
-          return
-        }
-
-        const classification = classifySolverStop({
-          stopReason: outcome.stopReason,
-          ...(outcome.error ? { error: outcome.error } : {}),
-          ...(active.cancelRequested ? { operatorCancel: true } : {}),
-          ...(this.shuttingDown ? { processShutdown: true } : {}),
-        })
-        if (
-          classification.kind === "operator_cancel" ||
-          classification.kind === "process_shutdown"
-        ) {
-          return
-        }
-        if (classification.requiresConfiguration) {
-          const message = `${classification.kind}: ${classification.detail ?? outcome.stopReason}`
-          this.suspend(`LLM 服务需要人工处理: ${message}`)
-          this.project.appendRunEvent(solver.runId, "run_transient_failure", {
-            retryable: false,
-            reason: classification.kind,
-            requiresConfiguration: true,
-            sameAttempt: true,
+                  })
+                : (this.options.prompt ?? "Start solving this CTF challenge."))
+          active.retryPrompt = undefined
+          const outcome = await runSolverPrompt({
+            solver,
+            prompt: recovery ? `${recovery}\n\n${prompt}` : prompt,
+            abortGraceMs: this.options.abortGraceMs ?? 5_000,
+            signal: active.controller.signal,
           })
-          await solver.close("failed", message)
-          solver = undefined
-          active.solver = undefined
-          this.lastError = `${active.challenge.title}: ${message}`
-          return
-        }
-        if (classification.blockDelta === 0) {
-          const message = `${classification.kind}: ${classification.detail ?? outcome.stopReason}`
-          const retryDelay = transientRetryDelays[transientRetries]
-          const retryScheduled = classification.retryable && retryDelay !== undefined
-          const requestAborted = isRequestAborted(
-            classification.detail ?? outcome.error ?? outcome.stopReason,
+          this.project.removeSchedulerChallenge(active.challenge.id)
+          continuation = true
+          if (outcome.kind === "submitted" || hasTerminalSubmission(solver)) continue
+          if (!canContinue()) return
+          if (progress > before) failures = 0
+          const classification = classifySolverStop({
+            stopReason: outcome.stopReason,
+            ...(outcome.error ? { error: outcome.error } : {}),
+          })
+          if (classification.requiresConfiguration) {
+            this.pauseGoal(goal.id, active, classification.detail ?? classification.kind)
+            return
+          }
+          const failed = outcome.stopReason === "error" || outcome.stopReason === "aborted"
+          failures = failed ? failures + 1 : 0
+          if (failed && !classification.retryable && failures >= 3) {
+            this.pauseGoal(goal.id, active, classification.detail ?? classification.kind)
+            return
+          }
+          const delay = failed
+            ? (delays[Math.min(failures - 1, delays.length - 1)] ?? 15_000)
+            : (this.options.retryDelayMs ?? 2_000)
+          this.project.appendRunEvent(
+            solver.runId,
+            failed ? "run_transient_failure" : "solver_continuation",
+            {
+              reason: classification.kind,
+              failureNumber: failures,
+              retryScheduled: true,
+              retryDelayMs: delay,
+              sameAttempt: true,
+              goalId: goal.id,
+            },
           )
-          this.project.appendRunEvent(solver.runId, "run_transient_failure", {
-            retryable: classification.retryable,
-            reason: classification.kind,
-            failureNumber: transientRetries + 1,
-            retryScheduled,
-            retryDelayMs: retryScheduled ? retryDelay : null,
-            sameAttempt: true,
+          this.lastError = failed
+            ? `${active.challenge.title}: ${outcome.error ?? outcome.stopReason}（将恢复求解）`
+            : undefined
+          this.project.solveGoals.update(goal.id, {
+            failures,
+            retryAt: new Date(Date.now() + delay).toISOString(),
+            reason: failed ? (this.lastError ?? null) : null,
           })
-          if (retryScheduled) {
-            transientRetries++
-            continuation = true
-            active.phase = "running"
-            const elapsed = await this.waitForRetryDelay(active, retryDelay)
-            if (!elapsed) return
-            continue
-          }
-          if (requestAborted && classification.retryable) {
-            const interruptionCount = this.project.sessionInterruptionCount(active.challenge.id) + 1
-            const maximum = this.options.maxSessionInterruptions ?? 3
-            const blocked = interruptionCount > maximum
-            const recoveryMessage = sessionInterruptionMessage(
-              "aborted",
-              classification.detail ?? outcome.error,
-              interruptionCount,
-              maximum,
-              blocked,
-            )
-            await solver.close(blocked ? "blocked" : "interrupted", recoveryMessage)
-            solver = undefined
-            active.solver = undefined
-            retryableFailure = false
-            failureReason = blocked ? "blocked" : "interrupted"
-            failureMessage = recoveryMessage
-            if (blocked) this.lastError = `${active.challenge.title}: ${recoveryMessage}`
-            break
-          }
-          await solver.close("failed", message)
-          solver = undefined
-          active.solver = undefined
-          retryableFailure = false
-          transientRetriesExhausted = classification.retryable
-          failureReason = "failed"
-          failureMessage = message
-          if (classification.retryable) break
-          this.lastError = `${active.challenge.title}: ${message}`
-          return
-        }
-
-        sameRunStops += 1
-        const interruptionCount =
-          this.project.sessionInterruptionCount(active.challenge.id) + sameRunStops
-        const maximum = this.options.maxSessionInterruptions ?? 3
-        const eventKey = `${solver.runId}:stop:${this.project.runEvents(solver.runId).length}`
-        const blockEvent = this.project.recordChallengeBlockEvent({
-          challengeId: active.challenge.id,
-          runId: solver.runId,
-          eventKey,
-          delta: classification.blockDelta,
-          reason: classification.kind,
-          compactPerformed: false,
-        })
-        this.project.appendRunEvent(solver.runId, "solver_stop", {
-          eventKey,
-          reason: classification.kind,
-          blockDelta: classification.blockDelta,
-          blocked: this.project.isChallengeBlocked(active.challenge.id),
-        })
-        const blocked =
-          blockEvent.scoreAfter > blockEvent.threshold ||
-          this.project.isChallengeBlocked(active.challenge.id) ||
-          interruptionCount > maximum
-        const message = sessionInterruptionMessage(
-          outcome.stopReason,
-          outcome.error,
-          interruptionCount,
-          maximum,
-          blocked,
-        )
-        if (blocked) {
-          await this.finalizeBlockedRun(active, solver, message)
-          solver = undefined
-          active.solver = undefined
-          this.lastError = `${active.challenge.title}: ${message}`
-          return
-        }
-        continuation = true
-        active.phase = "running"
-      } catch (error) {
-        if (solver && this.hasRecordedSolveOutcome(active.challenge.id, solver.runId)) {
-          // 平台已接受：此后的异常只来自 writeup 或清理，错误已随 Run 持久化。
-          // 不能把它当作求解失败去继续、重试或计入阻塞。
-          this.lastError = `${active.challenge.title}: ${errorText(error)}`
-          if (!solver.isClosed) {
-            try {
-              await solver.close("submitted")
-            } catch {
-              // close 的清理错误由 onClosed 写入 Run，这里不再重复上报。
-            }
-          }
-          solver = undefined
-          active.solver = undefined
-          return
-        }
-        const classification = classifySolverStop({
-          error,
-          ...(active.cancelRequested ? { operatorCancel: true } : {}),
-          ...(error instanceof ChallengeTimeoutError ? { timedOut: true } : {}),
-          ...(this.shuttingDown ? { processShutdown: true } : {}),
-        })
-        retryableFailure = classification.retryable
-        failureReason = active.cancelRequested
-          ? "cancelled"
-          : error instanceof ChallengeTimeoutError
-            ? "timed_out"
-            : "failed"
-        failureMessage = classification.detail ?? errorText(error)
-        if (classification.requiresConfiguration) {
-          this.suspend(
-            classification.kind === "run_configuration"
-              ? `Run 配置需要人工处理: ${failureMessage}`
-              : `LLM 服务需要人工处理: ${failureMessage}`,
-          )
-        }
-        if (
-          solver &&
-          classification.blockDelta === 0 &&
-          classification.retryable &&
-          !active.cancelRequested &&
-          !this.shuttingDown
-        ) {
-          const retryDelay = transientRetryDelays[transientRetries]
-          const retryScheduled = retryDelay !== undefined
-          const requestAborted = isRequestAborted(classification.detail ?? errorText(error))
-          this.project.appendRunEvent(solver.runId, "run_transient_failure", {
-            retryable: true,
-            reason: classification.kind,
-            failureNumber: transientRetries + 1,
-            retryScheduled,
-            retryDelayMs: retryScheduled ? retryDelay : null,
-            sameAttempt: true,
-          })
-          if (retryScheduled) {
-            transientRetries++
-            continuation = true
-            failureReason = undefined
-            failureMessage = undefined
-            retryableFailure = false
-            const elapsed = await this.waitForRetryDelay(active, retryDelay)
-            if (!elapsed) return
-            continue
-          }
-          if (requestAborted) {
-            const interruptionCount = this.project.sessionInterruptionCount(active.challenge.id) + 1
-            const maximum = this.options.maxSessionInterruptions ?? 3
-            const blocked = interruptionCount > maximum
-            const recoveryMessage = sessionInterruptionMessage(
-              "aborted",
-              classification.detail ?? errorText(error),
-              interruptionCount,
-              maximum,
-              blocked,
-            )
-            await solver.close(blocked ? "blocked" : "interrupted", recoveryMessage)
-            solver = undefined
-            active.solver = undefined
-            retryableFailure = false
-            failureReason = blocked ? "blocked" : "interrupted"
-            failureMessage = recoveryMessage
-            break
-          }
-          retryableFailure = false
-        }
-        if (
-          solver &&
-          classification.blockDelta === 1 &&
-          !active.cancelRequested &&
-          !this.shuttingDown
-        ) {
-          const eventKey = `${solver.runId}:stop:${this.project.runEvents(solver.runId).length}`
-          const blockEvent = this.project.recordChallengeBlockEvent({
-            challengeId: active.challenge.id,
-            runId: solver.runId,
-            eventKey,
-            delta: classification.blockDelta,
-            reason: classification.kind,
-            compactPerformed: false,
-          })
-          this.project.appendRunEvent(solver.runId, "solver_stop", {
-            eventKey,
-            reason: classification.kind,
-            blockDelta: classification.blockDelta,
-            blocked: this.project.isChallengeBlocked(active.challenge.id),
-          })
-          sameRunStops += 1
-          const interruptionCount =
-            this.project.sessionInterruptionCount(active.challenge.id) + sameRunStops
-          const maximum = this.options.maxSessionInterruptions ?? 3
+          if (!(await this.waitForRetryDelay(active, delay))) return
+          this.project.solveGoals.update(goal.id, { retryAt: null })
+        } catch (error) {
           if (
-            blockEvent.scoreAfter <= blockEvent.threshold &&
-            !this.project.isChallengeBlocked(active.challenge.id) &&
-            interruptionCount <= maximum
+            solver &&
+            (hasTerminalSubmission(solver) ||
+              this.hasRecordedSolveOutcome(active.challenge.id, solver.runId))
           ) {
-            continuation = true
-            failureReason = undefined
-            failureMessage = undefined
-            retryableFailure = false
-            continue
+            this.project.solveGoals.update(goal.id, {
+              state: "accepted",
+              reason: null,
+              retryAt: null,
+            })
+            this.lastError = `${active.challenge.title}: ${errorText(error)}`
+            return
           }
-          failureReason = "blocked"
-          failureMessage = sessionInterruptionMessage(
-            classification.kind,
-            failureMessage,
-            interruptionCount,
-            maximum,
-            true,
-          )
-        }
-        if (failureReason === "blocked" && solver && !solver.isClosed) {
-          await this.finalizeBlockedRun(active, solver, failureMessage ?? "blocked")
-          solver = undefined
-        } else if (solver && !solver.isClosed) {
-          await solver.close(failureReason, failureMessage)
-          solver = undefined
-        }
-        break
-      } finally {
-        if (!solver) active.solver = undefined
-      }
-    }
-
-    if (active.cancelRequested || this.shuttingDown) return
-
-    const schedulerAttemptsAfter = this.project.schedulerAttemptCount(active.challenge.id)
-    const recoverableRun = latestRecoverableRuns(this.project.runs()).get(active.challenge.id)
-    const resumeRun =
-      active.runId && recoverableRun?.id === active.runId ? recoverableRun : undefined
-    const canResumeRun = resumeRun !== undefined && !hasRunResumed(this.project, resumeRun.id)
-    if (
-      failureReason !== "cancelled" &&
-      failureReason !== "blocked" &&
-      (canResumeRun ||
-        (resumeRun === undefined &&
-          (retryableFailure || schedulerAttemptsAfter > schedulerAttemptsBefore))) &&
-      !this.shuttingDown &&
-      this.availability().available &&
-      active.queueGeneration === this.queueGeneration &&
-      // 瞬时 Provider 故障已经在同一个 Run 内完成有限次退避重试；恢复
-      // 原 Run 同样只占用一次 attempt 预算，且同一个 Run 自动恢复一次后
-      // 不再无限循环。没有可恢复 Run 的创建失败仍受 attempt 预算约束。
-      schedulerAttemptsAfter < (this.options.maxAttempts ?? 2) &&
-      !this.project.isChallengeSolved(active.challenge.id) &&
-      !this.project.isChallengeBlocked(active.challenge.id)
-    ) {
-      if (failureMessage) {
-        this.lastError = `${active.challenge.title}: ${failureMessage}（等待重试）`
-      }
-      const configuredDelay = this.options.retryDelayMs ?? 2_000
-      const delay = retryableFailure
-        ? Math.max(
+          if (!canContinue()) return
+          if (progress > before) failures = 0
+          failures++
+          const classification = classifySolverStop({ error })
+          // A failed creation may already have allocated a durable Run.
+          if (!solver) {
+            const latest = latestRecoverableRun(
+              this.project.runs({ challengeId: active.challenge.id }),
+            )
+            if (latest) this.project.solveGoals.update(goal.id, { runId: latest.id })
+          }
+          if (
+            classification.requiresConfiguration ||
+            (!classification.retryable && failures >= 3)
+          ) {
+            this.pauseGoal(goal.id, active, errorText(error))
+            return
+          }
+          const delay = Math.max(
+            this.options.retryDelayMs ?? 2_000,
             this.options.infrastructureRetryDelayMs ?? 15_000,
-            configuredDelay,
-            ...(transientRetriesExhausted ? [transientRetryDelays.at(-1) ?? 0] : []),
+            delays[Math.min(failures - 1, delays.length - 1)] ?? 0,
           )
-        : configuredDelay
-      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
-      if (
-        !active.cancelRequested &&
-        !this.shuttingDown &&
-        active.queueGeneration === this.queueGeneration &&
-        !this.queue.some((item) => item.challenge.id === active.challenge.id)
-      ) {
-        this.enqueueChallenge(
-          active.challenge,
-          "retry",
-          "execution",
-          active.lane,
-          false,
-          active.requiresAuto,
-          resumeRun ? { resumeRun } : undefined,
-        )
+          this.project.solveGoals.update(goal.id, {
+            failures,
+            retryAt: new Date(Date.now() + delay).toISOString(),
+            reason: errorText(error),
+          })
+          if (!solver) return // Release the slot; the durable goal will re-enter the queue.
+          this.project.appendRunEvent(solver.runId, "run_transient_failure", {
+            reason: classification.kind,
+            failureNumber: failures,
+            retryScheduled: true,
+            retryDelayMs: delay,
+            sameAttempt: true,
+            goalId: goal.id,
+          })
+          continuation = true
+          if (!(await this.waitForRetryDelay(active, delay))) return
+          this.project.solveGoals.update(goal.id, { retryAt: null })
+        }
       }
-    } else if (failureMessage && failureReason !== "cancelled") {
-      this.lastError = `${active.challenge.title}: ${failureMessage}`
+    } finally {
+      unsubscribe?.()
+      try {
+        if (solver && !solver.isClosed)
+          await solver.close(
+            hasTerminalSubmission(solver) ||
+              this.hasRecordedSolveOutcome(active.challenge.id, solver.runId)
+              ? "submitted"
+              : active.cancelRequested && !this.shuttingDown
+                ? "cancelled"
+                : "interrupted",
+            this.project.solveGoals.get(active.challenge.id)?.reason ?? undefined,
+          )
+      } catch (error) {
+        const current = this.project.solveGoals.get(active.challenge.id)
+        if (current?.state === "active")
+          this.pauseGoal(goal.id, active, `资源回收需要处理: ${errorText(error)}`)
+        this.lastError = errorText(error)
+      } finally {
+        active.solver = undefined
+        const current = this.project.solveGoals.get(active.challenge.id)
+        if (current?.state === "accepted" || current?.state === "stopped")
+          this.project.removeSchedulerChallenge(active.challenge.id)
+        if (
+          !this.shuttingDown &&
+          !this.resetting.has(active.challenge.id) &&
+          current?.id === goal.id &&
+          (current.state === "active" || current.state === "paused")
+        ) {
+          const run = current.runId
+            ? this.project
+                .runs({ challengeId: active.challenge.id })
+                .find((candidate) => candidate.id === current.runId)
+            : undefined
+          this.enqueueChallenge(
+            active.challenge,
+            "retry",
+            "execution",
+            "normal",
+            false,
+            current.requiresAuto,
+            run ? { resumeRun: run } : {},
+          )
+        }
+      }
     }
+  }
+
+  private pauseGoal(id: string, active: ActiveItem, reason: string): void {
+    this.project.solveGoals.update(id, { state: "paused", reason, retryAt: null })
+    this.lastError = `${active.challenge.title}: ${reason}（进度已保存，修复后恢复）`
+    if (active.runId)
+      this.project.appendRunEvent(active.runId, "solve_goal_paused", { goalId: id, reason })
   }
 
   private hasRecordedSolveOutcome(challengeId: string, runId: string): boolean {
@@ -1484,7 +1370,7 @@ export class ContestScheduler {
       const outcome = await runSolverPrompt({
         solver,
         prompt,
-        timeoutMs: Math.min(this.options.challengeTimeoutMs ?? 120_000, 120_000),
+        timeoutMs: 120_000,
         abortGraceMs: this.options.abortGraceMs ?? 5_000,
         ignoreExistingSubmission: true,
       })
@@ -1524,65 +1410,6 @@ export class ContestScheduler {
     await solver.close("failed", error)
   }
 
-  private async finalizeBlockedRun(
-    active: ActiveItem,
-    solver: CtfSolverAgent,
-    trigger: string,
-  ): Promise<void> {
-    let finalizationError: string | undefined
-    try {
-      this.project.forceChallengeBlocked({
-        challengeId: active.challenge.id,
-        runId: solver.runId,
-      })
-      await this.project.markRunBlocking(solver.runId, trigger)
-      const records = await this.project.finalizeSubagents(
-        solver.runId,
-        "Report your current objective, verified findings, attempted experiments, exact results, artifacts, and next-step recommendation. Terminate processes you started and remove disposable temporary files; list the exact path and purpose of every retained artifact. Stop investigating after this report.",
-        30_000,
-      )
-      const outcome = await runSolverPrompt({
-        solver,
-        // 收尾指令和 SubAgent 快照属于同一轮，但必须有独立根节点，
-        // 否则 WebUI 会把整条消息误识别为 active_subagents 卡片。
-        prompt: [
-          "<blocked_finalization>",
-          subagentSnapshotPrompt(
-            subagentSnapshot(solver.runId, records, {
-              previewCodePoints: SUBAGENT_MODEL_PREVIEW_CODE_POINTS,
-            }),
-          ),
-          BLOCKED_FINALIZATION_PROMPT,
-          "</blocked_finalization>",
-        ].join("\n\n"),
-        timeoutMs: Math.min(this.options.challengeTimeoutMs ?? 30_000, 30_000),
-        abortGraceMs: this.options.abortGraceMs ?? 5_000,
-      })
-      if (outcome.kind === "submitted" || hasTerminalSubmission(solver)) {
-        await solver.close("submitted")
-        return
-      }
-      if (outcome.stopReason === "error" || outcome.stopReason === "aborted") {
-        finalizationError = outcome.error ?? `Final turn stopped: ${outcome.stopReason}`
-        this.project.appendRunEvent(solver.runId, "block_finalization_failed", {
-          trigger,
-          error: finalizationError,
-        })
-      }
-    } catch (error) {
-      finalizationError = errorText(error)
-      try {
-        this.project.appendRunEvent(solver.runId, "block_finalization_failed", {
-          trigger,
-          error: finalizationError,
-        })
-      } catch {
-        // 保留原始收尾错误，close callback 仍会持久化 Run 终态。
-      }
-    }
-    await solver.close("blocked", finalizationError ?? trigger)
-  }
-
   private enqueueChallenge(
     challenge: ChallengeSummary,
     source: SchedulerQueueSource,
@@ -1590,7 +1417,7 @@ export class ContestScheduler {
     lane: "normal" | "blocked",
     manualOverride: boolean,
     requiresAuto: boolean,
-    options: { resumeRun?: RunRecord } = {},
+    options: { resumeRun?: RunRecord; retryPrompt?: string; writeupRetry?: boolean } = {},
   ): void {
     if (
       this.idleQueue.some((item) => item.challenge.id === challenge.id) ||
@@ -1604,6 +1431,10 @@ export class ContestScheduler {
       stage,
       lane,
       manualOverride,
+      requiresAuto,
+      ...(options.resumeRun ? { resumeRunId: options.resumeRun.id } : {}),
+      ...(options.retryPrompt ? { retryPrompt: options.retryPrompt } : {}),
+      ...(options.writeupRetry ? { writeupRetry: true } : {}),
     })
     const item: QueueItem = {
       challenge,
@@ -1614,8 +1445,7 @@ export class ContestScheduler {
       requiresAuto,
       enqueuedAt: persisted.enqueuedAt,
       version: persisted.version,
-      persisted: true,
-      ...(options.resumeRun ? { resumeRun: options.resumeRun } : {}),
+      ...options,
     }
     const target = stage === "idle" ? this.idleQueue : this.queue
     if (manualOverride) target.unshift(item)
@@ -1632,6 +1462,13 @@ export class ContestScheduler {
   }
 
   private canAdmit(item: QueueItem): boolean {
+    const goal = this.project.solveGoals.get(item.challenge.id)
+    if (
+      !item.writeupRetry &&
+      goal &&
+      (goal.state !== "active" || (goal.retryAt && Date.parse(goal.retryAt) > Date.now()))
+    )
+      return false
     // 本地题和有附件题不消耗“预期远程槽”，可在平台实例已满时继续利用 Sandbox。
     if (item.challenge.needsEnv === false || item.challenge.hasAttachments === true) return true
 
@@ -1702,9 +1539,6 @@ export class ContestScheduler {
 
   private waitForRetryDelay(active: ActiveItem, delayMs: number): Promise<boolean> {
     if (active.cancelRequested || this.shuttingDown) return Promise.resolve(false)
-    if (delayMs === 0) {
-      return Promise.resolve(true)
-    }
     return new Promise((resolve) => {
       let settled = false
       const finish = (elapsed: boolean) => {
@@ -1763,7 +1597,10 @@ function deduplicate(challenges: readonly ChallengeSummary[]): ChallengeSummary[
 }
 
 function latestRecoverableInterruptedRuns(runs: readonly RunRecord[]): Map<string, RunRecord> {
-  return latestRecoverableRuns(runs.filter((run) => run.status === "interrupted"))
+  const candidates = runs
+    .filter((run) => run.status === "interrupted" && isRecoverableRun(run))
+    .sort(compareRunOrder)
+  return new Map(candidates.map((run) => [run.challengeId, run]))
 }
 
 /**
@@ -1776,25 +1613,15 @@ function latestRecoverableRun(runs: readonly RunRecord[]): RunRecord | undefined
   return latest && isRecoverableRun(latest) ? latest : undefined
 }
 
-function latestRecoverableRuns(runs: readonly RunRecord[]): Map<string, RunRecord> {
-  const candidates = runs.filter(isRecoverableRun).sort(compareRunOrder)
-  return new Map(candidates.map((run) => [run.challengeId, run]))
-}
-
 function isRecoverableRun(run: RunRecord): boolean {
   return (
     RECOVERABLE_TERMINAL_RUN_STATUSES.has(run.status) &&
-    run.closeReason !== "blocked" &&
     RECOVERABLE_SCHEDULER_RUN_SOURCES.has(run.source)
   )
 }
 
 function compareRunOrder(left: RunRecord, right: RunRecord): number {
   return left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
-}
-
-function hasRunResumed(project: Project, runId: string): boolean {
-  return project.runEvents(runId).some((event) => event.type === "run_resumed")
 }
 
 const RETRYABLE_RUN_STATUSES = new Set<RunRecord["status"]>([
@@ -1812,13 +1639,6 @@ function positiveInteger(value: number, field: string): void {
 
 function nonNegativeInteger(value: number, field: string): void {
   if (!Number.isInteger(value) || value < 0) throw new Error(`${field} 必须是非负整数`)
-}
-
-function isRequestAborted(detail: string | undefined): boolean {
-  return (
-    /\b(?:request|operation)(?: was)? aborted\b/i.test(detail ?? "") ||
-    /^\s*aborted\s*$/i.test(detail ?? "")
-  )
 }
 
 function errorText(error: unknown): string {

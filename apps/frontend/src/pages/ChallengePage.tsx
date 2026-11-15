@@ -197,6 +197,15 @@ export function ChallengePage() {
             </div>
 
             <TabsContent value="conversation" className="flex min-h-0 flex-1 flex-col">
+              {(selectedRun?.unknownUsageRequests ?? 0) > 0 ? (
+                <p
+                  role="status"
+                  className="border-b border-border bg-warning/5 px-4 py-2 text-xs text-warning"
+                >
+                  有 {selectedRun?.unknownUsageRequests}{" "}
+                  次已发送请求的用量尚未确认；当前统计不代表完整用量或零费用。
+                </p>
+              ) : null}
               {selectedRun ? (
                 <ConversationPanel
                   key={`${rid}:${selectedSubagent?.id ?? "solver"}`}

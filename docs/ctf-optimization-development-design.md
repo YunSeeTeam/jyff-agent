@@ -2,9 +2,9 @@
 
 | 项目     | 内容                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------- |
-| 文档版本 | 1.2（2026-11-15）：撤销产品预算，P3 改为持续求解与故障恢复；1.1 的 Pi 调查保留为历史基线 |
+| 文档版本 | 1.3（2026-11-15）：阶段 4 持续求解/恢复落地；预算只用于独立测试                          |
 | 编制日期 | 2026-11-02                                                                               |
-| 状态     | 开发设计基线；新增接口、迁移和收益尚未实现或验收                                         |
+| 状态     | 阶段 0—4 工程已实现；阶段 3 效果验收受限，阶段 5/6 待实现                                |
 | 需求输入 | `jyff_agent_ctf_optimization_plan_v1.md`（不在本仓库内），以下简称“原方案”               |
 | 代码基线 | `5ae3b9d56fff505dde3e3de60de089a7973eac52`；本次本地 HEAD 与其一致，核查开始时工作树干净 |
 | 读者     | 后端、Agent 运行时、前端、测试、部署维护人员                                             |
@@ -426,7 +426,7 @@ sequenceDiagram
 | P0   | 数据能力登记                 | 新 `runtime_data_capabilities(name PRIMARY KEY, version INTEGER)`，如 accepted-fact-v1、bounded-report-v2；供受控启动/回退检查                                                          |
 | P1   | `run_subagents` 加列         | `execution_id TEXT NULL`、`result_kind TEXT NULL`；旧非空 result 标 legacy                                                                                                              |
 | P1   | 黑板查询索引                 | `challenge_opportunities(challenge_id,id)`，按查询计划确认有必要后加入                                                                                                                  |
-| P3   | 队列/Run 恢复关联            | 持久化 resume_run_id/purpose 和目标状态，具体 DDL 在阶段 4 冻结；不新增预算表或 budget_id                                                                                               |
+| P3   | 队列/Run 恢复关联            | solve_goals 与 resume_run_id/retry_prompt/writeup_retry/requires_auto；DDL 已在阶段 4 冻结，见第 11.3 节；不建预算表                                                                    |
 | P4   | 新 `local_process_sessions`  | 请求幂等、身份、状态、截止、日志位置/长度、清理状态；不存原始输出块                                                                                                                     |
 | P5   | `run_subagents` 加协作记账列 | `purpose TEXT NULL`、`review_id TEXT NULL`；旧记录 NULL 表示历史分类未知，新任务使用 explore/verify/review                                                                              |
 
@@ -440,7 +440,7 @@ solveOutcome 的数据库 CHECK 允许第 7.1 节枚举，NULL 表示无可确�
 
 command_ref 指向受管理的启动描述文件，避免把长命令反复嵌入状态响应；其文件发布成功后才提交可启动记录，失败即不启动。其删除跟随 Run 保留策略。owner 由宿主绑定为 `solver` 或子会话 ID，executionId 用于来源追踪，不使 resume 取得新的 requestKey 命名空间。主模型接手仍保留原 owner 审计。
 
-目标恢复状态在阶段 4 冻结，必须区分求解中、可恢复暂停、人工停止与 accepted；不设置 exhausted 或费用状态。旧预算表设计已撤销，不执行对应 DDL。
+目标恢复状态已在阶段 4 冻结为 active/paused/stopped/accepted；不设置 exhausted 或费用状态。旧预算表设计已撤销，不执行对应 DDL。
 
 ```mermaid
 erDiagram
@@ -576,11 +576,11 @@ Compose 可追加 `./ctf-skills:/data/.pi/skills:ro`，保留状态卷和 Docker
 
 ## 11. 持续求解、故障恢复与测试边界
 
-### 11.1 产品目标与停止语义（P3，修订后待实现）
+### 11.1 产品目标与停止语义（P3，阶段 4 已实现）
 
 正式求解以判题确认的 accepted 为成功依据，保留人工停止。模型自报 flag、候选字符串、单次尝试结束或固定失败次数均不等于目标完成。暂时的网络、限流、订阅配额或鉴权故障应保存进度，退避或显示需处理状态；条件恢复后继续。不得用极大费用/时长数字模拟“不限”，不新增预算开关或限额模式。
 
-现有单次尝试超时与失败次数仍属旧调度行为，本次删除预算占位不代表已经实现持续求解。阶段 4 须明确把它们转换为恢复、换路或可恢复暂停，避免将未解目标自动判为最终放弃；恢复应保留证据与已尝试路径，防止重复无进展操作。
+阶段 4 已移除生产调度的整题超时、maxAttempts 与 maxSessionInterruptions。模型结束、长度截断和压缩后继续同一 Run；网络错误按 10/60/300/300… 秒恢复。有进展后连续失败归零；鉴权/配额/配置和三次无进展的非瞬态错误保留为可恢复暂停，页面提供原因与恢复入口。单请求默认 5 分钟、流空闲 90 秒，仅释放卡死请求，不结束目标。恢复保留原 Session、workspace、黑板和配置快照，解题效果与长时间真实运行质量仍需后续样本评估。
 
 ### 11.2 请求与工具的可靠性
 
@@ -590,15 +590,15 @@ accepted、人工停止及暂停必须在排队后、实际发送前再次检查
 
 ### 11.3 持久入队、恢复与 accepted 对账
 
-将 `retryRun()` 的 `persisted:false` 内存路径并入统一持久入队，保存恢复 Run、用途与所属求解目标。具体目标身份/表结构在阶段 4 冻结；只管理生命周期，不建立 `solve_budgets`、`budget_requests`、费用预留或累计 deadline。重启先核对 accepted、人工停止、暂停与资源状态，再恢复任务，避免重复派发。
+`retryAttempt()` 已并入统一持久入队，队列增加 `resume_run_id/retry_prompt/writeup_retry/requires_auto`。`solve_goals` 以 challenge_id 为主键、UUID 为目标身份，保存 active/paused/stopped/accepted、run_id、requires_auto、retry_at、failures、reason、updated_at；无预算表或累计 deadline。旧 worker 更新受目标身份与终态检查保护，入队刷新和 reset/cancel 也防止晚到任务复活。使用新状态后登记 `continuous-solve-goals: 1` 数据能力，防止不兼容回退。
 
-补齐 `accepted_persistence_failed` 的证据对账：平台当前已解不能证明原 Run 的接受归属或原始接受时间，不伪造历史。成功后停止探索，按现有配置总结和清理，失败可诊断/重试但不抹除 accepted；不另设金额或整题收尾预算。
+`accepted_persistence_failed` 通过 `accepted-receipt.json` 对账：实际回执在 SQLite 写入前原子落盘并 fsync，恢复核对项目/题目/Run/状态/观察时间与 checksum。平台当前已解不能证明原 Run 的接受归属或原始接受时间。成功后停止探索，按现有配置总结和清理，失败可诊断/重试但不抹除 accepted。发送中崩溃的 model_request 记录补为未知用量失败，不能计成已知零费用。
 
 ### 11.4 配置迁移与独立测试
 
 产品 `RunSettings`、HTTP 更新/返回和新 Run 快照删除 `budgetPolicy`，请求显式携带废弃字段应报配置错误。读取旧 Project 配置时丢弃旧预算字段；旧 `review.maxPerBudget` 只作为读取迁移别名映射为 `maxPerGoal`，后者只限制自动复核次数，不限制 Solver 继续求解。旧 Run 快照原字节/hash 保留，运行投影忽略预算字段；不得改写历史评测配置或结果。
 
-测试费用授权、保守对账、余额轮询、在途预留和样本墙钟均放在独立评测器。各组固定同等测试条件，保存原始失败、中断、重跑和未知归账；充值不自动增加测试授权。生产交付不包含预算设置页、预算停机逻辑或预算表迁移。T24—T28 在第 15.1 节按新的持续求解合同重定义，旧预算测试定义撤销，不把已有阶段 3 测试冒称这些未来验收已完成。
+测试费用授权、保守对账、余额轮询、在途预留和样本墙钟均放在独立评测器。各组固定同等测试条件，保存原始失败、中断、重跑和未知归账；充值不自动增加测试授权。生产交付不包含预算设置页、预算停机逻辑或预算表迁移。T24—T28 已以阶段 4 的免费 SQLite/Project/Scheduler、实际 Pi 请求入口和 ProviderGate 用例实现；外部模型/订阅连通、真实容器掉电和长期运行稳定性不由这些测试推断。
 
 <a id="sec-12"></a>
 

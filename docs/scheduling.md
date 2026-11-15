@@ -1,9 +1,9 @@
 # 调度与硬资源上限
 
 本文描述 WebUI 长驻调度器 `ContestScheduler` 的实际资源模型。核心目标不是让尽可能多的
-Run 处于“活跃”状态，而是在固定本地容器和远程环境预算内，持续把算力交给最可能推进的题目。
+Run 处于“活跃”状态，而是在本地容器和远程环境并发上限内，持续求解直到判题确认或人工停止。
 
-一次性批量执行器 `ContestRunner` 不维护本文的持久队列，但同样受自身 worker pool 上限约束。
+独立评测使用的批量执行器 `ContestRunner` 保留测试超时与尝试次数；生产入口只创建本文的 `ContestScheduler`，不读取测试器的费用或整题时限。
 
 ## 1. 调度意图与双队列
 
@@ -69,13 +69,18 @@ preparing ──→ running ──→ blocking / writing_writeup ──→ termi
 不存在 `waiting_execution_slot`，也不存在环境等待时临时释放并发、随后重新抢执行许可的流程。
 这正是容器数量不再从配置值 2 膨胀到 6、7 个的关键。
 
-Solver 在同一个 Run 和 Sandbox 中持续工作，直到以下任一结果：
+求解目标独立于单次 Run，持久化为 `solve_goals`：
 
-- Flag 被平台接受并完成 Writeup；
-- Supervisor 判定为 Blocked 并完成进度收尾；
-- 人工取消、进程关闭或不可恢复失败。
+| 状态       | 行为                                                                                            |
+| ---------- | ----------------------------------------------------------------------------------------------- |
+| `active`   | 持续求解或按 `retry_at` 等待恢复；普通模型结束、长度截断、压缩、固定失败次数均不结束目标        |
+| `paused`   | 配置、鉴权、配额、反复协议错误或资源清理需要处理；保存 Run/Session/证据，释放 Solver 后等待恢复 |
+| `stopped`  | 人工停止的持久状态；自动发现、平台恢复、重启均不能复活；显式重新派发创建新目标                  |
+| `accepted` | 已收到判题成功或平台已解观察；停止探索，原始接受归属仍以独立 Run 回执为准                       |
 
-进程异常退出时，Project 会把遗留的非终态 Run 标记为 `interrupted`。Scheduler 恢复执行队列时，若该 Run 来自调度器且题目尚未 Blocked，会用原 Run 的 attempt 和 JSONL session 调用 `resumeSolver()`，发送默认 continuation prompt，而不是创建新的 attempt。人工再次派发 `cancelled`、普通失败或超时的题目时也遵循同一规则；只有题目已进入 Blocked 时才不恢复原 Run。
+目标保存 UUID、题目、关联 Run、是否随调度暂停、连续失败数、恢复时间和原因。重启先恢复真实接受回执、处理遗留请求和容器，再恢复队列；同一目标复用原 Run、attempt、配置快照、workspace 和 JSONL。遗留容器回收失败会暂停目标，续跑前再次尝试清理。兼容历史 blocked/revival，但生产调度不再因累计阻塞分或中断次数自动放弃题目。
+
+模型自报答案和错误提交不算 accepted。`accepted-receipt.json` 在实际接受响应后、SQLite 写入前独立落盘并校验身份/hash；写库失败后重启可恢复原 Run 和原始观察时间。仅看到平台“已解”可以停止探索，不能反推哪次 Run 提交成功，也不能补造接受时间。Writeup/清理失败不抹除成功事实。
 
 普通 turn 结束、远程环境排队或 transient retry 都不会为了“提高表面并发”创建额外 Sandbox。
 
@@ -132,12 +137,15 @@ max(remoteCoordinator.occupied, admittedRemoteOnlyRuns) < maxRemoteEnvironments
 `ctf_instance_start` 是一个顺序工具调用。远程名额不足时，调用停在协调器队列中，当前 Agent
 不会产生下一次 LLM 请求。Run 仍占 Sandbox 槽，因此系统总资源保持有界。
 
-- 环境等待不扣减 Solver 工作时限；
+- 环境等待没有整题倒计时；
 - 平台启动仍受独立的 4 分钟墙钟上限；
 - status、destroy 和补偿清理默认受 30 秒上限；
 - 明确 `retryable: true` 的启动错误在同一次工具调用内有限退避，不创建新 Run 或新 LLM turn；
 - 取消等待中的 Run 会中止 pending/starting 请求，并走统一 Solver 清理；
-- 网络、429 和 5xx 的普通 Solver 失败仍按 `10s → 60s → 300s` 做同 Run 有限退避；退避耗尽后，所有非 `blocked` 的终态重试都会复用原 attempt/session，并发送默认 continuation prompt。
+- 网络、429 和 5xx 按 `10s → 60s → 300s → 300s…` 恢复同一 Run；有进展后连续失败数清零。退避时间落库，重启不能跳过冷却；不会因达到次数而结束目标。
+- 配置/鉴权/供应商配额错误保存为 `paused`；修复后使用“恢复求解”或保存配置恢复。普通平台刷新不会解除这些暂停，也不会反复尝试扣费。三次无进展的不可重试协议/执行错误也进入可恢复暂停，原因可见。
+- 每个实际模型请求默认最长 **5 分钟**，流空闲最长 **90 秒**；SDK 重试设为 0、Pi 自动重试关闭。超时只结束当前请求，Solver 按上述策略续跑，不限制整题时长。Provider 错峰默认 2 秒，临时 429/5xx 冷却 15 秒。
+- Solver、SubAgent、压缩和分支摘要的模型调用携带不可变身份。排队后实际发送前复查目标状态；取消信号与请求超时会结束不响应取消的流，迟到的工具调用不再转发。不同 Run 共享 Provider 不共享生命周期身份。
 
 ## 7. 队列、Blocked 与恢复
 
@@ -146,9 +154,10 @@ max(remoteCoordinator.occupied, admittedRemoteOnlyRuns) < maxRemoteEnvironments
 - normal 题处理完后才进入 blocked revival；
 - 空闲与执行队列的位置和版本分别持久化，拖拽通过队列级或条目级 `expectedVersion` 拒绝陈旧写入；
 - `pauseAuto()` 保留两条等待队列但不取消活跃 Run；WebUI 暂停后会提供“停止全部 Solver”，并等待各 Run 完成正常资源回收；
-- `suspend()` 在平台或模型配置故障时冻结领取，并保留队列和持久化模式；
+- `suspend()` 在平台故障时冻结领取；目标自身的可恢复暂停单独持久化，不妨碍其他可运行题目；
 - 创建 Scheduler 后先执行 `restore()`：从 RunStore 恢复两条队列与模式，再 reconcile 平台事实；
-- 重启后遗留非终态 Run 标记为 interrupted，旧进程的容器和内存许可不会被假定仍存在；未被 Blocked 的调度 Run 重新进入 execution 时复用原 attempt/session，并发送默认 continuation prompt。历史 `cancelled`、`failed`、`timed_out` 和 `closed` Run 再次派发时同样复用原 attempt；`blocked` Run 不自动恢复。
+- 显式 retry 与 writeup retry 统一持久入队，保存 `resume_run_id`、提示词、writeup 用途和 `requires_auto`；启动准备期间的 retry 提示词仍保留在持久队列中。人工停止和重置优先于在途刷新/重试，旧任务不能复活新目标。
+- 进程关闭保留目标，人工停止结束目标；两种意图分开。新增数据能力 `continuous-solve-goals: 1`，使用目标或新队列数据后阻止更新器回退到不能理解这些状态的旧构建。
 
 ## 8. Dashboard 可观察性
 
@@ -157,6 +166,7 @@ Project Dashboard 直接展示三类调度事实：
 - **调度工作台**：并排显示空闲与执行队列、持久化模式、活跃数量和 Blocked lane；停止时提供题目复选、批量加入/移除与键盘可操作的拖拽手柄，运行时冻结编排控件；
 - **远程环境**：占用/上限、题目、Run、waiting/starting/ready/releasing、已持续时间、到期时间，并允许人工释放；
 - **所有 Solver 日志**：跨题聚合最近 Run、工具、SubAgent、Flag 和环境事件。高频 thinking 与 usage 不进入该列表，避免日志本身造成存储和渲染压力。
+- 工作台展示可恢复暂停的原因、自动重试时间和“恢复求解”；Run 对话显示尚未确认用量的请求数量。请求的 queued/sending/completed/failed 事件均可诊断；发送后崩溃或超时不能当零用量，重启会补记未知用量事件。
 
 Dashboard 数据来自 RunStore 与 `RemoteEnvironmentCoordinator.snapshot()`；浏览器不是资源状态的
 权威来源。SSE 断线后重新读取快照即可恢复。
