@@ -1,7 +1,11 @@
-import { existsSync, statSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { copyFile, lstat, mkdir, readdir } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
-import { loadSkillsFromDir, type ResourceDiagnostic } from "@earendil-works/pi-coding-agent"
+import {
+  loadSkillsFromDir,
+  parseFrontmatter,
+  type ResourceDiagnostic,
+} from "@earendil-works/pi-coding-agent"
 
 export interface AgentSkill {
   name: string
@@ -27,11 +31,19 @@ export function parseSkillPackage(directory: string, expectedName: string): Agen
   const skill = loaded.skills.find(
     (entry) => resolve(entry.filePath) === resolve(directory, "SKILL.md"),
   )
-  if (!skill || skill.name !== expectedName) {
+  if (!skill) {
+    throw new Error(`Skill package metadata does not match ${expectedName}`)
+  }
+  const { frontmatter } = parseFrontmatter(readFileSync(skill.filePath, "utf8"))
+  // Pi falls back to the source directory name when name is absent/empty/non-string.
+  // Content-addressed publication changes that directory; retain its frozen logical
+  // name without rewriting the package bytes or weakening explicit-name validation.
+  const name = typeof frontmatter.name === "string" && frontmatter.name ? skill.name : expectedName
+  if (name !== expectedName) {
     throw new Error(`Skill package metadata does not match ${expectedName}`)
   }
   return {
-    name: skill.name,
+    name,
     description: skill.description,
     filePath: skill.filePath,
     baseDir: skill.baseDir,

@@ -2,7 +2,11 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vite-plus/test"
-import { discoverProjectSkillsWithDiagnostics, materializeSkills } from "../../src/index.ts"
+import {
+  discoverProjectSkillsWithDiagnostics,
+  materializeSkills,
+  parseSkillPackage,
+} from "../../src/index.ts"
 
 const roots: string[] = []
 afterEach(async () =>
@@ -21,6 +25,32 @@ async function fixture(): Promise<string> {
 }
 
 describe("shared Pi skills", () => {
+  it.each(["", 'name: ""\n', "name: 7\n"])(
+    "retains the frozen fallback name when published metadata has no explicit name (%j)",
+    async (nameField) => {
+      const root = await mkdtemp(join(tmpdir(), "published-skill-"))
+      roots.push(root)
+      const directory = join(root, "a".repeat(64))
+      await mkdir(directory)
+      const content = `---\n${nameField}description: Analyze binaries safely\n---\n# Reverse 😀\n`
+      const path = join(directory, "SKILL.md")
+      await writeFile(path, content)
+
+      expect(parseSkillPackage(directory, "reverse")).toMatchObject({
+        name: "reverse",
+        description: "Analyze binaries safely",
+      })
+      expect(await readFile(path, "utf8")).toBe(content)
+    },
+  )
+
+  it("still rejects a published skill whose explicit name differs from its frozen name", async () => {
+    const root = await fixture()
+    const directory = join(root, ".pi/skills/reverse")
+    expect(() => parseSkillPackage(directory, "crypto")).toThrow("metadata does not match")
+    expect(parseSkillPackage(directory, "reverse").name).toBe("reverse")
+  })
+
   it("discovers with Pi and materializes a container-visible copy", async () => {
     const root = await fixture()
     const discovered = await discoverProjectSkillsWithDiagnostics(root)

@@ -214,7 +214,11 @@ export async function openRunSkills(input: OpenRunSkillsInput): Promise<{
         const hash = packageHash(files)
         sources.push({ skill, onlyFile, hash })
         const hostPath = `packages/${hash}`
-        await writePackage(join(staging, hostPath), files)
+        // Logical selections and their limits remain separate; identical bytes only
+        // need one physical package inside this Run's content-addressed directory.
+        if (!packages.some((entry) => entry.hash === hash)) {
+          await writePackage(join(staging, hostPath), files)
+        }
         parseSkillPackage(join(staging, hostPath), name)
         if (hash !== packageHash(await readPackage(skill.baseDir, limits, onlyFile))) {
           throw changed(`Skill source changed during publication: ${name}`)

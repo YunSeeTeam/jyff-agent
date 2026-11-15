@@ -62,6 +62,92 @@ async function fixture() {
 }
 
 describe("Run skill snapshots", () => {
+  it("preserves an inferred skill name and original bytes through publication and resume (T20/T21)", async () => {
+    const { root, input } = await fixture()
+    const sourcePath = join(root, ".pi/skills/reverse/SKILL.md")
+    const content = Buffer.from("---\r\ndescription: Inferred reverse\r\n---\r\n# Original 😀\r\n")
+    await writeFile(sourcePath, content)
+    input.discovered = await discoverProjectSkills(root)
+    expect(input.discovered.find((skill) => skill.name === "reverse")?.description).toBe(
+      "Inferred reverse",
+    )
+
+    const skills = await openRunSkills(input)
+    const entry = skills.manifest.packages.find((pkg) => pkg.name === "reverse")!
+    const manifestPath = join(input.runDirectory, "skills/manifest.json")
+    const savedManifest = await readFile(manifestPath)
+    const savedSkill = join(input.runDirectory, "skills", entry.hostPath, "SKILL.md")
+    expect(await readFile(savedSkill)).toEqual(content)
+    expect(await readFile(sourcePath)).toEqual(content)
+    expect((await skills.forSolver())[0]).toMatchObject({
+      name: "reverse",
+      description: "Inferred reverse",
+    })
+    await writeFile(sourcePath, "---\nname: changed\ndescription: Updated source\n---\n")
+    const resumed = await openRunSkills({ ...input, discovered: [], hasStarted: true })
+    expect((await resumed.forSolver())[0]).toMatchObject({
+      name: "reverse",
+      description: "Inferred reverse",
+    })
+    expect(resumed.manifest.manifestHash).toBe(skills.manifest.manifestHash)
+    expect(await readFile(manifestPath)).toEqual(savedManifest)
+    expect(await readFile(savedSkill)).toEqual(content)
+    expect(
+      await readFile(
+        join(input.workspace, ".skills", input.configuration.runId, entry.hash, "SKILL.md"),
+      ),
+    ).toEqual(content)
+  })
+
+  it("keeps distinct frozen names for identical packages selected by Solver and child (T20/T21)", async () => {
+    const { root, input } = await fixture()
+    const content = "---\ndescription: Shared instructions\n---\n# Original 😀\n"
+    for (const name of ["crypto", "reverse"]) {
+      await writeFile(join(root, ".pi/skills", name, "SKILL.md"), content)
+      await writeFile(join(root, ".pi/skills", name, "helper.py"), "print('shared helper')")
+    }
+    input.discovered = await discoverProjectSkills(root)
+    // Limits count each selected logical package, even if its bytes can be reused.
+    await expect(openRunSkills({ ...input, limits: { maxFiles: 3 } })).rejects.toMatchObject({
+      code: "skill_snapshot_limit",
+    })
+    expect(await readdir(input.runDirectory)).toEqual([])
+    await expect(
+      openRunSkills({
+        ...input,
+        limits: { maxBytes: Buffer.byteLength(content + "print('shared helper')") },
+      }),
+    ).rejects.toMatchObject({ code: "skill_snapshot_limit" })
+    expect(await readdir(input.runDirectory)).toEqual([])
+
+    const skills = await openRunSkills(input)
+    expect(skills.manifest.packages.map((pkg) => pkg.name)).toEqual(["crypto", "reverse"])
+    const [crypto, reverse] = skills.manifest.packages
+    expect(crypto!.hash).toBe(reverse!.hash)
+    expect(crypto!.hostPath).toBe(reverse!.hostPath)
+    expect(await readdir(join(input.runDirectory, "skills/packages"))).toEqual([crypto!.hash])
+    expect((await skills.forSolver()).map((skill) => skill.name)).toEqual(["reverse"])
+    expect((await skills.forRole("general-purpose")).map((skill) => skill.name)).toEqual(["crypto"])
+    expect(await skills.forRole("explorer")).toEqual([])
+    const manifestPath = join(input.runDirectory, "skills/manifest.json")
+    const savedManifest = await readFile(manifestPath)
+    await rm(join(root, ".pi/skills"), { recursive: true })
+
+    const resumed = await openRunSkills({ ...input, discovered: [], hasStarted: true })
+    expect((await resumed.forSolver()).map((skill) => skill.name)).toEqual(["reverse"])
+    expect((await resumed.forRole("general-purpose")).map((skill) => skill.name)).toEqual([
+      "crypto",
+    ])
+    expect(await readFile(manifestPath)).toEqual(savedManifest)
+    const savedSkill = join(input.runDirectory, "skills", crypto!.hostPath, "SKILL.md")
+    expect(await readFile(savedSkill, "utf8")).toBe(content)
+    await writeFile(savedSkill, content + "tampered")
+    await expect(resumed.forSolver()).rejects.toMatchObject({ code: "skill_snapshot_changed" })
+    await expect(resumed.forRole("general-purpose")).rejects.toMatchObject({
+      code: "skill_snapshot_changed",
+    })
+  })
+
   it("freezes selected package bytes and reparses metadata, with replacing role overrides (T20/T21)", async () => {
     const { root, input } = await fixture()
     // Discovery metadata is intentionally stale: publication must parse the saved bytes.
