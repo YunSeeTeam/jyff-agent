@@ -6,6 +6,11 @@ import { DockerSandbox, executeDockerCommand } from "@ctf-agent/sandbox"
 import { RunStore } from "../../../src/persistence/run-store.ts"
 import { challengeWorkspacePath } from "../../../src/project/challenge-workspace.ts"
 import { RunEvidence } from "../../../src/project/experiment-record.ts"
+import {
+  fixedSampleMounts,
+  fixedReadsRequested,
+  startFixedReads,
+} from "./fixed-attachment-witness.ts"
 
 const [root, projectId, image, failed, writeup] = process.argv.slice(2)
 if (!root || !projectId || !image || !failed || !writeup)
@@ -34,6 +39,7 @@ for (const [index, runId] of [failed, writeup].entries()) {
               "--pull=never",
               "--label",
               "ctf-agent.test.cleanup=" + projectId,
+              ...fixedSampleMounts(workspace, challengeId),
               ...args.slice(1),
             ]
           : args,
@@ -74,6 +80,8 @@ for (const [index, runId] of [failed, writeup].entries()) {
     store.recordSolveOutcome({ runId, outcome: "accepted", observedAt: acceptedAt })
     store.updateRun(runId, { status: "writing_writeup" })
   }
+  if (fixedReadsRequested)
+    await startFixedReads(box.id, workspace, index === 0 ? "failed" : "writeup")
 }
 await writeFile(
   join(root, "owner-ready.json"),

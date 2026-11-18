@@ -14,12 +14,71 @@ import { RunStore } from "../../src/persistence/run-store.ts"
 import { challengeWorkspacePath } from "../../src/project/challenge-workspace.ts"
 import { Project } from "../../src/project/project.ts"
 import { TestPlatformPlugin } from "../fake-platform.ts"
+import {
+  type FixedReceipt,
+  fixedSampleMounts,
+  fixedReadsRequested,
+  inspectFixedReads,
+  startFixedReads,
+} from "./fixtures/fixed-attachment-witness.ts"
 
 async function docker(args: string[]): Promise<string> {
   const result = await executeDockerCommand(args, { timeoutMs: 30_000 })
   if (result.code !== 0)
     throw new Error(`Docker ${args[0]} failed: ${result.stderr || result.stdout}`)
   return result.stdout.trim()
+}
+
+async function saveFixedRead(
+  project: Project,
+  runId: string,
+  session: FixedReceipt["sessions"][number],
+) {
+  const refs: string[] = []
+  let pages = 0
+  for (const [index, stream] of (["stdout", "stderr"] as const).entries()) {
+    const { bytes, sha256 } = session.streams[index]!
+    const ref = await project.evidence.capture(runId, {
+      path: `.fixed-attachment-receipts/copy-${session.id}-${stream}.bin`,
+      prefixBytes: bytes,
+      expectedSha256: sha256,
+    })
+    const observed = createHash("sha256")
+    let offset = 0
+    do {
+      const page = await project.evidence.content(runId, ref.refId, { offset, limitBytes: 4093 })
+      const chunk = Buffer.from(page.content, "base64")
+      expect(page.offset).toBe(offset)
+      expect(page.nextOffset).toBe(offset + chunk.length)
+      expect(page.hasMore).toBe(page.nextOffset < bytes)
+      if (page.hasMore) expect(chunk.length).toBeGreaterThan(0)
+      observed.update(chunk)
+      offset = page.nextOffset
+      pages++
+    } while (offset < bytes)
+    expect(observed.digest("hex")).toBe(sha256)
+    refs.push(ref.refId)
+  }
+  const status =
+    session.state === "exited"
+      ? "exited"
+      : session.state === "interrupted"
+        ? "interrupted"
+        : "unknown"
+  const record = await project.evidence.record(runId, {
+    status,
+    ...(session.exitCode !== null && { exitCode: session.exitCode }),
+    stdoutRef: refs[0],
+    stderrRef: refs[1],
+  })
+  return {
+    experimentId: record.id,
+    status: record.status,
+    exitCode: record.exitCode,
+    stdoutRef: refs[0],
+    stderrRef: refs[1],
+    pages,
+  }
 }
 
 // The grandchild writes its PID after reparenting and exits. The observer stays
@@ -103,6 +162,8 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
     await mkdir(workspace, { recursive: true })
     const path = join(workspace, "sample.bin")
     const samples = process.env.DOCKER_CLEANUP_SAMPLES
+    if (fixedReadsRequested && !samples)
+      throw new Error("Fixed reads require DOCKER_CLEANUP_SAMPLES")
     if (samples) await copyFile(join(samples, challenge, challenge + "_attachment.zip"), path)
     else await writeFile(path, "local cleanup fixture " + challenge)
     return createHash("sha256")
@@ -191,6 +252,24 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
     expect(ready.hashes).toEqual(hashes)
     const [failedBox, writeupBox] = ready.containers
     expect(await ids(false)).toEqual([...ready.containers].sort())
+    const fixedReads: FixedReceipt[][] = []
+    const savedReads: Awaited<ReturnType<typeof saveFixedRead>>[] = []
+    const auditReads = (reconcile: boolean) =>
+      Promise.all(
+        ["misc1", "misc2"].map((sample) =>
+          inspectFixedReads(
+            image,
+            challengeWorkspacePath(join(root, ".ctf-agent"), sample),
+            label(),
+            reconcile,
+          ),
+        ),
+      )
+    if (fixedReadsRequested) {
+      const initial = await auditReads(false)
+      expect(initial.map((r) => r.sessions.map((s) => s.held))).toEqual([[false, true], [true]])
+      fixedReads.push(initial)
+    }
     const controls = [
       await idleContainer([
         "ctf-agent.project=" + projectId + "-other",
@@ -246,6 +325,17 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
     }
     expect(await pending()).toEqual([failed])
     expect(await managedForRun(failed)).toEqual([failedBox])
+    if (fixedReadsRequested) {
+      const firstScan = await auditReads(true)
+      expect(firstScan.map((r) => r.sessions.map((s) => [s.held, s.pending]))).toEqual([
+        [
+          [false, false],
+          [true, true],
+        ],
+        [[false, false]],
+      ])
+      fixedReads.push(firstScan)
+    }
     // No injected executor on the next startup. It uses the production Project
     // selector and real Docker. Both similarly labelled control containers survive.
     const recovered = await reopen()
@@ -286,9 +376,40 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
       await recovered.close()
     }
     expect(await pending()).toEqual([])
+    if (fixedReadsRequested) {
+      const secondScan = await auditReads(true)
+      expect(secondScan.map((r) => r.visited)).toEqual([[2], []])
+      expect(secondScan.map((r) => r.sessions.map((s) => [s.state, s.exitCode]))).toEqual([
+        [
+          ["exited", 2],
+          ["interrupted", null],
+        ],
+        [["interrupted", null]],
+      ])
+      for (const receipt of secondScan) {
+        for (const s of receipt.sessions) {
+          expect(s).toMatchObject({ held: false, pending: false, boots: 1 })
+        }
+      }
+      const stable = (set: FixedReceipt[]) =>
+        set.map((r) => r.sessions.map((s) => [s.id, s.pid, s.streams]))
+      expect(stable(secondScan)).toEqual(stable(fixedReads[0]!))
+      fixedReads.push(secondScan)
+      expect((await auditReads(true)).map((r) => r.visited)).toEqual([[], []])
+    }
     const again = await reopen()
     try {
       expect(await ids(false)).toEqual(controls)
+      if (fixedReadsRequested) {
+        for (const receipt of fixedReads.at(-1)!) {
+          for (const session of receipt.sessions) {
+            savedReads.push(
+              await saveFixedRead(again, receipt.phase === "failed" ? failed : writeup, session),
+            )
+          }
+        }
+        expect(savedReads.map((r) => r.exitCode)).toEqual([2, null, null])
+      }
     } finally {
       await again.close()
     }
@@ -307,6 +428,7 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
         controlsSurvived: controls.length,
         preservedExit: 1,
         unobservedExit: null,
+        ...(fixedReadsRequested && { fixedReads, savedReads }),
         acceptedAt: ready.acceptedAt,
       }),
     )
@@ -314,6 +436,9 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
 
   it("T38 reclaims the leased container and sandbox after a session fails to close", async () => {
     const digest = await sample("misc2")
+    const workspace = challengeWorkspacePath(join(root, ".ctf-agent"), "misc2")
+    const fixedReads: FixedReceipt[] = []
+    const savedReads: Awaited<ReturnType<typeof saveFixedRead>>[] = []
     const platform = new TestPlatformPlugin()
     // Keep the platform and its lease offline, with a real, separate resource
     // behind instance.destroy(). Both container removals must precede teardown.
@@ -383,7 +508,14 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
         DockerSandbox.create(options, (args, opts) =>
           executeDockerCommand(
             args[0] === "create"
-              ? ["create", "--pull=never", "--label", label(), ...args.slice(1)]
+              ? [
+                  "create",
+                  "--pull=never",
+                  "--label",
+                  label(),
+                  ...fixedSampleMounts(options.workspace, "misc2"),
+                  ...args.slice(1),
+                ]
               : args,
             { timeoutMs: 30_000, ...opts },
           ),
@@ -427,6 +559,14 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
       const activeContainers = await ids(false)
       expect(activeContainers).toHaveLength(2)
       expect(activeContainers).toEqual(expect.arrayContaining([box, leasedBox]))
+      if (fixedReadsRequested) {
+        await startFixedReads(box, workspace, "close")
+        const initial = await inspectFixedReads(image, workspace, label())
+        expect(initial.sessions.map((s) => s.held)).toEqual([true, true])
+        expect(new Set(initial.sessions.map((s) => s.pid)).size).toBe(2)
+        fixedReads.push(initial)
+        savedReads.push(await saveFixedRead(project, runId, initial.sessions[0]!))
+      }
       await expect(solver.close("failed", "original Run failure")).rejects.toBeInstanceOf(
         AggregateError,
       )
@@ -439,6 +579,20 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
       })
       expect(stream.mock.calls.length).toBe(0)
       expect(await ids()).toEqual([])
+      if (fixedReadsRequested) {
+        const after = await inspectFixedReads(image, workspace, label(), true)
+        expect(after.sessions).toEqual(
+          fixedReads[0]!.sessions.map((s) => ({
+            ...s,
+            held: false,
+            pending: false,
+            state: "interrupted",
+            exitCode: null,
+          })),
+        )
+        fixedReads.push(after)
+        savedReads.push(await saveFixedRead(project, runId, after.sessions[1]!))
+      }
       expect(project.runs()[0]).toMatchObject({
         id: runId,
         status: "failed",
@@ -452,6 +606,14 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
     const recovered = await reopen()
     try {
       expect(recovered.diagnostics().filter((d) => d.code === "sandbox")).toEqual([])
+      for (const read of savedReads) {
+        expect(await recovered.evidence.experiment(runId, read.experimentId)).toMatchObject({
+          status: read.status,
+          exitCode: read.exitCode,
+          stdoutRef: read.stdoutRef,
+          stderrRef: read.stderrRef,
+        })
+      }
       expect(recovered.runs()[0]).toMatchObject({
         id: runId,
         status: "failed",
@@ -477,6 +639,7 @@ describe.runIf(process.env.DOCKER_LIVE === "1")("offline Docker container cleanu
         offlineLeasesReleased: 1,
         containersAfterClose: 0,
         modelCalls: stream.mock.calls.length,
+        ...(fixedReadsRequested && { fixedReads, savedReads }),
       }),
     )
   }, 90_000)

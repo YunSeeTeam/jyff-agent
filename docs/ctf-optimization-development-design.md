@@ -864,6 +864,16 @@ code 是稳定机器合同，message 用于人读，retryable 必须按场景返
 
 阶段 5 的 T36/T38 容器回收可单独复验。在已缓存镜像的测试进程中设置 `DOCKER_LIVE=1`，运行 `vp test run packages/core/test/project/docker-cleanup-live.test.ts --reporter=verbose --silent=false`。Windows 原生 Docker 使用 `CTF_AGENT_DOCKER_MODE=native`。`DOCKER_CLEANUP_SAMPLES` 可指向包含 `misc1/misc1_attachment.zip` 和 `misc2/misc2_attachment.zip` 的目录。测试在禁网容器内校验附件哈希。日志记录每个用例的容器 ID、回收结果和测试结束时的容器余量。独立进程会话的验收条件见 15.1。
 
+固定作业的复验使用同一个样例目录，并在测试进程中额外设置 `DOCKER_FIXED_ATTACHMENTS=1`。`misc1` 和 `misc2` 必须与用例登记的 SHA-256 一致。每个读取进程只接受两个单字节窗口选择和 EOF，以原始字节分别写出 stdout 和 stderr。按下列顺序运行，详细日志包含并发启动次数、写入回执、退出观察和关闭后的文件锁状态。
+
+```text
+vp test run packages/core/test/project/fixed-attachment-sessions.test.ts -t 'T(29|30|31|32|33|34|35) fixed' --reporter=verbose --silent=false
+vp test run packages/core/test/project/fixed-attachment-sessions.test.ts -t 'T(36|38) fixed' --reporter=verbose --silent=false
+vp test run packages/core/test/project/docker-cleanup-live.test.ts --reporter=verbose --silent=false
+```
+
+第三组用例在 Project 管理的沙箱内运行同一读取程序，独立容器在清理前后检查各会话的文件锁与日志哈希。重复启动、回执和身份绑定由测试用的附件读取程序实现。产品 `localProcesses` 的工程条件见 15.1，评测 D 的对照和发布条件见 15.3、15.4。
+
 按仓库要求依次执行：
 
 ```text
