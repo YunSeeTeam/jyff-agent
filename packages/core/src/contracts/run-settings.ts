@@ -31,7 +31,8 @@ export interface OptimizationSettings {
   blackboardReaderV2: boolean
   fullSubagentReports: boolean
   skillSnapshots: boolean
-  localProcesses: boolean
+  /** true requests the full process contract. The named profile only reads the two pinned archives. */
+  localProcesses: boolean | "fixed-attachments"
   review: ReviewSettings
 }
 
@@ -186,6 +187,7 @@ export type OptimizationCapability =
   | "full-subagent-reports"
   | "skill-snapshots"
   | "local-processes"
+  | "fixed-attachment-reads"
   | "review"
 
 export interface ConfigurationDependencyIssue {
@@ -228,7 +230,12 @@ export function configurationDependencyIssues(
   }
   if (optimization.skillSnapshots) capability("optimization.skillSnapshots", "skill-snapshots")
   if (optimization.localProcesses) {
-    capability("optimization.localProcesses", "local-processes")
+    capability(
+      "optimization.localProcesses",
+      optimization.localProcesses === "fixed-attachments"
+        ? "fixed-attachment-reads"
+        : "local-processes",
+    )
   }
   if (optimization.review.enabled) {
     capability("optimization.review.enabled", "review")

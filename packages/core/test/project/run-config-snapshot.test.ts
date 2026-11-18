@@ -136,6 +136,7 @@ describe("Run configuration freeze", () => {
           runStoreCapabilities: { "accepted-fact": 1 },
           optimizationCapabilities: [
             "blackboard-reader-v2",
+            "fixed-attachment-reads",
             "full-subagent-reports",
             "skill-snapshots",
           ],

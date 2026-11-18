@@ -35,6 +35,7 @@ export interface CreateCtfSubagentOptions {
   skills?: readonly AgentSkill[]
   /** Challenge-bound read-only capability; never exposes a writable blackboard tool. */
   blackboardReadTool?: AgentTool
+  fixedAttachmentReadTool?: AgentTool
   /** 可选注入 web-access 工具；role.tools 白名单未包含时不会启用。 */
   webAccessTools?: readonly AgentTool[]
   /** 可选注入 ShellPoop 反弹 shell 工具；role.tools 白名单未包含时不会启用。 */
@@ -83,6 +84,7 @@ export class CtfSubagent extends BaseAgent {
     const model = resolveRoleModel(models, fallbackModel, options.role.model)
     const allTools = [
       ...(options.blackboardReadTool ? [options.blackboardReadTool] : []),
+      ...(options.fixedAttachmentReadTool ? [options.fixedAttachmentReadTool] : []),
       ...(options.webAccessTools ?? []),
       ...(options.shellpoopTools ?? []),
       ...createSubagentTools({

@@ -70,6 +70,7 @@ describe("updater minimum data reader capability (T40)", () => {
       store.createRun({ id: "r", challengeId: "c", attempt: 1, workspace: "unused" })
       store.setSandboxCleanupPending("r", true)
       store.requireDataCapability("frozen-artifacts")
+      store.fixedAttachmentReads.reserve("r", "solver", "misc1")
     } finally {
       store.close()
     }
@@ -83,6 +84,7 @@ describe("updater minimum data reader capability (T40)", () => {
     expect(await requiredDataCapabilities(root)).toMatchObject({
       "pending-sandbox-cleanup": 1,
       "frozen-artifacts": 1,
+      "fixed-attachment-reads": 1,
     })
     await expect(
       assertDataCompatible(fileURLToPath(new URL("../../../", import.meta.url)), root),

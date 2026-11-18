@@ -25,6 +25,40 @@ async function storeFixture(options: { persistent?: boolean } = {}): Promise<{
 }
 
 describe("RunStore", () => {
+  it("reserves each fixed attachment reader once and keeps active limits, input pins and bytes scoped to its Run", async () => {
+    const { store } = await storeFixture()
+    try {
+      for (const id of ["a", "b"])
+        store.createRun({ id, challengeId: id, workspace: "unused", attempt: 1 })
+      const fixed = store.fixedAttachmentReads
+      const first = fixed.reserve("a", "child", "misc1")
+      for (const owner of ["two", "three", "four"]) fixed.reserve("a", owner, "misc1")
+      expect(fixed.reserve("a", "child", "misc1")).toEqual({
+        receipt: first.receipt,
+        created: false,
+      })
+      expect(() => fixed.reserve("a", "five", "misc1")).toThrow("four active")
+      expect(() => fixed.reserve("a", "child", "misc2")).toThrow("different pinned archive")
+      const bytes = Buffer.alloc(16396, 42)
+      expect(() => fixed.save("a", first.receipt.id, 2, Buffer.alloc(16397))).toThrow()
+      fixed.save("a", first.receipt.id, 1, bytes)
+      expect(fixed.output("b", first.receipt.id, "solver", 1)).toBeUndefined()
+      expect(fixed.output("a", first.receipt.id, "two", 1)).toBeUndefined()
+      fixed.end("a", first.receipt.id, true)
+      expect(fixed.reserve("a", "five", "misc1").created).toBe(true)
+      expect(fixed.reserve("b", "child", "misc2").created).toBe(true)
+      fixed.recover()
+      expect(fixed.output("a", first.receipt.id, "solver", 1)).toEqual(bytes)
+      expect(fixed.find("a", first.receipt.id, "child")).toMatchObject({
+        state: "exited",
+        exitCode: 0,
+      })
+      expect(fixed.list("b", "solver")[0]).toMatchObject({ state: "interrupted", exitCode: null })
+    } finally {
+      store.close()
+    }
+  })
+
   it("持久化最后一次成功的平台视图", async () => {
     const { path, store } = await storeFixture({ persistent: true })
     store.cachePlatformView("overview", {

@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto"
 import { posix } from "node:path"
 import type { Attachment, ChallengeCapability } from "@ctf-agent/platform"
-import { DockerExecutionEnv, type Sandbox } from "@ctf-agent/sandbox"
+import { DockerExecutionEnv, matchFixedAttachment, type Sandbox } from "@ctf-agent/sandbox"
 
 export interface DownloadedChallengeAttachment {
   id: string
   name: string
   size: number
   path: string
+  fixedRead?: ReturnType<typeof matchFixedAttachment>
 }
 
 export class ChallengeAttachmentError extends Error {
@@ -29,6 +30,7 @@ export async function downloadChallengeAttachments(options: {
   capability: ChallengeCapability
   attachments: readonly Attachment[]
   sandbox: Sandbox
+  fixedAttachmentReads?: boolean
 }): Promise<DownloadedChallengeAttachment[]> {
   const env = new DockerExecutionEnv(options.sandbox)
   const downloaded: DownloadedChallengeAttachment[] = []
@@ -74,6 +76,7 @@ export async function downloadChallengeAttachments(options: {
       name: payload.attachment.name,
       size: payload.content.byteLength,
       path,
+      ...(options.fixedAttachmentReads ? { fixedRead: matchFixedAttachment(payload.content) } : {}),
     })
   }
   return downloaded

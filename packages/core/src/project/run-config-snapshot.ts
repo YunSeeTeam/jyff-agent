@@ -26,11 +26,12 @@ import {
 import { RUN_STORE_DATA_CAPABILITIES } from "../persistence/run-store.ts"
 
 /**
- * Implemented information contracts. Settings still default off; persistent
- * processes and review remain unavailable until their own gates pass.
+ * Implemented contracts. The pinned attachment reader has a distinct capability
+ * so older settings requesting the full process contract keep their meaning.
  */
 export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability> = new Set([
   "blackboard-reader-v2",
+  "fixed-attachment-reads",
   "full-subagent-reports",
   "skill-snapshots",
 ])

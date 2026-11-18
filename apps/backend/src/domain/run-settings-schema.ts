@@ -30,7 +30,7 @@ function runSettingsPatchSchema(strict: boolean) {
       blackboardReaderV2: z.boolean().optional(),
       fullSubagentReports: z.boolean().optional(),
       skillSnapshots: z.boolean().optional(),
-      localProcesses: z.boolean().optional(),
+      localProcesses: z.union([z.boolean(), z.literal("fixed-attachments")]).optional(),
       review: object({
         enabled: z.boolean().optional(),
         maxPerGoal: z.number().int().min(0).max(REVIEW_MAX_PER_GOAL_LIMIT).optional(),

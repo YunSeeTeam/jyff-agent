@@ -9,6 +9,10 @@ import type {
 } from "@ctf-agent/platform"
 import { SUBAGENT_REPORT_MAX_STORED_BYTES } from "../contracts/index.ts"
 import { SOLVE_GOALS_SCHEMA, SolveGoalStore } from "./solve-goals.ts"
+import {
+  FIXED_ATTACHMENT_READS_SCHEMA,
+  FixedAttachmentReadStore,
+} from "./fixed-attachment-reads.ts"
 import type { SubagentRecord } from "../collaboration/subagent-manager.ts"
 import type {
   RemoteEnvironmentLeaseRecord,
@@ -66,6 +70,7 @@ export const RUN_STORE_DATA_CAPABILITIES = {
   "continuous-solve-goals": 1,
   "pending-sandbox-cleanup": 1,
   "frozen-artifacts": 1,
+  "fixed-attachment-reads": 1,
 } as const
 
 export type RunCloseReason =
@@ -902,6 +907,11 @@ function normalizedUsageIdentity(value: string, field: string): string {
 export class RunStore {
   private closed = false
 
+  get fixedAttachmentReads(): FixedAttachmentReadStore {
+    this.assertOpen()
+    return new FixedAttachmentReadStore(this.database)
+  }
+
   get solveGoals(): SolveGoalStore {
     this.assertOpen()
     return new SolveGoalStore(this.database)
@@ -1195,6 +1205,7 @@ export class RunStore {
       )
     }
     database.exec(SOLVE_GOALS_SCHEMA)
+    database.exec(FIXED_ATTACHMENT_READS_SCHEMA)
     for (const [name, definition] of [
       ["resume_run_id", "TEXT REFERENCES runs(id) ON DELETE CASCADE"],
       ["retry_prompt", "TEXT"],

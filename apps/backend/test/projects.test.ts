@@ -1,4 +1,4 @@
-import type { ProjectActivation } from "@ctf-agent/core"
+import { BUILD_OPTIMIZATION_CAPABILITIES, type ProjectActivation } from "@ctf-agent/core"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -465,6 +465,7 @@ describe("Project 运行配置的优化设置", () => {
       storagePath: join(root, "runtime-config.json"),
       fallback: base,
       availableModelIds: () => new Set(),
+      availableCapabilities: () => BUILD_OPTIMIZATION_CAPABILITIES,
     })
     return appWithControlPlane({ ...configuration, current: () => configuration.snapshot() })
   }
@@ -544,6 +545,22 @@ describe("Project 运行配置的优化设置", () => {
         ],
       },
     })
+  })
+
+  it("保存固定附件模式并允许关闭，拒绝未实现的模式", async () => {
+    const { app } = await appWithFileRuntime()
+    for (const mode of ["fixed-attachments", "unrecognized", false]) {
+      const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+        ...base,
+        optimization: { localProcesses: mode },
+      })
+      expect(response.status).toBe(mode === "unrecognized" ? 400 : 200)
+      const { runtime } = await jsonOf(await app.request("/api/projects/demo/runtime-config"))
+      expect((runtime as ProjectRuntimeConfigurationView).optimization.localProcesses).toBe(
+        mode === "unrecognized" ? "fixed-attachments" : mode,
+      )
+      expect(runtime).not.toHaveProperty("budgetPolicy")
+    }
   })
 
   it("基于过期版本的提交返回 409，不覆盖较新的修改", async () => {

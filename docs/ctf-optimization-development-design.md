@@ -874,6 +874,8 @@ vp test run packages/core/test/project/docker-cleanup-live.test.ts --reporter=ve
 
 第三组用例在 Project 管理的沙箱内运行同一读取程序，独立容器在清理前后检查各会话的文件锁与日志哈希。重复启动、回执和身份绑定由测试用的附件读取程序实现。产品 `localProcesses` 的工程条件见 15.1，评测 D 的对照和发布条件见 15.3、15.4。
 
+复验正式固定附件模式时，使用上述同一组环境变量与本地镜像，执行 `vp test run packages/core/test/project/fixed-reader-live.test.ts --reporter=verbose --silent=false`。该套件通过 Project 创建 Solver、由 Pi 调用子代理的读取工具，并在独立宿主异常退出后恢复原 Run。具体的工具范围和实测结果见 [阶段 5 记录](ctf-optimization-stage5.md)。
+
 按仓库要求依次执行：
 
 ```text

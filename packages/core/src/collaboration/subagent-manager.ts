@@ -34,6 +34,7 @@ import {
 } from "../contracts/index.ts"
 import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentListPage } from "./subagent-projection.ts"
 import { firstSubagentResultPage, subagentResultPage } from "./subagent-report.ts"
+import type { FixedAttachmentReads } from "../project/fixed-attachment-reads.ts"
 
 export type { SubagentStatus } from "../contracts/index.ts"
 
@@ -94,6 +95,7 @@ export interface SubagentManagerOptions {
   skills?: readonly AgentSkill[]
   skillsForRole?: (role: string) => Promise<readonly AgentSkill[]>
   blackboardReadTool?: AgentTool
+  fixedAttachmentReads?: FixedAttachmentReads
   fullSubagentReports?: boolean
   persistence?: SubagentLifecyclePersistence
   /** 可选注入 web-access 工具，SubAgent 通过 role.tools 白名单决定是否启用。 */
@@ -429,7 +431,11 @@ export class CtfSubagentManager {
     try {
       this.finish(managed, "cancelled")
     } finally {
-      await managed.agent?.abort()
+      try {
+        await managed.agent?.abort()
+      } finally {
+        await this.options.fixedAttachmentReads?.closeOwner(id)
+      }
     }
     if (captureError) throw captureError
     return snapshot(managed.record)
@@ -549,6 +555,7 @@ export class CtfSubagentManager {
             ? await this.options.skillsForRole(managed.role.name)
             : this.options.skills,
           blackboardReadTool: this.options.blackboardReadTool,
+          fixedAttachmentReadTool: this.options.fixedAttachmentReads?.tool(managed.record.id),
           webAccessTools: this.options.webAccessTools,
           shellpoopTools: this.options.shellpoopTools,
         })

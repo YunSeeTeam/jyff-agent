@@ -82,6 +82,7 @@ import {
 import { openRunSkills, SkillSnapshotError } from "./run-skill-snapshot.ts"
 import { persistAcceptedReceipt, recoverAcceptedReceipts } from "./accepted-receipt.ts"
 import { RunEvidence } from "./experiment-record.ts"
+import { FixedAttachmentReads } from "./fixed-attachment-reads.ts"
 import type { ArtifactRangeQuery } from "./artifact-range-reader.ts"
 import {
   readBlackboard,
@@ -407,6 +408,7 @@ export class Project {
       // Project.open 只可能发生在新进程/新控制面中；遗留活跃记录不可继续信任。
       const interrupted = new Set(runStore.markInterruptedRuns().map((run) => run.id))
       runStore.markInterruptedSubagents()
+      runStore.fixedAttachmentReads.recover()
       const removeManagedSandboxes =
         options.removeManagedSandboxes ??
         (options.sandboxFactory === undefined
@@ -1351,6 +1353,7 @@ export class Project {
     let capability: Awaited<ReturnType<PlatformProject["bindChallenge"]>> | undefined
     let sandbox: Sandbox | undefined
     let subagentManager: CtfSubagentManager | undefined
+    let fixedAttachmentReads: FixedAttachmentReads | undefined
     // 提升到 try 之外，使创建失败路径的 catch 也能回收会话（闭包经 onBeforeCleanup 使用）。
     let shellpoopSession: ShellPoopSession | undefined
     try {
@@ -1463,7 +1466,22 @@ export class Project {
         capability,
         attachments: challenge.attachments,
         sandbox,
+        fixedAttachmentReads: settings.optimization.localProcesses === "fixed-attachments",
       })
+      if (settings.optimization.localProcesses === "fixed-attachments") {
+        const pinned = downloadedAttachments.length === 1 && downloadedAttachments[0]?.fixedRead
+        if (!pinned || !(sandbox instanceof DockerSandbox))
+          throw new RunConfigurationError(
+            "capability_unavailable",
+            "The fixed-attachments profile requires a Docker Run with one pinned misc1 or misc2 archive",
+          )
+        fixedAttachmentReads = new FixedAttachmentReads(
+          runId,
+          this.runStore.fixedAttachmentReads,
+          sandbox,
+          pinned,
+        )
+      }
       const challengeContext = challengeContextPrompt(challenge, downloadedAttachments)
       this.runChallengeContexts.set(runId, challengeContext)
       const challengeMessages: AgentMessage[] = resumed
@@ -1520,6 +1538,7 @@ export class Project {
           ? { blackboardReadTool: createBlackboardReadTool(this.runStore, challengeId) }
           : {}),
         fullSubagentReports: settings.optimization.fullSubagentReports,
+        fixedAttachmentReads,
         persistence: {
           beginExecution: (record, previousExecutionId) =>
             this.runStore.beginSubagentExecution(record, previousExecutionId),
@@ -1592,6 +1611,7 @@ export class Project {
             ...options.agent.initialState,
             tools: [
               ...(options.agent.initialState?.tools ?? []),
+              ...(fixedAttachmentReads ? [fixedAttachmentReads.tool("solver")] : []),
               ...webAccessTools,
               ...shellpoopTools,
               ...createBlackboardTools({
@@ -1659,6 +1679,11 @@ export class Project {
             await subagentManager?.close()
           } catch (error) {
             failures.push(`SubAgent 回收失败: ${errorText(error)}`)
+          }
+          try {
+            await fixedAttachmentReads?.close()
+          } catch (error) {
+            failures.push(`固定附仅读取回收失败: ${errorText(error)}`)
           }
           if (failures.length) throw new Error(failures.join("\n"))
         },
@@ -1786,6 +1811,11 @@ export class Project {
       this.runChallengeContexts.delete(runId)
       this.frozenRunSettings.delete(runId)
       const cleanupErrors: string[] = []
+      try {
+        await fixedAttachmentReads?.close()
+      } catch (cleanupError) {
+        cleanupErrors.push(`固定附仅读取回收失败: ${errorText(cleanupError)}`)
+      }
       if (subagentManager) {
         try {
           await subagentManager.close()
