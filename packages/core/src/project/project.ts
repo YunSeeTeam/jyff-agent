@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs"
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import {
   type AgentSkill,
@@ -83,6 +83,7 @@ import { openRunSkills, SkillSnapshotError } from "./run-skill-snapshot.ts"
 import { persistAcceptedReceipt, recoverAcceptedReceipts } from "./accepted-receipt.ts"
 import { RunEvidence } from "./experiment-record.ts"
 import { FixedAttachmentReads } from "./fixed-attachment-reads.ts"
+import { LocalProcessManager } from "./local-process-manager.ts"
 import type { ArtifactRangeQuery } from "./artifact-range-reader.ts"
 import {
   readBlackboard,
@@ -409,6 +410,7 @@ export class Project {
       const interrupted = new Set(runStore.markInterruptedRuns().map((run) => run.id))
       runStore.markInterruptedSubagents()
       runStore.fixedAttachmentReads.recover()
+      runStore.localProcesses.recover()
       const removeManagedSandboxes =
         options.removeManagedSandboxes ??
         (options.sandboxFactory === undefined
@@ -420,6 +422,37 @@ export class Project {
           try {
             await removeManagedSandboxes([run.id])
             runStore.setSandboxCleanupPending(run.id, false)
+            let cursor: string | undefined
+            do {
+              const page = runStore.localProcesses.list(run.id, "solver", cursor, 32)
+              for (const session of page.sessions) {
+                const length = async (stream: "stdout" | "stderr") => {
+                  try {
+                    const info = await lstat(
+                      join(
+                        agentDirectory,
+                        "runs",
+                        run.id,
+                        "processes",
+                        session.id,
+                        `${stream}.bin`,
+                      ),
+                    )
+                    return info.isFile() && !info.isSymbolicLink() ? info.size : 0
+                  } catch {
+                    return 0
+                  }
+                }
+                runStore.localProcesses.observe(
+                  run.id,
+                  session.id,
+                  await length("stdout"),
+                  await length("stderr"),
+                )
+              }
+              cursor = page.nextCursor
+            } while (cursor)
+            runStore.localProcesses.confirmRunCleanup(run.id)
           } catch (error) {
             sandboxDiagnostics.push({
               code: "sandbox",
@@ -1354,6 +1387,7 @@ export class Project {
     let sandbox: Sandbox | undefined
     let subagentManager: CtfSubagentManager | undefined
     let fixedAttachmentReads: FixedAttachmentReads | undefined
+    let localProcessManager: LocalProcessManager | undefined
     // 提升到 try 之外，使创建失败路径的 catch 也能回收会话（闭包经 onBeforeCleanup 使用）。
     let shellpoopSession: ShellPoopSession | undefined
     try {
@@ -1449,11 +1483,15 @@ export class Project {
         ? await runSkills.forSolver()
         : await materializeSkills(this.skills, workspace)
       this.runStore.setSandboxCleanupPending(runId, true)
+      const processLogDirectory =
+        settings.optimization.localProcesses === true ? join(runDirectory, "processes") : undefined
+      if (processLogDirectory) await mkdir(processLogDirectory, { recursive: true })
       sandbox = await this.sandboxFactory({
         projectId: this.config.project.id,
         runId,
         image: this.config.sandbox.image,
         workspace,
+        processLogDirectory,
         workspaceMount: this.workspaceMount?.({
           runId,
           workspace,
@@ -1462,6 +1500,19 @@ export class Project {
         privileged: this.config.sandbox.privileged,
         networkMode: solverSandboxNetworkMode(this.platform, this.config.sandbox.networkMode),
       })
+      if (settings.optimization.localProcesses === true) {
+        if (!(sandbox instanceof DockerSandbox) || !processLogDirectory)
+          throw new RunConfigurationError(
+            "capability_unavailable",
+            "Managed processes require a Docker Run",
+          )
+        localProcessManager = new LocalProcessManager(
+          runId,
+          this.runStore.localProcesses,
+          sandbox,
+          processLogDirectory,
+        )
+      }
       const downloadedAttachments = await downloadChallengeAttachments({
         capability,
         attachments: challenge.attachments,
@@ -1539,6 +1590,7 @@ export class Project {
           : {}),
         fullSubagentReports: settings.optimization.fullSubagentReports,
         fixedAttachmentReads,
+        localProcessManager,
         persistence: {
           beginExecution: (record, previousExecutionId) =>
             this.runStore.beginSubagentExecution(record, previousExecutionId),
@@ -1612,6 +1664,7 @@ export class Project {
             tools: [
               ...(options.agent.initialState?.tools ?? []),
               ...(fixedAttachmentReads ? [fixedAttachmentReads.tool("solver")] : []),
+              ...(localProcessManager ? localProcessManager.tools("solver") : []),
               ...webAccessTools,
               ...shellpoopTools,
               ...createBlackboardTools({
@@ -1685,6 +1738,11 @@ export class Project {
           } catch (error) {
             failures.push(`固定附仅读取回收失败: ${errorText(error)}`)
           }
+          try {
+            await localProcessManager?.close()
+          } catch (error) {
+            failures.push(`受管进程回收失败: ${errorText(error)}`)
+          }
           if (failures.length) throw new Error(failures.join("\n"))
         },
         onClosed: async (details) => {
@@ -1712,7 +1770,10 @@ export class Project {
             details,
           )
           await this.persistRecord(updated, runDirectory)
-          if (!details.cleanupErrors.length) this.runStore.setSandboxCleanupPending(runId, false)
+          if (!details.cleanupErrors.length) {
+            this.runStore.setSandboxCleanupPending(runId, false)
+            this.runStore.localProcesses.confirmRunCleanup(runId)
+          }
         },
       })
       subagentManager.attachParent(solver)
@@ -1815,6 +1876,11 @@ export class Project {
         await fixedAttachmentReads?.close()
       } catch (cleanupError) {
         cleanupErrors.push(`固定附仅读取回收失败: ${errorText(cleanupError)}`)
+      }
+      try {
+        await localProcessManager?.close()
+      } catch (cleanupError) {
+        cleanupErrors.push(`受管进程回收失败: ${errorText(cleanupError)}`)
       }
       if (subagentManager) {
         try {

@@ -6,6 +6,7 @@
     "continuous-solve-goals": 1,
     "pending-sandbox-cleanup": 1,
     "frozen-artifacts": 1,
-    "fixed-attachment-reads": 1
+    "fixed-attachment-reads": 1,
+    "local-processes": 1
   }
 }

@@ -32,6 +32,7 @@ import { RUN_STORE_DATA_CAPABILITIES } from "../persistence/run-store.ts"
 export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability> = new Set([
   "blackboard-reader-v2",
   "fixed-attachment-reads",
+  "local-processes",
   "full-subagent-reports",
   "skill-snapshots",
 ])

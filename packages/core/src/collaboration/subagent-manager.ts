@@ -35,6 +35,7 @@ import {
 import { SUBAGENT_MODEL_PREVIEW_CODE_POINTS, subagentListPage } from "./subagent-projection.ts"
 import { firstSubagentResultPage, subagentResultPage } from "./subagent-report.ts"
 import type { FixedAttachmentReads } from "../project/fixed-attachment-reads.ts"
+import type { LocalProcessManager } from "../project/local-process-manager.ts"
 
 export type { SubagentStatus } from "../contracts/index.ts"
 
@@ -96,6 +97,7 @@ export interface SubagentManagerOptions {
   skillsForRole?: (role: string) => Promise<readonly AgentSkill[]>
   blackboardReadTool?: AgentTool
   fixedAttachmentReads?: FixedAttachmentReads
+  localProcessManager?: LocalProcessManager
   fullSubagentReports?: boolean
   persistence?: SubagentLifecyclePersistence
   /** 可选注入 web-access 工具，SubAgent 通过 role.tools 白名单决定是否启用。 */
@@ -428,16 +430,25 @@ export class CtfSubagentManager {
       managed.resultConsumed = true
       managed.reject(error)
     }
+    const failures: unknown[] = []
     try {
       this.finish(managed, "cancelled")
-    } finally {
-      try {
-        await managed.agent?.abort()
-      } finally {
-        await this.options.fixedAttachmentReads?.closeOwner(id)
-      }
+    } catch (error) {
+      failures.push(error)
     }
-    if (captureError) throw captureError
+    try {
+      await managed.agent?.abort()
+    } catch (error) {
+      failures.push(error)
+    }
+    const cleanup = await Promise.allSettled([
+      this.options.fixedAttachmentReads?.closeOwner(id),
+      this.options.localProcessManager?.closeOwner(id),
+    ])
+    for (const result of cleanup) if (result.status === "rejected") failures.push(result.reason)
+    if (captureError && failures.length === 0) throw captureError
+    if (captureError) failures.unshift(captureError)
+    if (failures.length) throw new AggregateError(failures, "SubAgent cancellation failed")
     return snapshot(managed.record)
   }
 
@@ -556,6 +567,7 @@ export class CtfSubagentManager {
             : this.options.skills,
           blackboardReadTool: this.options.blackboardReadTool,
           fixedAttachmentReadTool: this.options.fixedAttachmentReads?.tool(managed.record.id),
+          processTools: this.options.localProcessManager?.tools(managed.record.id),
           webAccessTools: this.options.webAccessTools,
           shellpoopTools: this.options.shellpoopTools,
         })

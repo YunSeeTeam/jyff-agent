@@ -138,6 +138,7 @@ describe("Run configuration freeze", () => {
             "blackboard-reader-v2",
             "fixed-attachment-reads",
             "full-subagent-reports",
+            "local-processes",
             "skill-snapshots",
           ],
         },
@@ -262,12 +263,12 @@ describe("Run configuration freeze", () => {
   it("refuses a Run this build cannot honor without blocking the challenge, and freezes it once fixed", async () => {
     const root = await fixture()
     let settings = mergeRunSettings(defaultRunSettings(), {
-      optimization: { localProcesses: true },
+      optimization: { review: { enabled: true } },
     })
     const { project, sandboxes } = await openProject(root, { runSettings: () => settings })
     try {
       await expect(project.createSolver("warmup-flag", { agent })).rejects.toMatchObject({
-        message: expect.stringContaining("local-processes"),
+        message: expect.stringContaining("review"),
         blocked: false,
         retryable: false,
         requiresConfiguration: true,
@@ -275,7 +276,7 @@ describe("Run configuration freeze", () => {
       expect(sandboxes()).toBe(0)
       const [run] = project.runs({ challengeId: "warmup-flag" })
       expect(run).toMatchObject({ status: "failed", closeReason: "failed" })
-      expect(run?.error).toContain("optimization.localProcesses")
+      expect(run?.error).toContain("optimization.review.enabled")
       expect(project.isChallengeBlocked("warmup-flag")).toBe(false)
       if (!run) throw new Error("the rejected Run was not recorded")
 

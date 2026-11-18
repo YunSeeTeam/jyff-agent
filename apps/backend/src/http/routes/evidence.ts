@@ -16,6 +16,7 @@ const capture = z.strictObject({
 })
 const ref = z.uuidv4()
 const observation = z.strictObject({
+  processSessionId: ref.optional(),
   inputRefs: z.array(ref).max(16).optional(),
   scriptRef: ref.optional(),
   stdoutRef: ref.optional(),
@@ -117,6 +118,16 @@ export function evidenceRoutes(services: Services): App {
         stream,
         range(q),
       ),
+    )
+  })
+  app.get("/runs/:runId/processes/:sessionId/log", (c) => {
+    const q = query(c, ["stream", "offset", "limitBytes", "encoding"])
+    const stream = q.get("stream")
+    if (stream !== "stdout" && stream !== "stderr")
+      throw new HttpError(400, "invalid_query", "请选择 stdout 或 stderr")
+    return response(
+      c,
+      evidence(c).processLog(c.req.param("runId"), c.req.param("sessionId"), stream, range(q)),
     )
   })
   app.get("/challenges/:challengeId/files/range", (c) => {

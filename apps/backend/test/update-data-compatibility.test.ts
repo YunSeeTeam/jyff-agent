@@ -71,6 +71,14 @@ describe("updater minimum data reader capability (T40)", () => {
       store.setSandboxCleanupPending("r", true)
       store.requireDataCapability("frozen-artifacts")
       store.fixedAttachmentReads.reserve("r", "solver", "misc1")
+      store.localProcesses.reserve({
+        runId: "r",
+        owner: "solver",
+        requestKey: "probe",
+        fingerprint: "probe",
+        startedAt: new Date().toISOString(),
+        deadlineAt: new Date(Date.now() + 300000).toISOString(),
+      })
     } finally {
       store.close()
     }
@@ -85,6 +93,7 @@ describe("updater minimum data reader capability (T40)", () => {
       "pending-sandbox-cleanup": 1,
       "frozen-artifacts": 1,
       "fixed-attachment-reads": 1,
+      "local-processes": 1,
     })
     await expect(
       assertDataCompatible(fileURLToPath(new URL("../../../", import.meta.url)), root),

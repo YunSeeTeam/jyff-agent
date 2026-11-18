@@ -51,6 +51,8 @@ export interface DockerSandboxOptions {
   image: string
   workspace: string
   workspaceMount?: DockerWorkspaceMount
+  /** Host-owned Run directory for durable managed-process logs. */
+  processLogDirectory?: string
   privileged: boolean
   networkMode: "none" | "bridge" | "host" | `container:${string}`
   resources?: Partial<DockerSandboxResources>
@@ -313,6 +315,10 @@ export function dockerSandboxCreateArguments(
     "--mount",
     workspaceMount,
   ]
+  if (options.processLogDirectory) {
+    if (options.processLogDirectory.includes(",")) throw new Error("Invalid process log directory")
+    args.push("--mount", `type=bind,src=${options.processLogDirectory},dst=/ctf-processes`)
+  }
   if (options.privileged) args.push("--privileged")
   args.push(options.image, ...workspaceContainerCommand(options.workspaceMount, usesVolumeSubpath))
   return args

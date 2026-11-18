@@ -13,6 +13,7 @@ import {
   FIXED_ATTACHMENT_READS_SCHEMA,
   FixedAttachmentReadStore,
 } from "./fixed-attachment-reads.ts"
+import { LOCAL_PROCESS_SCHEMA, LocalProcessStore } from "./local-processes.ts"
 import type { SubagentRecord } from "../collaboration/subagent-manager.ts"
 import type {
   RemoteEnvironmentLeaseRecord,
@@ -71,6 +72,7 @@ export const RUN_STORE_DATA_CAPABILITIES = {
   "pending-sandbox-cleanup": 1,
   "frozen-artifacts": 1,
   "fixed-attachment-reads": 1,
+  "local-processes": 1,
 } as const
 
 export type RunCloseReason =
@@ -912,6 +914,11 @@ export class RunStore {
     return new FixedAttachmentReadStore(this.database)
   }
 
+  get localProcesses(): LocalProcessStore {
+    this.assertOpen()
+    return new LocalProcessStore(this.database)
+  }
+
   get solveGoals(): SolveGoalStore {
     this.assertOpen()
     return new SolveGoalStore(this.database)
@@ -1206,6 +1213,7 @@ export class RunStore {
     }
     database.exec(SOLVE_GOALS_SCHEMA)
     database.exec(FIXED_ATTACHMENT_READS_SCHEMA)
+    database.exec(LOCAL_PROCESS_SCHEMA)
     for (const [name, definition] of [
       ["resume_run_id", "TEXT REFERENCES runs(id) ON DELETE CASCADE"],
       ["retry_prompt", "TEXT"],

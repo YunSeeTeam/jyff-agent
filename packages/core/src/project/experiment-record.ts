@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { constants } from "node:fs"
 import type { BigIntStats } from "node:fs"
 import { lstat, mkdir, open, readdir, rename, rm, type FileHandle } from "node:fs/promises"
 import { join } from "node:path"
@@ -33,6 +34,7 @@ export interface CaptureArtifact {
 
 /** Describes an observed experiment. Registration has no command or execution side effect. */
 export interface RegisterExperiment {
+  processSessionId?: string
   inputRefs?: string[]
   scriptRef?: string
   stdoutRef?: string
@@ -398,6 +400,49 @@ export class RunEvidence {
     }
   }
 
+  async processLog(
+    runId: string,
+    sessionId: string,
+    stream: "stdout" | "stderr",
+    query: ArtifactRangeQuery,
+  ) {
+    if (this.closed) throw new EvidenceError("evidence_unavailable", "Project is closing")
+    if (!UUID.test(sessionId) || (stream !== "stdout" && stream !== "stderr"))
+      throw new EvidenceError("invalid_query", "Invalid process log request")
+    const receipt = this.runs.localProcesses.operatorFind(runId, sessionId)
+    if (!receipt) throw notFound()
+    const { fingerprint: _fingerprint, requestKey: _requestKey, ...safeReceipt } = receipt
+    const { root } = await this.location(runId)
+    const directory = join(root, "processes", sessionId)
+    const dirInfo = await lstat(directory).catch((error: unknown) => {
+      if (missing(error)) return undefined
+      throw error
+    })
+    if (!dirInfo) {
+      if (receipt.stdoutBytes || receipt.stderrBytes) throw changed()
+      return { session: safeReceipt, stream, ...readBufferArtifactRange(Buffer.alloc(0), query) }
+    }
+    if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) throw changed()
+    const path = join(directory, `${stream}.bin`)
+    const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(
+      (error: unknown) => {
+        if (missing(error) && !receipt[stream === "stdout" ? "stdoutBytes" : "stderrBytes"])
+          return undefined
+        throw error
+      },
+    )
+    if (!file)
+      return { session: safeReceipt, stream, ...readBufferArtifactRange(Buffer.alloc(0), query) }
+    try {
+      const [before, after] = await Promise.all([file.stat(), lstat(path)])
+      if (!before.isFile() || before.dev !== after.dev || before.ino !== after.ino) throw changed()
+      const bytes = Math.min(before.size, 64 * 1024 * 1024)
+      return { session: safeReceipt, stream, ...(await readArtifactRange(file, bytes, query)) }
+    } finally {
+      await file.close()
+    }
+  }
+
   async list(runId: string, kind: "artifacts" | "experiments", after?: string, limit = 16) {
     if (
       (after !== undefined && !UUID.test(after)) ||
@@ -430,6 +475,7 @@ export class RunEvidence {
       const inputs = [...new Set(input.inputRefs ?? [])]
       if (
         !statuses.includes(input.status) ||
+        (input.processSessionId !== undefined && !UUID.test(input.processSessionId)) ||
         inputs.length > 16 ||
         (input.note !== undefined &&
           (typeof input.note !== "string" || input.note.length > 2000)) ||
@@ -437,13 +483,35 @@ export class RunEvidence {
           (input.status !== "exited" || !Number.isSafeInteger(input.exitCode)))
       )
         throw new EvidenceError("invalid_query", "Invalid experiment observation")
+      const processReceipt = input.processSessionId
+        ? this.runs.localProcesses.operatorFind(runId, input.processSessionId)
+        : undefined
+      if (input.processSessionId && !processReceipt) throw notFound()
+      if (processReceipt) {
+        const expected =
+          processReceipt.state === "exited"
+            ? "exited"
+            : processReceipt.state === "interrupted"
+              ? "interrupted"
+              : processReceipt.state === "failed"
+                ? "failed"
+                : "unknown"
+        if (
+          input.status !== expected ||
+          (input.exitCode !== undefined && input.exitCode !== processReceipt.exitCode)
+        )
+          throw new EvidenceError(
+            "invalid_query",
+            "Experiment observation conflicts with process receipt",
+          )
+      }
       const ids = new Set(
         [...inputs, input.scriptRef, input.stdoutRef, input.stderrRef].filter(
           (id): id is string => id !== undefined,
         ),
       )
-      if (!ids.size)
-        throw new EvidenceError("invalid_query", "The experiment requires a saved file reference")
+      if (!ids.size && !processReceipt)
+        throw new EvidenceError("invalid_query", "The experiment requires a saved reference")
       const refs = new Map<string, ArtifactRef>()
       for (const id of ids) refs.set(id, await this.withCopy(runId, id, false, async (ref) => ref))
       const record: ExperimentRecord = {
@@ -453,11 +521,11 @@ export class RunEvidence {
         recordedBy: "operator",
         recordedAt: new Date().toISOString(),
         executionId: null,
-        processSessionId: null,
+        processSessionId: processReceipt?.id ?? null,
         imageDigest: "unknown",
         instanceId: "unknown",
         status: input.status,
-        exitCode: input.exitCode ?? null,
+        exitCode: processReceipt?.exitCode ?? input.exitCode ?? null,
         inputs: inputs.map((id) => refs.get(id)!),
         script: input.scriptRef ? refs.get(input.scriptRef)! : null,
         stdoutRef: input.stdoutRef ?? null,
@@ -478,6 +546,7 @@ export class RunEvidence {
         experimentId: record.id,
         status: record.status,
         refIds: [...ids],
+        processSessionId: record.processSessionId,
       })
       return record
     })
@@ -500,7 +569,9 @@ export class RunEvidence {
         record.imageDigest !== "unknown" ||
         record.instanceId !== "unknown" ||
         record.executionId !== null ||
-        record.processSessionId !== null ||
+        (record.processSessionId !== null &&
+          (!UUID.test(record.processSessionId) ||
+            !this.runs.localProcesses.operatorFind(runId, record.processSessionId))) ||
         !Number.isFinite(Date.parse(record.recordedAt)) ||
         (record.note !== undefined &&
           (typeof record.note !== "string" || record.note.length > 2000)) ||

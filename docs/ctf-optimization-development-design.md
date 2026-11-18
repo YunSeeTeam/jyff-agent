@@ -701,7 +701,7 @@ TERM→有限 grace→KILL 针对托管进程组；故意 setsid/daemonize 脱�
 
 固定附件日志通过 `GET /runs/:runId/fixed-attachments/:sessionId/log?stream=stdout` 读取。也可选择 `stderr`，分页沿用上述合约，默认为 Base64。每页的字节和会话状态来自同一份 RunStore 快照。运行中只显示已确认并保存的前缀，`finish` 提前停止时仍保留该前缀。关闭或重启后可直接读取已存日志；丢失的回执保持 `interrupted` 和空退出码。
 
-冻结副本及其 sidecar 共用每 Run 256 MiB 磁盘容量，重启后继续计入已占用字节。容量不足时本次保存返回 `artifact_storage_limit`，求解目标继续按原规则运行。写入冻结副本或清理标记后，对应数据能力为 `frozen-artifacts@1` 和 `pending-sandbox-cleanup@1`。阶段 5 的通用进程会话仍未交付。验收范围见路线图 3.7。
+冻结副本及其 sidecar 共用每 Run 256 MiB 磁盘容量，重启后继续计入已占用字节。容量不足时本次保存返回 `artifact_storage_limit`，求解目标继续按原规则运行。写入冻结副本或清理标记后，对应数据能力为 `frozen-artifacts@1` 和 `pending-sandbox-cleanup@1`。2026-11-19 增补通用受管进程会话：新 Run 设 `localProcesses=true` 时注册 `local-processes@1`，Supervisor 在专用 Run 挂载中落原始双流日志，Project 恢复时保留已知终态并将失联进程标为 interrupted。工程合同的真容器结果与 D 组效果验收状态分别见阶段 5 记录及路线图 3.7。
 
 <a id="sec-13"></a>
 

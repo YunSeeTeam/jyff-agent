@@ -243,7 +243,14 @@ export interface DashboardProject {
   readonly config?: Pick<ProjectConfig, "project">
   readonly evidence?: Pick<
     RunEvidence,
-    "list" | "capture" | "content" | "verify" | "record" | "experiment" | "fixedAttachmentLog"
+    | "list"
+    | "capture"
+    | "content"
+    | "verify"
+    | "record"
+    | "experiment"
+    | "fixedAttachmentLog"
+    | "processLog"
   >
   readonly solveGoals?: { list(): import("@ctf-agent/core").SolveGoal[] }
   refresh(): Promise<ContestOverview>

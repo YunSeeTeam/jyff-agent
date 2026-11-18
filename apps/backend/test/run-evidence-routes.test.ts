@@ -35,6 +35,7 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
     await writeFile(join(workspace, "example.txt"), "本地文件")
     const store = await RunStore.open(join(state, "runs.sqlite"))
     let fixedSessionId: string
+    let processSessionId: string
     try {
       for (const id of ["one", "two"]) {
         await mkdir(join(state, "runs", id), { recursive: true })
@@ -57,6 +58,27 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
         Buffer.concat([Buffer.alloc(12295, 0x81), Buffer.alloc(4102, 0x82)]),
       )
       reads.end("one", fixedSessionId, true)
+      const managed = store.localProcesses.reserve({
+        runId: "one",
+        owner: "worker",
+        requestKey: "sample",
+        fingerprint: "sample",
+        startedAt: new Date().toISOString(),
+        deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+      })
+      processSessionId = managed.receipt.id
+      const processDirectory = join(state, "runs", "one", "processes", processSessionId)
+      await mkdir(processDirectory, { recursive: true })
+      await writeFile(join(processDirectory, "stdout.bin"), Buffer.from([0x00, 0xff, 0x41]))
+      await writeFile(join(processDirectory, "stderr.bin"), Buffer.from([0x42]))
+      store.localProcesses.finish("one", processSessionId, {
+        state: "exited",
+        exitCode: 0,
+        stopReason: null,
+        stdoutBytes: 3,
+        stderrBytes: 1,
+        cleanupState: "confirmed",
+      })
     } finally {
       store.close()
     }
@@ -96,6 +118,18 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
     expect(
       (await app.request(fixedLog.replace("/local/", "/elsewhere/") + "?stream=stdout")).status,
     ).toBe(404)
+    const processLog = base + "/processes/" + processSessionId + "/log"
+    expect(await (await app.request(processLog + "?stream=stdout&offset=1")).json()).toMatchObject({
+      stream: "stdout",
+      offset: 1,
+      nextOffset: 3,
+      content: Buffer.from([0xff, 0x41]).toString("base64"),
+      session: { state: "exited", exitCode: 0, owner: "worker" },
+    })
+    expect(
+      (await app.request(processLog.replace("/one/", "/two/") + "?stream=stdout")).status,
+    ).toBe(404)
+    expect((await app.request(processLog + "?stream=stdin")).status).toBe(400)
     const live = "/api/projects/local/challenges/sample/files/range"
     expect(
       await (
@@ -147,6 +181,12 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
       note: "人工观察",
     })
     expect(saved.status).toBe(201)
+    const linked = await post(base + "/experiments", {
+      status: "exited",
+      processSessionId,
+    })
+    expect(linked.status).toBe(201)
+    expect((await linked.json()).processSessionId).toBe(processSessionId)
     const record = (await saved.json()) as ExperimentRecord
     await project.close()
     project = await openProject()

@@ -530,26 +530,26 @@ describe("Project 运行配置的优化设置", () => {
     const { app } = await appWithFileRuntime()
     const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
       ...base,
-      optimization: { localProcesses: true },
+      optimization: { review: { enabled: true } },
     })
     expect(response.status).toBe(400)
     expect(await jsonOf(response)).toMatchObject({
       error: "invalid_project_runtime_configuration",
       details: {
         reason: "configuration_dependency_error",
-        issues: [
+        issues: expect.arrayContaining([
           expect.objectContaining({
-            setting: "optimization.localProcesses",
-            requires: "local-processes",
+            setting: "optimization.review.enabled",
+            requires: "review",
           }),
-        ],
+        ]),
       },
     })
   })
 
-  it("保存固定附件模式并允许关闭，拒绝未实现的模式", async () => {
+  it("保存进程与固定附件模式并允许关闭，拒绝未知模式", async () => {
     const { app } = await appWithFileRuntime()
-    for (const mode of ["fixed-attachments", "unrecognized", false]) {
+    for (const mode of [true, "fixed-attachments", "unrecognized", false]) {
       const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
         ...base,
         optimization: { localProcesses: mode },
