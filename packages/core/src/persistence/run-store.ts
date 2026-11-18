@@ -64,6 +64,8 @@ export const RUN_STORE_DATA_CAPABILITIES = {
   "accepted-fact": 1,
   "bounded-subagent-reports": 1,
   "continuous-solve-goals": 1,
+  "pending-sandbox-cleanup": 1,
+  "frozen-artifacts": 1,
 } as const
 
 export type RunCloseReason =
@@ -1240,6 +1242,17 @@ export class RunStore {
       for (const [name, sql] of acceptedFactMigrations) {
         if (!runColumnNames.has(name)) database.exec(sql)
       }
+      if (!runColumnNames.has("sandbox_cleanup_pending")) {
+        database.exec(
+          "ALTER TABLE runs ADD COLUMN sandbox_cleanup_pending INTEGER NOT NULL DEFAULT 0 CHECK (sandbox_cleanup_pending IN (0,1))",
+        )
+        // Legacy Runs have no durable container-cleanup confirmation. Check their
+        // project/run labels once on upgrade, including already terminal Runs.
+        database.exec("UPDATE runs SET sandbox_cleanup_pending = 1")
+        database.exec(
+          "INSERT OR IGNORE INTO runtime_data_capabilities SELECT 'pending-sandbox-cleanup', 1 WHERE EXISTS (SELECT 1 FROM runs WHERE sandbox_cleanup_pending = 1)",
+        )
+      }
       // Runs that ended solved before the fact existed: success is known, its time is not.
       // Only on the migration that adds the column, so reopening never relabels new data.
       if (!hadSolveOutcome) {
@@ -1252,10 +1265,7 @@ export class RunStore {
         INSERT INTO runtime_data_capabilities (name, version) VALUES (?, ?)
         ON CONFLICT(name) DO UPDATE SET version = MAX(version, excluded.version)
       `)
-      for (const [name, version] of Object.entries(RUN_STORE_DATA_CAPABILITIES)) {
-        if (name !== "bounded-subagent-reports" && name !== "continuous-solve-goals")
-          registerCapability.run(name, version)
-      }
+      registerCapability.run("accepted-fact", RUN_STORE_DATA_CAPABILITIES["accepted-fact"])
       database.exec("COMMIT")
     } catch (error) {
       database.exec("ROLLBACK")
@@ -1746,6 +1756,26 @@ export class RunStore {
     return this.getRunOrThrow(input.runId)
   }
 
+  requireDataCapability(name: "pending-sandbox-cleanup" | "frozen-artifacts"): void {
+    this.database
+      .prepare("INSERT OR IGNORE INTO runtime_data_capabilities (name, version) VALUES (?, ?)")
+      .run(name, RUN_STORE_DATA_CAPABILITIES[name])
+  }
+
+  setSandboxCleanupPending(runId: string, pending: boolean): void {
+    if (pending) this.requireDataCapability("pending-sandbox-cleanup")
+    this.database
+      .prepare("UPDATE runs SET sandbox_cleanup_pending = ? WHERE id = ?")
+      .run(pending ? 1 : 0, runId)
+  }
+
+  pendingSandboxCleanup(): RunRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM runs WHERE sandbox_cleanup_pending = 1 ORDER BY created_at, id")
+      .all() as unknown as RunRow[]
+    return rows.map(runFromRow)
+  }
+
   dataCapabilities(): Record<string, number> {
     this.assertOpen()
     const rows = this.database
@@ -1762,6 +1792,7 @@ export class RunStore {
     const active = this.listRuns({
       status: ["preparing", "running", "blocking", "writing_writeup"],
     })
+    for (const run of active) this.setSandboxCleanupPending(run.id, true)
     return active.map((run) =>
       this.updateRun(
         run.id,
@@ -2878,12 +2909,13 @@ export class RunStore {
     return row !== undefined
   }
 
-  events(runId: string): RunEvent[] {
+  events(runId: string, filter?: "registered_evidence"): RunEvent[] {
     this.assertOpen()
     const rows = this.database
       .prepare(`
       SELECT * FROM run_events
       WHERE run_id = ?
+      ${filter === "registered_evidence" ? "AND type IN ('artifact_registered','experiment_recorded')" : ""}
       ORDER BY id ASC
     `)
       .all(runId) as unknown as EventRow[]

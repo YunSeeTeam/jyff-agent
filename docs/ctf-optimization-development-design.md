@@ -2,9 +2,9 @@
 
 | 项目     | 内容                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------- |
-| 文档版本 | 1.3（2026-11-15）：阶段 4 持续求解/恢复落地；预算只用于独立测试                          |
+| 文档版本 | 1.4（2026-11-18），补记阶段 5 实验证据与 Run 资源清理的实际交付范围                      |
 | 编制日期 | 2026-11-02                                                                               |
-| 状态     | 阶段 0—4 工程已实现；阶段 3 效果验收受限，阶段 5/6 待实现                                |
+| 状态     | 阶段 0—4 工程已实现，阶段 3 效果验收受限。阶段 5 部分交付，阶段 6 未开始。               |
 | 需求输入 | `jyff_agent_ctf_optimization_plan_v1.md`（不在本仓库内），以下简称“原方案”               |
 | 代码基线 | `5ae3b9d56fff505dde3e3de60de089a7973eac52`；本次本地 HEAD 与其一致，核查开始时工作树干净 |
 | 读者     | 后端、Agent 运行时、前端、测试、部署维护人员                                             |
@@ -694,6 +694,12 @@ TERM→有限 grace→KILL 针对托管进程组；故意 setsid/daemonize 脱�
 范围读取应在允许目录内做规范路径和符号链接解析检查，并尽可能使用已校验文件句柄读取，避免检查后再按可替换路径打开的竞态。宿主快照目录不直接允许模型任意写入；workspace 中的文件仍可被共享 bash 修改，所以 hash 不能证明“谁写的”或实验真实发生。
 
 复用现有 workspace 文件展示，但补真正 offset/length 读取，不能调用全文件读取后在返回前 slice 就宣称解决大文件 IO。稳定引用复制产生额外磁盘占用，计入独立的 Artifact 保留容量并在发布前检查；超过容量报错，不删除活跃引用腾空间。Project reset/delete 仍可删除所属数据，不能宣称永久档案。
+
+**2026-11-18 实施记录。** 在题目「文件」页可按偏移查看原文件，并在所选 Run 下保存完整快照或指定长度的前缀。操作者可按引用浏览、完整校验和登记实验。登记描述人工观察，未知环境标为 `unknown`，没有关联的执行或进程 ID 记为 `null`。
+
+项目范围 HTTP 前缀为 `/api/projects/:projectId`。`GET /challenges/:challengeId/files/range` 接受相对路径 `path`，与 `GET /runs/:runId/artifacts/:refId/content` 共用 `offset`、`limitBytes` 和 `encoding`。页默认 8192 字节，最大 32768 字节，返回下次可读的 `nextOffset`。`POST /runs/:runId/artifacts` 保存文件，`POST /runs/:runId/artifacts/:refId/verify` 核验整个副本。`POST /runs/:runId/experiments` 记录输入、脚本和输出引用，`GET /runs/:runId/experiments/:id` 读取记录。两类集合都支持游标分页。
+
+冻结副本及其 sidecar 共用每 Run 256 MiB 磁盘容量，重启后继续计入已占用字节。容量不足时本次保存返回 `artifact_storage_limit`，求解目标继续按原规则运行。写入冻结副本或清理标记后，对应数据能力为 `frozen-artifacts@1` 和 `pending-sandbox-cleanup@1`。阶段 5 的通用进程会话仍未交付。验收范围见路线图 3.7。
 
 <a id="sec-13"></a>
 

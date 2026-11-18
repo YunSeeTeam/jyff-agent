@@ -14,6 +14,7 @@ import type { Model } from "@earendil-works/pi-ai"
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
 import { RunStore } from "../../src/persistence/run-store.ts"
+import { CtfSubagentManager } from "../../src/collaboration/subagent-manager.ts"
 import { Project } from "../../src/project/project.js"
 import { testPlatform } from "../fake-platform.ts"
 
@@ -793,6 +794,79 @@ describe("Project", () => {
     }
   })
 
+  it("逐 Run 重试遗留容器回收，保留 failed 终态和写报告时的 accepted 事实", async () => {
+    const root = await fixture()
+    const store = await RunStore.open(join(root, ".ctf-agent", "runs.sqlite"))
+    const acceptedAt = "2026-08-12T10:00:00.000Z"
+    try {
+      store.createRun({ id: "failed", challengeId: "one", workspace: root, attempt: 1 })
+      store.setSandboxCleanupPending("failed", true)
+      store.updateRun("failed", {
+        status: "failed",
+        error: "original failure",
+        cleanupError: "original cleanup failure",
+      })
+      store.createRun({ id: "writeup", challengeId: "two", workspace: root, attempt: 1 })
+      store.recordSolveOutcome({ runId: "writeup", outcome: "accepted", observedAt: acceptedAt })
+      store.updateRun("writeup", { status: "writing_writeup" })
+    } finally {
+      store.close()
+    }
+    const calls: string[] = []
+    let fail = true
+    const options = {
+      root,
+      platforms: [testPlatform],
+      sandboxFactory: async () => new FakeSandbox(),
+      removeManagedSandboxes: async (ids: readonly string[]) => {
+        calls.push(...ids)
+        if (fail && ids.includes("failed")) throw new Error("local cleanup unavailable")
+      },
+    }
+    const first = await Project.open(options)
+    try {
+      expect(calls.sort()).toEqual(["failed", "writeup"])
+      expect(first.diagnostics()).toContainEqual(
+        expect.objectContaining({ code: "sandbox", runId: "failed" }),
+      )
+      expect(first.runs()).toContainEqual(
+        expect.objectContaining({
+          id: "failed",
+          status: "failed",
+          error: "original failure",
+          cleanupError: "original cleanup failure",
+        }),
+      )
+      expect(first.runs()).toContainEqual(
+        expect.objectContaining({
+          id: "writeup",
+          status: "interrupted",
+          solveOutcome: "accepted",
+          observedAcceptedAt: acceptedAt,
+          writeupStatus: "interrupted",
+        }),
+      )
+      expect(first.solveGoals.get("one")).toBeUndefined()
+    } finally {
+      await first.close()
+    }
+    calls.length = 0
+    fail = false
+    const next = await Project.open(options)
+    try {
+      expect(calls).toEqual(["failed"])
+    } finally {
+      await next.close()
+    }
+    calls.length = 0
+    const confirmed = await Project.open(options)
+    try {
+      expect(calls).toEqual([])
+    } finally {
+      await confirmed.close()
+    }
+  })
+
   it("重启后可从 interrupted Run 的 session.jsonl 恢复 Solver", async () => {
     const root = await fixture()
     const first = await Project.open({
@@ -945,6 +1019,36 @@ describe("Project.setThinkingLevel(运行中切换思考强度)", () => {
 })
 
 describe("Project · ShellPoop 会话生命周期", () => {
+  it("会话关闭抛错时仍回收 SubAgent 与容器，保留原错误", async () => {
+    const root = await fixture()
+    const sandbox = new FakeSandbox()
+    const closeManager = vi.spyOn(CtfSubagentManager.prototype, "close")
+    vi.mocked(createShellPoopSession).mockReturnValueOnce({
+      tools: [],
+      close: vi.fn().mockRejectedValue(new Error("offline cleanup failure")),
+    })
+    const project = await Project.open({
+      root,
+      platforms: [testPlatform],
+      sandboxFactory: async () => sandbox,
+      shellpoopConfig: async (_signal, context) => ({
+        baseUrl: "http://unused.invalid",
+        challengeId: context.challengeId,
+      }),
+    })
+    try {
+      const solver = await project.createSolver("warmup-flag", { agent: agentOptions })
+      await expect(solver.close("manual")).rejects.toThrow()
+      expect(closeManager).toHaveBeenCalled()
+      expect(sandbox.closed).toBe(true)
+      expect(project.runs()[0]?.cleanupError).toContain(
+        "ShellPoop 回收失败: offline cleanup failure",
+      )
+    } finally {
+      closeManager.mockRestore()
+      await project.close()
+    }
+  })
   it("run 创建时按 challenge 建会话；solver 关闭时调用会话 close()", async () => {
     const root = await fixture()
     const sessionClose = vi.fn().mockResolvedValue(undefined)

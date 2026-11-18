@@ -286,7 +286,12 @@ export function challengeRoutes(services: Services): App {
     if (file.size > WORKSPACE_PREVIEW_MAX_BYTES) {
       throw new HttpError(413, "workspace_preview_too_large", "文件超过 256 KiB，无法在线预览")
     }
-    const content = await readWorkspaceFile(project, c.req.param("challengeId"), artifactPath)
+    const content = await readWorkspaceFile(
+      project,
+      c.req.param("challengeId"),
+      artifactPath,
+      WORKSPACE_PREVIEW_MAX_BYTES,
+    )
     if (content.byteLength > WORKSPACE_PREVIEW_MAX_BYTES) {
       throw new HttpError(413, "workspace_preview_too_large", "文件超过 256 KiB，无法在线预览")
     }
@@ -420,11 +425,19 @@ async function readWorkspaceFile(
   project: DashboardProject,
   challengeId: string,
   artifactPath: string,
+  maximumBytes?: number,
 ): Promise<Uint8Array> {
   try {
-    return await project.challengeWorkspaceFile(challengeId, artifactPath)
+    return await project.challengeWorkspaceFile(challengeId, artifactPath, maximumBytes)
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
+    if (
+      maximumBytes !== undefined &&
+      error instanceof Error &&
+      error.message.startsWith("Workspace artifact exceeds")
+    ) {
+      throw new HttpError(413, "workspace_preview_too_large", "文件超过 256 KiB，无法在线预览")
+    }
     if (code === "ENOENT") {
       throw new HttpError(404, "workspace_file_not_found", "文件不存在")
     }

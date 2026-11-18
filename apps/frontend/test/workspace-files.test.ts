@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { render, screen, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { userEvent } from "@testing-library/user-event"
 import { createElement } from "react"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test"
@@ -14,6 +14,7 @@ function jsonResponse(data: unknown): Response {
 
 describe("Workspace 文件面板", () => {
   afterEach(() => {
+    cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
@@ -112,5 +113,74 @@ describe("Workspace 文件面板", () => {
     await user.click(screen.getByRole("button", { name: "预览 notes.md" }))
     expect(await screen.findByRole("heading", { name: "Report" })).toBeTruthy()
     expect(screen.getByText("confirmed")).toBeTruthy()
+  })
+
+  it("在选中的 Run 保存快照，按字节翻页并登记人工观察", async () => {
+    const ref = {
+      refId: "file-1",
+      path: "notes.txt",
+      sha256: "a".repeat(64),
+      byteLength: 8,
+      state: "final",
+    }
+    const record = {
+      id: "obs-1",
+      recordedAt: "2026-11-18",
+      status: "unknown",
+      exitCode: null,
+      note: "复核",
+    }
+    const calls: Array<[string, string | null]> = []
+    const base = "/api/projects/local/runs/r1"
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const path = String(url)
+        const body = typeof init?.body === "string" ? init.body : null
+        calls.push([path, body])
+        if (path.endsWith("/files")) return jsonResponse({ files: [], truncated: false })
+        if (path.includes("/content?")) {
+          const at = Number(new URL(path, "http://local").searchParams.get("offset"))
+          return jsonResponse({
+            ref,
+            offset: at,
+            nextOffset: at + 4,
+            encoding: "base64",
+            content: at ? "RUZHSA==" : "QUJDRA==",
+            byteLength: 8,
+            hasMore: !at,
+          })
+        }
+        if (body && path.endsWith("/artifacts")) return jsonResponse(ref)
+        if (body && path.endsWith("/experiments")) return jsonResponse(record)
+        return jsonResponse({ ids: [] })
+      }),
+    )
+    render(
+      createElement(WorkspaceFilesPanel, {
+        projectId: "local",
+        challengeId: "sample",
+        runId: "r1",
+      }),
+    )
+    const user = userEvent.setup()
+    await user.click(await screen.findByText("本次 Run 的文件快照与实验记录"))
+    await user.type(await screen.findByLabelText("工作区文件路径"), "notes.txt")
+    await user.click(screen.getByRole("button", { name: "保存快照" }))
+    expect(await screen.findByText("QUJDRA==")).toBeTruthy()
+    expect(calls).toContainEqual([base + "/artifacts", JSON.stringify({ path: "notes.txt" })])
+    await user.click(screen.getByRole("button", { name: "下一页" }))
+    expect(await screen.findByText("RUZHSA==")).toBeTruthy()
+    expect(calls).toContainEqual([
+      base + "/artifacts/file-1/content?offset=4&encoding=base64",
+      null,
+    ])
+    await user.type(screen.getByLabelText("实验备注"), "复核")
+    await user.click(screen.getByRole("button", { name: "以此快照登记实验" }))
+    expect(await screen.findByText("已登记人工实验记录")).toBeTruthy()
+    expect(calls).toContainEqual([
+      base + "/experiments",
+      JSON.stringify({ inputRefs: ["file-1"], status: "unknown", note: "复核" }),
+    ])
   })
 })

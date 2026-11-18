@@ -81,6 +81,8 @@ import {
 } from "./run-config-snapshot.ts"
 import { openRunSkills, SkillSnapshotError } from "./run-skill-snapshot.ts"
 import { persistAcceptedReceipt, recoverAcceptedReceipts } from "./accepted-receipt.ts"
+import { RunEvidence } from "./experiment-record.ts"
+import type { ArtifactRangeQuery } from "./artifact-range-reader.ts"
 import {
   readBlackboard,
   createBlackboardReadTool,
@@ -148,6 +150,7 @@ import {
   challengeWorkspaceKey,
   challengeWorkspacePath,
   listWorkspaceArtifacts,
+  readChallengeWorkspaceRange,
   readWorkspaceArtifact,
   type WorkspaceArtifactListing,
 } from "./challenge-workspace.ts"
@@ -235,7 +238,7 @@ export interface ProjectTelemetryOptions {
 }
 
 export interface ProjectDiagnostic {
-  code: "skill" | "subagent" | "telemetry" | "environment" | "sandbox"
+  code: "skill" | "subagent" | "telemetry" | "environment" | "sandbox" | "evidence"
   message: string
   createdAt: string
   path?: string
@@ -295,6 +298,7 @@ export class SolverCreationError extends Error {
  * Project 是比赛的基本单元：它拥有完整平台 API 与持久化；Solver 永远只获得单题 capability。
  */
 export class Project {
+  readonly evidence: RunEvidence
   readonly root: string
   readonly config: ProjectConfig
   readonly agentDirectory: string
@@ -349,6 +353,7 @@ export class Project {
     this.root = root
     this.config = config
     this.agentDirectory = agentDirectory
+    this.evidence = new RunEvidence(agentDirectory, runStore)
     this.diagnosticLog = [...diagnostics]
   }
 
@@ -400,27 +405,36 @@ export class Project {
       await recoverAcceptedReceipts(runStore, agentDirectory, config.project.id)
       runStore.markInterruptedModelRequests()
       // Project.open 只可能发生在新进程/新控制面中；遗留活跃记录不可继续信任。
-      const interruptedRuns = runStore.markInterruptedRuns()
+      const interrupted = new Set(runStore.markInterruptedRuns().map((run) => run.id))
       runStore.markInterruptedSubagents()
       const removeManagedSandboxes =
         options.removeManagedSandboxes ??
-        (options.sandboxFactory === undefined ? removeManagedContainers : undefined)
+        (options.sandboxFactory === undefined
+          ? (ids: readonly string[]) => removeManagedContainers(ids, undefined, config.project.id)
+          : undefined)
       const sandboxDiagnostics: ProjectDiagnostic[] = []
-      if (removeManagedSandboxes && interruptedRuns.length > 0) {
-        try {
-          await removeManagedSandboxes(interruptedRuns.map((run) => run.id))
-        } catch (error) {
-          // SIGKILL/OOM 无法执行进程关闭钩子；保留诊断并允许读取本地记录，
-          // 后续显式重置仍会再次按 run 标签尝试回收这些容器。
-          sandboxDiagnostics.push({
-            code: "sandbox",
-            message: `遗留 Docker Sandbox 回收失败: ${errorText(error)}`,
-            createdAt: new Date().toISOString(),
-          })
-          for (const run of interruptedRuns) {
-            const goal =
-              runStore.solveGoals.get(run.challengeId) ??
-              runStore.solveGoals.begin(run.challengeId, true)
+      if (removeManagedSandboxes) {
+        for (const run of runStore.pendingSandboxCleanup()) {
+          try {
+            await removeManagedSandboxes([run.id])
+            runStore.setSandboxCleanupPending(run.id, false)
+          } catch (error) {
+            sandboxDiagnostics.push({
+              code: "sandbox",
+              runId: run.id,
+              message: `遗留 Docker Sandbox 回收失败: ${errorText(error)}`,
+              createdAt: new Date().toISOString(),
+            })
+            if (!interrupted.has(run.id) || runStore.isSolved(run.challengeId)) continue
+            const existing = runStore.solveGoals.get(run.challengeId)
+            if (
+              existing &&
+              (existing.state === "stopped" ||
+                existing.state === "accepted" ||
+                (existing.runId && existing.runId !== run.id))
+            )
+              continue
+            const goal = existing ?? runStore.solveGoals.begin(run.challengeId, true)
             runStore.solveGoals.update(goal.id, {
               state: "paused",
               runId: run.id,
@@ -435,7 +449,7 @@ export class Project {
         runStore,
       )
       const environmentDiagnostics = localOnly ? [] : await remoteEnvironments.reconcile(platform)
-      return new Project(
+      const project = new Project(
         root,
         config,
         agentDirectory,
@@ -479,6 +493,10 @@ export class Project {
         ],
         options.runSettings ?? defaultRunSettings,
       )
+      await project.evidence.recover((runId, message) =>
+        project.recordDiagnostic("evidence", message, runId),
+      )
+      return project
     } catch (error) {
       const failures: unknown[] = [error]
       try {
@@ -697,10 +715,19 @@ export class Project {
     return listWorkspaceArtifacts(challengeWorkspacePath(this.agentDirectory, challengeId))
   }
 
-  challengeWorkspaceFile(challengeId: string, artifactPath: string): Promise<Uint8Array> {
+  challengeWorkspaceRange(challengeId: string, path: string, query: ArtifactRangeQuery) {
+    return readChallengeWorkspaceRange(this.agentDirectory, challengeId, path, query)
+  }
+
+  challengeWorkspaceFile(
+    challengeId: string,
+    artifactPath: string,
+    maximumBytes?: number,
+  ): Promise<Uint8Array> {
     return readWorkspaceArtifact(
       challengeWorkspacePath(this.agentDirectory, challengeId),
       artifactPath,
+      maximumBytes,
     )
   }
 
@@ -1053,6 +1080,10 @@ export class Project {
   }
   /** 完全重置单题：清空 RunStore 中该题全部状态，并删除 Run session 目录与题目 workspace。 */
   async resetChallenge(challengeId: string): Promise<void> {
+    return this.evidence.exclusive(() => this.resetChallengeData(challengeId))
+  }
+
+  private async resetChallengeData(challengeId: string): Promise<void> {
     if (this.closed) throw new Error("Project 已关闭")
     // 防御性关闭该题仍在内存中的 solver（调度路径已关则幂等返回；
     // 兜底 ContestRunner 等不经过 scheduler 的活跃 solver 边角场景）
@@ -1092,6 +1123,7 @@ export class Project {
       ),
     )
     for (const run of deletedRuns) {
+      this.evidence.forget(run.id)
       this.subagentManagers.delete(run.id)
       this.runChallengeContexts.delete(run.id)
       this.frozenRunSettings.delete(run.id)
@@ -1283,7 +1315,10 @@ export class Project {
     }
     // A previous process may have died before cleanup. Never create a replacement
     // Sandbox until the old Run's managed containers have been reclaimed.
-    await this.removeManagedSandboxes?.([runId])
+    if (this.removeManagedSandboxes) {
+      await this.removeManagedSandboxes([runId])
+      this.runStore.setSandboxCleanupPending(runId, false)
+    }
     return this.createSolverForRun(run.challengeId, options, run)
   }
 
@@ -1410,6 +1445,7 @@ export class Project {
       const skills = runSkills
         ? await runSkills.forSolver()
         : await materializeSkills(this.skills, workspace)
+      this.runStore.setSandboxCleanupPending(runId, true)
       sandbox = await this.sandboxFactory({
         projectId: this.config.project.id,
         runId,
@@ -1613,10 +1649,18 @@ export class Project {
         onBeforeCleanup: async () => {
           webAccessSignal.abort()
           shellpoopSignal.abort()
-          // 会话 close() 尽力删除本 run 创建的 shell（内部 DELETE 不受刚 abort
-          // 的信号影响），随后回收 SubAgent。抛错由 performClose 记为 cleanupError。
-          await shellpoopSession?.close()
-          return subagentManager?.close()
+          const failures: string[] = []
+          try {
+            await shellpoopSession?.close()
+          } catch (error) {
+            failures.push(`ShellPoop 回收失败: ${errorText(error)}`)
+          }
+          try {
+            await subagentManager?.close()
+          } catch (error) {
+            failures.push(`SubAgent 回收失败: ${errorText(error)}`)
+          }
+          if (failures.length) throw new Error(failures.join("\n"))
         },
         onClosed: async (details) => {
           this.solvers.delete(solver)
@@ -1643,6 +1687,7 @@ export class Project {
             details,
           )
           await this.persistRecord(updated, runDirectory)
+          if (!details.cleanupErrors.length) this.runStore.setSandboxCleanupPending(runId, false)
         },
       })
       subagentManager.attachParent(solver)
@@ -1765,6 +1810,7 @@ export class Project {
       if (sandbox) {
         try {
           await sandbox.close()
+          this.runStore.setSandboxCleanupPending(runId, false)
         } catch (cleanupError) {
           cleanupErrors.push(`Sandbox 关闭失败: ${errorText(cleanupError)}`)
         }
@@ -1963,6 +2009,7 @@ export class Project {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    await this.evidence.close()
     this.agentStreamListeners.clear()
     this.agentStreamSequences.clear()
     this.activeStreamMessages.clear()

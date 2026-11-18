@@ -1,4 +1,4 @@
-import type { WorkspaceArtifactEntry } from "@ctf-agent/core"
+import type { ArtifactPage, WorkspaceArtifactEntry } from "@ctf-agent/core"
 import { Icon } from "@iconify/react"
 import { useEffect, useState } from "react"
 import { MarkdownContent } from "../../components/content/MarkdownContent.tsx"
@@ -17,7 +17,7 @@ import { apiRequest } from "../../lib/api.ts"
 import { errorMessage } from "../../lib/format.ts"
 
 export interface WorkspaceFilePreviewDescriptor {
-  kind: "markdown" | "code" | "text"
+  kind: "markdown" | "code" | "text" | "range"
   language: string
 }
 
@@ -34,11 +34,13 @@ interface WorkspaceFilePreview extends WorkspaceFilePreviewDescriptor {
 export function WorkspaceFilePreviewDialog({
   file,
   previewUrl,
+  rangeUrl,
   downloadUrl,
   onClose,
 }: {
   file: PreviewableWorkspaceFile | null
   previewUrl: string | null
+  rangeUrl?: string
   downloadUrl: string | null
   onClose: () => void
 }) {
@@ -47,7 +49,7 @@ export function WorkspaceFilePreviewDialog({
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    if (!file?.preview) {
+    if (!file?.preview || file.preview.kind === "range") {
       setPreview(null)
       setError("")
       setLoading(false)
@@ -107,7 +109,13 @@ export function WorkspaceFilePreviewDialog({
         </header>
 
         <div className="min-h-0 flex-1 overflow-auto bg-background">
-          {loading ? (
+          {file?.preview?.kind === "range" && rangeUrl ? (
+            <LiveFileRange
+              key={rangeUrl}
+              url={rangeUrl}
+              defaultEncoding={file.preview.language === "utf8" ? "utf8" : "base64"}
+            />
+          ) : loading ? (
             <div className="flex h-full min-h-48 items-center justify-center">
               <Spinner label="加载文件预览" />
             </div>
@@ -131,5 +139,102 @@ export function WorkspaceFilePreviewDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function LiveFileRange({
+  url,
+  defaultEncoding,
+}: {
+  url: string
+  defaultEncoding: ArtifactPage["encoding"]
+}) {
+  const [offset, setOffset] = useState("0")
+  const [requested, setRequested] = useState({ offset: "0", encoding: defaultEncoding })
+  const [page, setPage] = useState<ArtifactPage | null>(null)
+  const [error, setError] = useState("")
+  useEffect(() => {
+    const controller = new AbortController()
+    setPage(null)
+    setError("")
+    void apiRequest<ArtifactPage>(url + "&" + new URLSearchParams(requested), {
+      signal: controller.signal,
+    })
+      .then((data) => {
+        if (!controller.signal.aborted) setPage(data)
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) setError(errorMessage(cause))
+      })
+    return () => controller.abort()
+  }, [url, requested])
+  return (
+    <div className="grid gap-3 p-4 text-xs">
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault()
+          setRequested({ ...requested, offset })
+        }}
+      >
+        <label>
+          编码{" "}
+          <select
+            className="rounded border bg-background p-1"
+            value={requested.encoding}
+            onChange={(e) =>
+              setRequested({ offset, encoding: e.target.value === "utf8" ? "utf8" : "base64" })
+            }
+          >
+            <option value="base64">Base64</option>
+            <option value="utf8">UTF-8</option>
+          </select>
+        </label>
+        <label>
+          字节偏移{" "}
+          <input
+            className="rounded border bg-background p-1"
+            type="number"
+            required
+            min="0"
+            step="1"
+            value={offset}
+            onChange={(e) => setOffset(e.target.value)}
+          />
+        </label>
+        <Button type="submit" size="sm" variant="outline">
+          读取范围
+        </Button>
+        {page?.hasMore && (
+          <Button
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => {
+              const next = String(page.nextOffset)
+              setRequested({ ...requested, offset: next })
+              setOffset(next)
+            }}
+          >
+            下一页
+          </Button>
+        )}
+      </form>
+      {error ? (
+        <ErrorNotice message={error} />
+      ) : page ? (
+        <>
+          <p>
+            工作区原文件 · 偏移 {page.offset} 至 {page.nextOffset}（结束位置不含在内） · 共{" "}
+            {page.byteLength} 字节
+          </p>
+          <pre className="overflow-auto whitespace-pre-wrap break-all font-mono">
+            {page.content}
+          </pre>
+        </>
+      ) : (
+        <Spinner label="加载字节范围" />
+      )}
+    </div>
   )
 }

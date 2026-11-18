@@ -254,7 +254,7 @@ export function ChallengePage() {
             </TabsContent>
 
             <TabsContent value="files" className="flex-1 overflow-y-auto p-4">
-              <WorkspaceFilesPanel projectId={projectId} challengeId={challengeId} />
+              <WorkspaceFilesPanel projectId={projectId} challengeId={challengeId} runId={rid} />
             </TabsContent>
 
             <TabsContent value="writeup" className="flex-1 overflow-y-auto p-4">

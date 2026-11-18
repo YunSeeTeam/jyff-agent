@@ -185,6 +185,7 @@ function successfulChildProcess(): ChildProcessWithoutNullStreams {
 describe("DockerSandbox resources", () => {
   it("默认限制每个 Solver 容器的 CPU、内存、swap、PID 与存储", () => {
     const args = dockerSandboxCreateArguments(options)
+    expect(args).toContain("--init")
 
     expect(valueAfter(args, "--cpus")).toBe(String(DEFAULT_DOCKER_SANDBOX_RESOURCES.cpus))
     expect(valueAfter(args, "--memory")).toBe(String(DEFAULT_DOCKER_SANDBOX_RESOURCES.memoryBytes))
@@ -383,10 +384,28 @@ describe("DockerSandbox resources", () => {
       .mockResolvedValueOnce(result(0, { stdout: "abc123\n" }))
       .mockResolvedValueOnce(result(0, { stdout: "" }))
       .mockResolvedValueOnce(result(0))
-    await removeManagedContainers(["run-a", "run-b"], execute)
+    await removeManagedContainers(["run-a", "run-b"], execute, "project")
     expect(execute.mock.calls.map(([args]) => args)).toEqual([
-      ["ps", "-aq", "--filter", "label=ctf-agent.run=run-a"],
-      ["ps", "-aq", "--filter", "label=ctf-agent.run=run-b"],
+      [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=ctf-agent.managed=true",
+        "--filter",
+        "label=ctf-agent.run=run-a",
+        "--filter",
+        "label=ctf-agent.project=project",
+      ],
+      [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=ctf-agent.managed=true",
+        "--filter",
+        "label=ctf-agent.run=run-b",
+        "--filter",
+        "label=ctf-agent.project=project",
+      ],
       ["rm", "-f", "abc123"],
     ])
   })

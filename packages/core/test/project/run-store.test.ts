@@ -1279,6 +1279,9 @@ describe("RunStore", () => {
 
     const migrated = await RunStore.open(path)
     expect(migrated.getRun("legacy-blocked")?.source).toBe("direct")
+    expect(migrated.pendingSandboxCleanup().map((run) => run.id)).toContain("legacy-blocked")
+    migrated.setSandboxCleanupPending("legacy-blocked", false)
+    expect(migrated.getRun("legacy-blocked")?.status).toBe("blocked")
     expect(migrated.challengeRuntimeState("legacy-challenge")).toEqual({
       challengeId: "legacy-challenge",
       blockScore: 9,

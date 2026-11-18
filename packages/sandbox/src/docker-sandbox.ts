@@ -289,6 +289,7 @@ export function dockerSandboxCreateArguments(
   const resources = resolveDockerSandboxResources(options.resources)
   const args = [
     "create",
+    "--init",
     "--name",
     name,
     "--label",
@@ -392,10 +393,18 @@ export async function clearDockerWorkspace(
 export async function removeManagedContainers(
   runIds: readonly string[],
   executeCommand: DockerCommandExecutor = executeDockerCommand,
+  projectId?: string,
 ): Promise<void> {
   const collected = new Set<string>()
   for (const runId of runIds) {
-    const listed = await executeCommand(["ps", "-aq", "--filter", `label=ctf-agent.run=${runId}`])
+    const filters = [
+      "--filter",
+      "label=ctf-agent.managed=true",
+      "--filter",
+      `label=ctf-agent.run=${runId}`,
+    ]
+    if (projectId !== undefined) filters.push("--filter", `label=ctf-agent.project=${projectId}`)
+    const listed = await executeCommand(["ps", "-aq", ...filters])
     if (listed.code !== 0) throw commandFailure("list", listed)
     for (const id of listed.stdout.trim().split(/\s+/).filter(Boolean)) collected.add(id)
   }

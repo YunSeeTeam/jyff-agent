@@ -4,6 +4,7 @@ import { Button, EmptyState, ErrorNotice, Spinner } from "../../components/index
 import { apiRequest, projectApi } from "../../lib/api.ts"
 import { errorMessage } from "../../lib/format.ts"
 import { absoluteTime } from "../../lib/time.ts"
+import { RunEvidencePanel } from "./RunEvidencePanel.tsx"
 import {
   type PreviewableWorkspaceFile,
   WorkspaceFilePreviewDialog,
@@ -17,14 +18,20 @@ interface WorkspaceFileListing {
 export function WorkspaceFilesPanel({
   projectId,
   challengeId,
+  runId,
 }: {
   projectId: string
   challengeId: string
+  runId?: string
 }) {
   const baseUrl = projectApi(projectId, `/api/challenges/${encodeURIComponent(challengeId)}/files`)
   return (
     <WorkspaceFilesBrowser
       listUrl={baseUrl}
+      rangeUrl={(path) => `${baseUrl}/range?path=${encodeURIComponent(path)}`}
+      evidenceUrl={
+        runId ? projectApi(projectId, `/api/runs/${encodeURIComponent(runId)}`) : undefined
+      }
       previewUrl={(path) => `${baseUrl}/preview?path=${encodeURIComponent(path)}`}
       downloadUrl={(path) => `${baseUrl}/download?path=${encodeURIComponent(path)}`}
       emptyDescription="派发 Solver 后，附件与生成的分析文件会显示在这里。"
@@ -34,14 +41,18 @@ export function WorkspaceFilesPanel({
 
 export function WorkspaceFilesBrowser({
   listUrl,
+  rangeUrl,
   previewUrl,
   downloadUrl,
   emptyDescription,
+  evidenceUrl,
 }: {
   listUrl: string
+  rangeUrl?: (path: string) => string
   previewUrl: (path: string) => string
   downloadUrl: (path: string) => string
   emptyDescription: string
+  evidenceUrl?: string
 }) {
   const [listing, setListing] = useState<WorkspaceFileListing | null>(null)
   const [previewFile, setPreviewFile] = useState<PreviewableWorkspaceFile | null>(null)
@@ -76,7 +87,18 @@ export function WorkspaceFilesBrowser({
       ) : null}
       {listing && listing.files.length > 0 ? (
         <WorkspaceFileTree
-          files={listing.files}
+          files={
+            rangeUrl
+              ? listing.files.map((file) =>
+                  !file.preview || file.size > 256 * 1024
+                    ? {
+                        ...file,
+                        preview: { kind: "range", language: file.preview ? "utf8" : "base64" },
+                      }
+                    : file,
+                )
+              : listing.files
+          }
           downloadUrl={downloadUrl}
           onPreview={setPreviewFile}
         />
@@ -89,10 +111,18 @@ export function WorkspaceFilesBrowser({
       ) : null}
       <WorkspaceFilePreviewDialog
         file={previewFile}
+        rangeUrl={previewFile && rangeUrl ? rangeUrl(previewFile.path) : undefined}
         previewUrl={previewFile ? previewUrl(previewFile.path) : null}
         downloadUrl={previewFile ? downloadUrl(previewFile.path) : null}
         onClose={() => setPreviewFile(null)}
       />
+      {evidenceUrl && (
+        <RunEvidencePanel
+          key={evidenceUrl}
+          url={evidenceUrl}
+          paths={listing?.files.map((file) => file.path) ?? []}
+        />
+      )}
     </div>
   )
 }

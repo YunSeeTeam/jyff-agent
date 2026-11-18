@@ -268,7 +268,7 @@ export class CtfSolverAgent extends BaseAgent {
       await this.onBeforeCleanup?.()
     } catch (cleanupError) {
       cleanupErrors.push(
-        `SubAgent 回收失败: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+        `Run 资源回收失败: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
       )
     }
     if (this.capability.instance) {

@@ -62,6 +62,33 @@ describe("updater minimum data reader capability (T40)", () => {
     await expect(assertDataCompatible(candidate, root)).rejects.toThrow("__proto__@1")
   })
 
+  it("rejects a stage 4 reader after evidence or pending cleanup data is written", async () => {
+    const { root, candidate, state } = await fixture()
+    const store = await RunStore.open(join(state, "runs.sqlite"))
+    const old = store.dataCapabilities()
+    try {
+      store.createRun({ id: "r", challengeId: "c", attempt: 1, workspace: "unused" })
+      store.setSandboxCleanupPending("r", true)
+      store.requireDataCapability("frozen-artifacts")
+    } finally {
+      store.close()
+    }
+    await writeFile(
+      join(candidate, "runtime-data-capabilities.json"),
+      JSON.stringify({ schemaVersion: 1, read: old }),
+    )
+    await expect(assertDataCompatible(candidate, root)).rejects.toMatchObject({
+      code: "source_update_data_incompatible",
+    })
+    expect(await requiredDataCapabilities(root)).toMatchObject({
+      "pending-sandbox-cleanup": 1,
+      "frozen-artifacts": 1,
+    })
+    await expect(
+      assertDataCompatible(fileURLToPath(new URL("../../../", import.meta.url)), root),
+    ).resolves.toBeUndefined()
+  })
+
   it("rejects malformed declaration versions even if no database yet needs them", async () => {
     const { root, candidate } = await fixture()
     await writeFile(

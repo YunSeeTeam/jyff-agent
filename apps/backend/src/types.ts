@@ -1,5 +1,7 @@
 import type {
   AgentStreamListener,
+  ArtifactPage,
+  ArtifactRangeQuery,
   AgentStreamTarget,
   Announcement,
   BlackboardStats,
@@ -23,6 +25,7 @@ import type {
   RemoteEnvironment,
   RemoteEnvironmentCoordinatorSnapshot,
   RunEvent,
+  RunEvidence,
   RunFilter,
   RunRecord,
   RunSessionExportMetadata,
@@ -237,6 +240,11 @@ export interface ChallengeDetails {
 }
 
 export interface DashboardProject {
+  readonly config?: Pick<ProjectConfig, "project">
+  readonly evidence?: Pick<
+    RunEvidence,
+    "list" | "capture" | "content" | "verify" | "record" | "experiment"
+  >
   readonly solveGoals?: { list(): import("@ctf-agent/core").SolveGoal[] }
   refresh(): Promise<ContestOverview>
   overview(): Promise<ContestOverview>
@@ -287,7 +295,16 @@ export interface DashboardProject {
   blackboardStats(): BlackboardStats[]
   challengeWriteup(challengeId: string): Promise<ChallengeWriteup>
   challengeWorkspaceFiles(challengeId: string): Promise<WorkspaceArtifactListing>
-  challengeWorkspaceFile(challengeId: string, artifactPath: string): Promise<Uint8Array>
+  challengeWorkspaceRange?(
+    challengeId: string,
+    path: string,
+    query: ArtifactRangeQuery,
+  ): Promise<ArtifactPage>
+  challengeWorkspaceFile(
+    challengeId: string,
+    artifactPath: string,
+    maximumBytes?: number,
+  ): Promise<Uint8Array>
   tldr(challengeId: string): TldrRecord | undefined
   refreshTldr(challengeId: string, agent: AgentOptions): Promise<TldrRecord>
   schedulerAttemptCount(challengeId: string): number

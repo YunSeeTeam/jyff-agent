@@ -23,6 +23,7 @@ import type { App, AppEnv, ProjectScope } from "./context.ts"
 import { errorHandler } from "./errors.ts"
 import { authenticationGate } from "./middleware/auth.ts"
 import { challengeRoutes } from "./routes/challenges.ts"
+import { evidenceRoutes } from "./routes/evidence.ts"
 import { codeAuditRoutes } from "./routes/code-audit.ts"
 import { fatherRoutes } from "./routes/father.ts"
 import { modelsRoutes, scopedModelsRoutes } from "./routes/models.ts"
@@ -148,6 +149,7 @@ export function buildRouter(services: Services, options: WebUiOptions): App {
   scoped.route("/", scopedSystemRoutes(services))
   scoped.route("/", scopedProjectRoutes(services))
   scoped.route("/", schedulerRoutes(services))
+  scoped.route("/", evidenceRoutes(services))
   scoped.route("/", challengeRoutes(services))
   scoped.route("/", runRoutes(services))
   scoped.route("/", scopedModelsRoutes(services))
