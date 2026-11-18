@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto"
 import type { BigIntStats } from "node:fs"
 import { lstat, mkdir, open, readdir, rename, rm, type FileHandle } from "node:fs/promises"
 import { join } from "node:path"
+import type { FixedReadStream } from "../persistence/fixed-attachment-reads.ts"
 import type { RunStore } from "../persistence/run-store.ts"
 import {
   EvidenceError,
   hashFilePrefix,
   readArtifactRange,
+  readBufferArtifactRange,
   type ArtifactRangeQuery,
 } from "./artifact-range-reader.ts"
 import { openChallengeWorkspaceArtifact, openWorkspaceArtifact } from "./challenge-workspace.ts"
@@ -375,6 +377,25 @@ export class RunEvidence {
       ref,
       ...(await readArtifactRange(file, ref.byteLength, query)),
     }))
+  }
+
+  async fixedAttachmentLog(
+    runId: string,
+    sessionId: string,
+    stream: FixedReadStream,
+    query: ArtifactRangeQuery,
+  ) {
+    if (this.closed) throw new EvidenceError("evidence_unavailable", "Project is closing")
+    if (stream !== "stdout" && stream !== "stderr")
+      throw new EvidenceError("invalid_query", "Expected stdout or stderr")
+    const log = this.runs.fixedAttachmentReads.log(runId, sessionId, stream)
+    if (!log) throw notFound()
+    const { id, ...receipt } = log.receipt
+    return {
+      session: { sessionId: id, ...receipt },
+      stream,
+      ...readBufferArtifactRange(log.bytes, query),
+    }
   }
 
   async list(runId: string, kind: "artifacts" | "experiments", after?: string, limit = 16) {

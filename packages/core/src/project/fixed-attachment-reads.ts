@@ -2,9 +2,10 @@ import { createHash } from "node:crypto"
 import { DockerSandbox, FixedAttachmentReader, type matchFixedAttachment } from "@ctf-agent/sandbox"
 import type { AgentTool } from "@earendil-works/pi-agent-core"
 import { Type } from "typebox"
-import type {
-  FixedAttachmentReadStore,
-  FixedReadReceipt,
+import {
+  type FixedAttachmentReadStore,
+  type FixedReadReceipt,
+  splitFixedReadOutput,
 } from "../persistence/fixed-attachment-reads.ts"
 
 const actions = ["open", "list", "status", "first", "second", "finish"] as const
@@ -12,19 +13,19 @@ type Action = (typeof actions)[number]
 const missing = () => new Error("Fixed attachment session not found in this scope")
 
 function describeOutput(data: Buffer, window: 1 | 2) {
-  const split = window === 1 ? 12294 : 12295
+  const { stdout, stderr } = splitFixedReadOutput(data, window)
   const stream = (bytes: Buffer) => ({
     bytes: bytes.length,
     sha256: createHash("sha256").update(bytes).digest("hex"),
   })
-  return { window, stdout: stream(data.subarray(0, split)), stderr: stream(data.subarray(split)) }
+  return { window, stdout: stream(stdout), stderr: stream(stderr) }
 }
 
 /** One immutable attachment for one Run. Identity comes from the Project and SubAgent manager. */
 export class FixedAttachmentReads {
   private readonly readers = new Map<string, FixedAttachmentReader>()
   private pending: Promise<void> = Promise.resolve()
-  private closing = false
+  private closing?: Promise<void>
 
   constructor(
     private readonly runId: string,
@@ -162,14 +163,19 @@ export class FixedAttachmentReads {
     })
   }
 
-  async close() {
-    this.closing = true
-    await this.pending
-    const results = await Promise.allSettled([...this.readers.keys()].map((id) => this.finish(id)))
-    const errors = results.flatMap((r) => (r.status === "rejected" ? [r.reason] : []))
-    if (errors.length) {
-      const causes = errors.map((error) => (error instanceof Error ? error.message : String(error)))
-      throw new AggregateError(errors, "Fixed attachment cleanup failed: " + causes.join(", "))
-    }
+  close() {
+    this.closing ??= this.serialize(async () => {
+      const results = await Promise.allSettled(
+        [...this.readers.keys()].map((id) => this.finish(id)),
+      )
+      const errors = results.flatMap((r) => (r.status === "rejected" ? [r.reason] : []))
+      if (errors.length) {
+        const causes = errors.map((error) =>
+          error instanceof Error ? error.message : String(error),
+        )
+        throw new AggregateError(errors, "Fixed attachment cleanup failed: " + causes.join(", "))
+      }
+    })
+    return this.closing
   }
 }

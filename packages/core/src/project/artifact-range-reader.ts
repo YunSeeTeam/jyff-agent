@@ -67,6 +67,22 @@ export async function readArtifactRange(
   byteLength: number,
   query: ArtifactRangeQuery = {},
 ): Promise<ArtifactPage> {
+  const { offset, limitBytes, encoding } = validatedRange(byteLength, query)
+  const bytes = Buffer.allocUnsafe(Math.min(byteLength - offset, limitBytes))
+  await readBytes(file, bytes, bytes.length, offset)
+  return encodePage(bytes, byteLength, offset, encoding)
+}
+
+/** For an already bounded and immutable snapshot of stored bytes. */
+export function readBufferArtifactRange(
+  bytes: Buffer,
+  query: ArtifactRangeQuery = {},
+): ArtifactPage {
+  const { offset, limitBytes, encoding } = validatedRange(bytes.length, query)
+  return encodePage(bytes.subarray(offset, offset + limitBytes), bytes.length, offset, encoding)
+}
+
+function validatedRange(byteLength: number, query: ArtifactRangeQuery) {
   const { offset = 0, limitBytes = 8192, encoding = "base64" } = query
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > byteLength)
     throw new EvidenceError("invalid_offset", "Offset is outside the recorded file")
@@ -77,8 +93,15 @@ export async function readArtifactRange(
     (encoding !== "base64" && encoding !== "utf8")
   )
     throw new EvidenceError("invalid_query", "Expected 1–32768 bytes and base64 or utf8 encoding")
-  const bytes = Buffer.allocUnsafe(Math.min(byteLength - offset, limitBytes))
-  await readBytes(file, bytes, bytes.length, offset)
+  return { offset, limitBytes, encoding }
+}
+
+function encodePage(
+  bytes: Buffer,
+  byteLength: number,
+  offset: number,
+  encoding: ArtifactPage["encoding"],
+): ArtifactPage {
   let content: string
   let consumed = bytes.length
   if (encoding === "base64") {

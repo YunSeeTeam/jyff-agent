@@ -34,18 +34,68 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
     await mkdir(workspace, { recursive: true })
     await writeFile(join(workspace, "example.txt"), "本地文件")
     const store = await RunStore.open(join(state, "runs.sqlite"))
+    let fixedSessionId: string
     try {
       for (const id of ["one", "two"]) {
         await mkdir(join(state, "runs", id), { recursive: true })
         store.createRun({ id, challengeId: "sample", workspace, attempt: id === "one" ? 1 : 2 })
         store.updateRun(id, { status: "failed" })
       }
+      const reads = store.fixedAttachmentReads
+      fixedSessionId = reads.reserve("one", "solver", "misc1").receipt.id
+      reads.acknowledge("one", fixedSessionId, 12)
+      reads.save(
+        "one",
+        fixedSessionId,
+        1,
+        Buffer.concat([Buffer.alloc(12294, 0xff), Buffer.alloc(4102, 0x00)]),
+      )
+      reads.save(
+        "one",
+        fixedSessionId,
+        2,
+        Buffer.concat([Buffer.alloc(12295, 0x81), Buffer.alloc(4102, 0x82)]),
+      )
+      reads.end("one", fixedSessionId, true)
     } finally {
       store.close()
     }
     project = await openProject()
     let { app } = createWebUiApp({ project })
     const base = "/api/projects/local/runs/one"
+    const fixedLog = base + "/fixed-attachments/" + fixedSessionId + "/log"
+    const boundary = await app.request(fixedLog + "?stream=stdout&offset=12293&limitBytes=2")
+    expect(boundary.status).toBe(200)
+    expect(boundary.headers.get("Cache-Control")).toBe("no-store")
+    const fixedPage = await boundary.json()
+    expect(fixedPage).toMatchObject({
+      session: {
+        sessionId: fixedSessionId,
+        runId: "one",
+        state: "exited",
+        windows: 2,
+        exitCode: 0,
+      },
+      stream: "stdout",
+      encoding: "base64",
+      offset: 12293,
+      nextOffset: 12295,
+      byteLength: 24589,
+      content: Buffer.from([0xff, 0x81]).toString("base64"),
+    })
+    expect(
+      await (await app.request(fixedLog + "?stream=stderr&offset=4101&limitBytes=2")).json(),
+    ).toMatchObject({ byteLength: 8204, content: Buffer.from([0x00, 0x82]).toString("base64") })
+    expect((await app.request(fixedLog + "?stream=stdout&offset=24590")).status).toBe(400)
+    expect((await app.request(fixedLog + "?stream=stdout&stream=stderr")).status).toBe(400)
+    expect((await app.request(fixedLog + "?stream=input")).status).toBe(400)
+    expect((await app.request(fixedLog + "?stream=stdout&encoding=utf8")).status).toBe(422)
+    expect((await app.request(fixedLog.replace("/one/", "/two/") + "?stream=stdout")).status).toBe(
+      404,
+    )
+    expect(
+      (await app.request(fixedLog.replace("/local/", "/elsewhere/") + "?stream=stdout")).status,
+    ).toBe(404)
     const live = "/api/projects/local/challenges/sample/files/range"
     expect(
       await (
@@ -101,12 +151,16 @@ it("saves, browses and resets an offline Run through project-scoped evidence end
     await project.close()
     project = await openProject()
     app = createWebUiApp({ project }).app
+    expect(
+      await (await app.request(fixedLog + "?stream=stdout&offset=12293&limitBytes=2")).json(),
+    ).toEqual(fixedPage)
     expect(project.diagnostics().filter((d) => d.code === "evidence")).toEqual([])
     expect(await (await app.request(base + "/artifacts")).json()).toEqual({ ids: [ref.refId] })
     expect(await (await app.request(base + "/experiments/" + record.id)).json()).toEqual(record)
     expect(await (await post(file + "/verify", {})).json()).toEqual(ref)
     await project.resetChallenge("sample")
     expect((await app.request(file + "/content")).status).toBe(404)
+    expect((await app.request(fixedLog + "?stream=stdout")).status).toBe(404)
   } finally {
     await project?.close()
     await rm(root, { recursive: true, force: true })

@@ -104,6 +104,21 @@ export function evidenceRoutes(services: Services): App {
     const q = query(c, ["offset", "limitBytes", "encoding"])
     return response(c, evidence(c).content(c.req.param("runId"), c.req.param("refId"), range(q)))
   })
+  app.get("/runs/:runId/fixed-attachments/:sessionId/log", (c) => {
+    const q = query(c, ["stream", "offset", "limitBytes", "encoding"])
+    const stream = q.get("stream")
+    if (stream !== "stdout" && stream !== "stderr")
+      throw new HttpError(400, "invalid_query", "请选择 stdout 或 stderr")
+    return response(
+      c,
+      evidence(c).fixedAttachmentLog(
+        c.req.param("runId"),
+        c.req.param("sessionId"),
+        stream,
+        range(q),
+      ),
+    )
+  })
   app.get("/challenges/:challengeId/files/range", (c) => {
     const project = scopedProject(c)
     const q = query(c, ["path", "offset", "limitBytes", "encoding"])

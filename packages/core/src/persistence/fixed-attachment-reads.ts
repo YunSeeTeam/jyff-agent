@@ -35,6 +35,13 @@ export interface FixedReadReceipt {
   windows: number
 }
 
+export type FixedReadStream = "stdout" | "stderr"
+
+export function splitFixedReadOutput(data: Buffer, window: 1 | 2) {
+  const split = window === 1 ? 12294 : 12295
+  return { stdout: data.subarray(0, split), stderr: data.subarray(split) }
+}
+
 export class FixedAttachmentReadStore {
   constructor(private readonly db: DatabaseSync) {}
 
@@ -100,6 +107,22 @@ export class FixedAttachmentReadStore {
       WHERE run_id=? AND id=? AND (owner=? OR ?='solver')`)
       .get(runId, id, actor, actor)
     return row?.output instanceof Uint8Array ? Buffer.from(row.output) : undefined
+  }
+
+  /** Project-scoped operator access to the acknowledged windows and receipt in one snapshot. */
+  log(runId: string, id: string, stream: FixedReadStream) {
+    const row = this.db
+      .prepare(`SELECT ${columns}, first_output AS firstOutput, second_output AS secondOutput
+        FROM fixed_attachment_reads WHERE run_id=? AND id=?`)
+      .get(runId, id) as
+      | (FixedReadReceipt & { firstOutput: Uint8Array | null; secondOutput: Uint8Array | null })
+      | undefined
+    if (!row) return
+    const { firstOutput, secondOutput, ...receipt } = row
+    const chunks: Buffer[] = []
+    if (firstOutput) chunks.push(splitFixedReadOutput(Buffer.from(firstOutput), 1)[stream])
+    if (secondOutput) chunks.push(splitFixedReadOutput(Buffer.from(secondOutput), 2)[stream])
+    return { receipt, bytes: Buffer.concat(chunks) }
   }
 
   end(runId: string, id: string, confirmed: boolean) {

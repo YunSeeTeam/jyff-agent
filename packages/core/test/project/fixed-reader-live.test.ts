@@ -14,9 +14,11 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
+import { FixedAttachmentReadStore } from "../../src/persistence/fixed-attachment-reads.ts"
 import {
   archive,
   docker,
+  expectedFixedWindow,
   fixedReaderProject,
   fixedTool,
   type ToolReceipt,
@@ -36,24 +38,22 @@ function observed(context: TranscriptContext, callId: string) {
   }
 }
 
+function noModel() {
+  return {
+    initialState: { model: createFauxCore({ provider: "fixed-reader-lifecycle" }).getModel() },
+    streamFn: () => {
+      throw new Error("Unexpected model request")
+    },
+  }
+}
+
 async function expectedWindow(sample: "misc1" | "misc2", window: 1 | 2) {
-  const source = await archive(sample)
-  const start = (window - 1) * 16384
-  const out = Buffer.concat([
-    ...(window === 2 ? [Buffer.from([0x82, 0xac])] : []),
-    Buffer.from([0, 255, 0xe4, 0xb8, 0xad]),
-    source.subarray(start, start + 12288),
-    ...(window === 1 ? [Buffer.from([0xe2])] : []),
-  ])
-  const err = Buffer.concat([
-    Buffer.from([254, 0, 0xf0, 0x9f, 0x8c, 0x8d]),
-    source.subarray(start + 12288, start + 16384),
-  ])
+  const { stdout, stderr } = expectedFixedWindow(await archive(sample), window)
   const digest = (data: Buffer) => ({
     bytes: data.length,
     sha256: createHash("sha256").update(data).digest("hex"),
   })
-  return { window, stdout: digest(out), stderr: digest(err) }
+  return { window, stdout: digest(stdout), stderr: digest(stderr) }
 }
 
 describe.runIf(process.env.DOCKER_FIXED_ATTACHMENTS === "1")(
@@ -84,6 +84,120 @@ describe.runIf(process.env.DOCKER_FIXED_ATTACHMENTS === "1")(
         await rm(root, { recursive: true, force: true, maxRetries: 3 })
       }
     })
+
+    it("confirms an early stop in the running container and keeps only its acknowledged prefix", async () => {
+      const project = await fixedReaderProject(root, projectId, image)
+      let stopped!: ToolReceipt
+      const startup = vi.spyOn(FixedAttachmentReader.prototype, "ready")
+      try {
+        const solver = await project.createSolver("misc1", { agent: noModel() })
+        const read = fixedTool(solver)
+        const starts = await Promise.all(Array.from({ length: 4 }, () => read("open")))
+        const opened = starts[0]!
+        expect(startup).toHaveBeenCalledTimes(1)
+        expect(
+          starts.every((start) => start.sessionId === opened.sessionId && start.pid === opened.pid),
+        ).toBe(true)
+        expect(opened).toMatchObject({ state: "reading", windows: 0, exitCode: null })
+        const [box] = await boxes()
+        expect(box).toBeTruthy()
+        const alive = () =>
+          docker([
+            "exec",
+            box!,
+            "python3",
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            'import pathlib, sys; print(pathlib.Path("/proc", sys.argv[1]).is_dir())',
+            String(opened.pid),
+          ])
+        expect(await alive()).toBe("True")
+        const empty = await project.evidence.fixedAttachmentLog(
+          solver.runId,
+          opened.sessionId,
+          "stdout",
+          {},
+        )
+        expect(empty).toMatchObject({ byteLength: 0, content: "", hasMore: false })
+        await read("first", opened.sessionId)
+        stopped = await read("finish", opened.sessionId)
+        expect(stopped).toMatchObject({ state: "exited", windows: 1, exitCode: 0 })
+        expect(await alive()).toBe("False")
+        expect(await read("finish", opened.sessionId)).toEqual(stopped)
+        expect(await read("open")).toEqual(stopped)
+        await expect(read("second", opened.sessionId)).rejects.toThrow("no saved output")
+      } finally {
+        startup.mockRestore()
+        await project.close()
+      }
+      expect(await boxes()).toEqual([])
+      const reopened = await fixedReaderProject(root, projectId, image)
+      try {
+        const expected = await expectedWindow("misc1", 1)
+        for (const stream of ["stdout", "stderr"] as const) {
+          const log = await reopened.evidence.fixedAttachmentLog(
+            stopped.runId,
+            stopped.sessionId,
+            stream,
+            { limitBytes: 32768 },
+          )
+          const bytes = Buffer.from(log.content, "base64")
+          expect(log.session).toEqual(stopped)
+          expect(log.byteLength).toBe(expected[stream].bytes)
+          expect(createHash("sha256").update(bytes).digest("hex")).toBe(expected[stream].sha256)
+        }
+        expect(await boxes()).toEqual([])
+      } finally {
+        await reopened.close()
+      }
+    }, 120_000)
+
+    it("retains an interrupted reservation after losing the startup receipt and never restarts it", async () => {
+      const project = await fixedReaderProject(root, projectId, image)
+      let interrupted!: ToolReceipt
+      let observedPid: number | undefined
+      const loseReceipt = vi
+        .spyOn(FixedAttachmentReadStore.prototype, "acknowledge")
+        .mockImplementationOnce((_runId, _sessionId, pid) => {
+          observedPid = pid
+          throw new Error("injected lost startup receipt")
+        })
+      try {
+        const solver = await project.createSolver("misc2", { agent: noModel() })
+        const read = fixedTool(solver)
+        await expect(read("open")).rejects.toThrow("injected lost startup receipt")
+        expect(observedPid).toBeGreaterThan(0)
+        interrupted = await read("open")
+        expect(interrupted).toMatchObject({
+          state: "interrupted",
+          windows: 0,
+          pid: null,
+          exitCode: null,
+        })
+        expect(loseReceipt).toHaveBeenCalledOnce()
+        expect(await read("finish", interrupted.sessionId)).toEqual(interrupted)
+        await expect(read("first", interrupted.sessionId)).rejects.toThrow("no saved output")
+      } finally {
+        loseReceipt.mockRestore()
+        await project.close()
+      }
+      const reopened = await fixedReaderProject(root, projectId, image)
+      try {
+        expect(await boxes()).toEqual([])
+        const log = await reopened.evidence.fixedAttachmentLog(
+          interrupted.runId,
+          interrupted.sessionId,
+          "stdout",
+          {},
+        )
+        expect(log.session).toEqual(interrupted)
+        expect(log.byteLength).toBe(0)
+      } finally {
+        await reopened.close()
+      }
+    }, 120_000)
 
     it("lets the Solver take over a child read and isolates a sibling, a concurrent Run and a later Run on the same ZIP", async () => {
       const project = await fixedReaderProject(root, projectId, image)
@@ -333,6 +447,20 @@ describe.runIf(process.env.DOCKER_FIXED_ATTACHMENTS === "1")(
         try {
           expect(await boxes()).toEqual([])
           for (const { first, last } of records) {
+            const retained = await project.evidence.fixedAttachmentLog(
+              first.runId,
+              first.sessionId,
+              "stderr",
+              {},
+            )
+            expect(retained.session).toMatchObject({
+              state: first.sample === "misc1" ? "exited" : "interrupted",
+              exitCode: first.sample === "misc1" ? 0 : null,
+              windows: 1,
+            })
+            expect(
+              createHash("sha256").update(Buffer.from(retained.content, "base64")).digest("hex"),
+            ).toBe((await expectedWindow(first.sample, 1)).stderr.sha256)
             const solver = await project.resumeSolver(first.runId, {
               agent: {
                 initialState: { model },

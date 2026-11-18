@@ -699,6 +699,8 @@ TERM→有限 grace→KILL 针对托管进程组；故意 setsid/daemonize 脱�
 
 项目范围 HTTP 前缀为 `/api/projects/:projectId`。`GET /challenges/:challengeId/files/range` 接受相对路径 `path`，与 `GET /runs/:runId/artifacts/:refId/content` 共用 `offset`、`limitBytes` 和 `encoding`。页默认 8192 字节，最大 32768 字节，返回下次可读的 `nextOffset`。`POST /runs/:runId/artifacts` 保存文件，`POST /runs/:runId/artifacts/:refId/verify` 核验整个副本。`POST /runs/:runId/experiments` 记录输入、脚本和输出引用，`GET /runs/:runId/experiments/:id` 读取记录。两类集合都支持游标分页。
 
+固定附件日志通过 `GET /runs/:runId/fixed-attachments/:sessionId/log?stream=stdout` 读取。也可选择 `stderr`，分页沿用上述合约，默认为 Base64。每页的字节和会话状态来自同一份 RunStore 快照。运行中只显示已确认并保存的前缀，`finish` 提前停止时仍保留该前缀。关闭或重启后可直接读取已存日志；丢失的回执保持 `interrupted` 和空退出码。
+
 冻结副本及其 sidecar 共用每 Run 256 MiB 磁盘容量，重启后继续计入已占用字节。容量不足时本次保存返回 `artifact_storage_limit`，求解目标继续按原规则运行。写入冻结副本或清理标记后，对应数据能力为 `frozen-artifacts@1` 和 `pending-sandbox-cleanup@1`。阶段 5 的通用进程会话仍未交付。验收范围见路线图 3.7。
 
 <a id="sec-13"></a>
@@ -875,6 +877,8 @@ vp test run packages/core/test/project/docker-cleanup-live.test.ts --reporter=ve
 第三组用例在 Project 管理的沙箱内运行同一读取程序，独立容器在清理前后检查各会话的文件锁与日志哈希。重复启动、回执和身份绑定由测试用的附件读取程序实现。产品 `localProcesses` 的工程条件见 15.1，评测 D 的对照和发布条件见 15.3、15.4。
 
 复验正式固定附件模式时，使用上述同一组环境变量与本地镜像，执行 `vp test run packages/core/test/project/fixed-reader-live.test.ts --reporter=verbose --silent=false`。该套件通过 Project 创建 Solver、由 Pi 调用子代理的读取工具，并在独立宿主异常退出后恢复原 Run。具体的工具范围和实测结果见 [阶段 5 记录](ctf-optimization-stage5.md)。
+
+固定只读离线评测另用 `node --experimental-transform-types apps/backend/test/fixtures/fixed-reader-evaluation.ts <misc1-or-misc2> <new-output-dir> <cached-image-id>`。六个样本各启动独立宿主进程，使用新 Project、RunStore 和禁网容器，两份附件各运行三次。每次读取两窗并确认退出，重开 Project 后通过日志 API 分页取回 stdout 和 stderr，与附件独立计算的预期字节逐一比对，同时记录容器回收。此评测衡量固定作业的执行和存证，原 D 组的判题与成本指标见 15.3、15.4。
 
 按仓库要求依次执行：
 

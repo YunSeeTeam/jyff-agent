@@ -45,7 +45,12 @@ class LocalArchives extends TestPlatformPlugin {
   }
 }
 
-export function fixedReaderProject(root: string, projectId: string, image: string) {
+export function fixedReaderProject(
+  root: string,
+  projectId: string,
+  image: string,
+  samples: readonly FixedArchive[] = ["misc1", "misc2"],
+) {
   if (!/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error("Expected a cached image ID")
   return Project.open({
     root,
@@ -55,7 +60,7 @@ export function fixedReaderProject(root: string, projectId: string, image: strin
       platform: {
         plugin: "test",
         config: {
-          challenges: ["misc1", "misc2"].map((id) => ({
+          challenges: samples.map((id) => ({
             id,
             title: id,
             category: "misc",
@@ -83,7 +88,7 @@ export interface ToolReceipt {
   sample: FixedArchive
   state: "reading" | "exited" | "interrupted"
   windows: number
-  pid: number
+  pid: number | null
   exitCode: number | null
   output?: {
     window: number
@@ -98,4 +103,20 @@ export function fixedTool(solver: CtfSolverAgent) {
   return async (action: string, sessionId?: string) =>
     (await tool.execute("fixture", { action, ...(sessionId && { sessionId }) }))
       .details as ToolReceipt
+}
+
+/** Expected dual-stream bytes computed from the input fixture, independently of the reader. */
+export function expectedFixedWindow(source: Buffer, window: 1 | 2) {
+  const start = (window - 1) * 16384
+  const stdout = Buffer.concat([
+    ...(window === 2 ? [Buffer.from([0x82, 0xac])] : []),
+    Buffer.from([0, 255, 0xe4, 0xb8, 0xad]),
+    source.subarray(start, start + 12288),
+    ...(window === 1 ? [Buffer.from([0xe2])] : []),
+  ])
+  const stderr = Buffer.concat([
+    Buffer.from([254, 0, 0xf0, 0x9f, 0x8c, 0x8d]),
+    source.subarray(start + 12288, start + 16384),
+  ])
+  return { stdout, stderr }
 }
