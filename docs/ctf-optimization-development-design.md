@@ -862,6 +862,8 @@ code 是稳定机器合同，message 用于人读，retryable 必须按场景返
 
 ### 15.2 测试命令与适用范围
 
+阶段 5 的 T36/T38 容器回收可单独复验。在已缓存镜像的测试进程中设置 `DOCKER_LIVE=1`，运行 `vp test run packages/core/test/project/docker-cleanup-live.test.ts --reporter=verbose --silent=false`。Windows 原生 Docker 使用 `CTF_AGENT_DOCKER_MODE=native`。`DOCKER_CLEANUP_SAMPLES` 可指向包含 `misc1/misc1_attachment.zip` 和 `misc2/misc2_attachment.zip` 的目录。测试在禁网容器内校验附件哈希。日志记录每个用例的容器 ID、回收结果和测试结束时的容器余量。独立进程会话的验收条件见 15.1。
+
 按仓库要求依次执行：
 
 ```text
