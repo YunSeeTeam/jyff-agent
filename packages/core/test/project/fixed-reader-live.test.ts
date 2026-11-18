@@ -447,20 +447,27 @@ describe.runIf(process.env.DOCKER_FIXED_ATTACHMENTS === "1")(
         try {
           expect(await boxes()).toEqual([])
           for (const { first, last } of records) {
-            const retained = await project.evidence.fixedAttachmentLog(
-              first.runId,
-              first.sessionId,
-              "stderr",
-              {},
-            )
-            expect(retained.session).toMatchObject({
-              state: first.sample === "misc1" ? "exited" : "interrupted",
-              exitCode: first.sample === "misc1" ? 0 : null,
-              windows: 1,
-            })
-            expect(
-              createHash("sha256").update(Buffer.from(retained.content, "base64")).digest("hex"),
-            ).toBe((await expectedWindow(first.sample, 1)).stderr.sha256)
+            const expected = await expectedWindow(first.sample, 1)
+            for (const stream of ["stdout", "stderr"] as const) {
+              const retained = await project.evidence.fixedAttachmentLog(
+                first.runId,
+                first.sessionId,
+                stream,
+                { limitBytes: 32768 },
+              )
+              expect(retained.session).toMatchObject({
+                sessionId: first.sessionId,
+                state: first.sample === "misc1" ? "exited" : "interrupted",
+                exitCode: first.sample === "misc1" ? 0 : null,
+                windows: 1,
+              })
+              expect(retained.byteLength).toBe(expected[stream].bytes)
+              expect(retained.nextOffset).toBe(expected[stream].bytes)
+              expect(retained.hasMore).toBe(false)
+              expect(
+                createHash("sha256").update(Buffer.from(retained.content, "base64")).digest("hex"),
+              ).toBe(expected[stream].sha256)
+            }
             const solver = await project.resumeSolver(first.runId, {
               agent: {
                 initialState: { model },
