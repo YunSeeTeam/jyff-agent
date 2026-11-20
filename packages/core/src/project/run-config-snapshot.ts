@@ -35,6 +35,7 @@ export const BUILD_OPTIMIZATION_CAPABILITIES: ReadonlySet<OptimizationCapability
   "local-processes",
   "full-subagent-reports",
   "skill-snapshots",
+  "review",
 ])
 
 export const RUN_CONFIG_SNAPSHOT_FILE = "run-config.json"

@@ -13,7 +13,6 @@ import { Project } from "../../src/project/project.ts"
 import { RunStore } from "../../src/persistence/run-store.ts"
 import {
   buildRunConfigSnapshot,
-  BUILD_OPTIMIZATION_CAPABILITIES,
   canonicalJson,
   effectiveRunSettings,
   type RunConfigSnapshot,
@@ -110,10 +109,7 @@ async function snapshotOf(root: string, runId: string): Promise<RunConfigSnapsho
 }
 
 describe("Run configuration freeze", () => {
-  it("wires targeted review through a Project Run while the production gate stays closed", async () => {
-    const capabilities = BUILD_OPTIMIZATION_CAPABILITIES as Set<string>
-    expect(capabilities.has("review")).toBe(false)
-    capabilities.add("review")
+  it("wires opt-in targeted review through a Project Run", async () => {
     let project: Project | undefined
     try {
       const root = await fixture()
@@ -164,9 +160,7 @@ describe("Run configuration freeze", () => {
       await solver.close("manual")
     } finally {
       await project?.close()
-      capabilities.delete("review")
     }
-    expect(capabilities.has("review")).toBe(false)
   })
 
   it("freezes settings, skills, roles, model, and runtime profile before the Run starts", async () => {
@@ -199,6 +193,7 @@ describe("Run configuration freeze", () => {
             "fixed-attachment-reads",
             "full-subagent-reports",
             "local-processes",
+            "review",
             "skill-snapshots",
           ],
         },
@@ -320,7 +315,7 @@ describe("Run configuration freeze", () => {
     }
   })
 
-  it("refuses a Run this build cannot honor without blocking the challenge, and freezes it once fixed", async () => {
+  it("refuses review without reader and reports without blocking the challenge", async () => {
     const root = await fixture()
     let settings = mergeRunSettings(defaultRunSettings(), {
       optimization: { review: { enabled: true } },

@@ -24,11 +24,12 @@ function harness(initial = defaultRunSettings()) {
 }
 
 describe("Information settings", () => {
-  it("shows only the three available switches, disabled by default", () => {
+  it("shows the opt-in review switch disabled until its prerequisites are on", () => {
     harness()
     const switches = screen.getAllByRole("switch")
-    expect(switches).toHaveLength(3)
+    expect(switches).toHaveLength(4)
     expect(switches.every((item) => item.getAttribute("aria-checked") === "false")).toBe(true)
+    expect(screen.getByRole("switch", { name: "定向复核" }).getAttribute("disabled")).not.toBeNull()
     expect(screen.queryByLabelText("主任务技能")).toBeNull()
     expect(screen.getByText("保存后仅对新任务生效；已开始的任务继续使用原配置。")).toBeTruthy()
   })
@@ -68,5 +69,29 @@ describe("Information settings", () => {
       review: { enabled: false },
     })
     expect(save.mock.lastCall![0]).not.toHaveProperty("budgetPolicy")
+  })
+
+  it("edits review limits and turns review off when a prerequisite is disabled", () => {
+    const save = harness()
+    fireEvent.click(screen.getByRole("switch", { name: "共享证据读取" }))
+    fireEvent.click(screen.getByRole("switch", { name: "保留完整子任务报告" }))
+    fireEvent.click(screen.getByRole("switch", { name: "定向复核" }))
+    expect(save.mock.lastCall![0].optimization.review).toEqual({
+      enabled: true,
+      maxPerGoal: 2,
+      maxConcurrent: 1,
+    })
+    fireEvent.change(screen.getByLabelText("每个求解目标最多复核次数"), {
+      target: { value: "3" },
+    })
+    fireEvent.change(screen.getByLabelText("同时复核数"), { target: { value: "2" } })
+    expect(save.mock.lastCall![0].optimization.review).toEqual({
+      enabled: true,
+      maxPerGoal: 3,
+      maxConcurrent: 2,
+    })
+    fireEvent.click(screen.getByRole("switch", { name: "共享证据读取" }))
+    expect(save.mock.lastCall![0].optimization.review.enabled).toBe(false)
+    expect(screen.getByRole("switch", { name: "定向复核" }).getAttribute("disabled")).not.toBeNull()
   })
 })

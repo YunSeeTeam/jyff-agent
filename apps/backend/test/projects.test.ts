@@ -540,11 +540,37 @@ describe("Project 运行配置的优化设置", () => {
         issues: expect.arrayContaining([
           expect.objectContaining({
             setting: "optimization.review.enabled",
-            requires: "review",
+            requires: "optimization.blackboardReaderV2",
+          }),
+          expect.objectContaining({
+            setting: "optimization.review.enabled",
+            requires: "optimization.fullSubagentReports",
           }),
         ]),
       },
     })
+  })
+
+  it("accepts explicit review opt-in when reader and reports are enabled", async () => {
+    const { app } = await appWithFileRuntime()
+    const response = await jsonRequest(app, "/api/projects/demo/runtime-config", "POST", {
+      ...base,
+      optimization: {
+        blackboardReaderV2: true,
+        fullSubagentReports: true,
+        review: { enabled: true, maxPerGoal: 2, maxConcurrent: 1 },
+      },
+    })
+    expect(response.status).toBe(200)
+    const saved = (await jsonOf(response)).runtime as ProjectRuntimeConfigurationView
+    expect(saved.optimization).toMatchObject({
+      blackboardReaderV2: true,
+      fullSubagentReports: true,
+      review: { enabled: true, maxPerGoal: 2, maxConcurrent: 1 },
+    })
+    expect(
+      (await jsonOf(await app.request("/api/projects/demo/runtime-config"))).runtime,
+    ).toMatchObject({ optimization: { review: { enabled: true } } })
   })
 
   it("保存进程与固定附件模式并允许关闭，拒绝未知模式", async () => {

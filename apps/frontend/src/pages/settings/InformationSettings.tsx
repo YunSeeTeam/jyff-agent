@@ -1,6 +1,8 @@
 import {
   type RunSettings,
   type SkillSelection,
+  REVIEW_MAX_CONCURRENT_LIMIT,
+  REVIEW_MAX_PER_GOAL_LIMIT,
   defaultRunSettings,
   usesDefaultSkillSelection,
 } from "@ctf-agent/core/contracts"
@@ -20,6 +22,8 @@ export function InformationSettings({
 }) {
   const optimization = value.optimization
   const customSkills = !usesDefaultSkillSelection(value.skills)
+  const reviewGoalInputId = useId()
+  const reviewConcurrentInputId = useId()
   const switches = [
     ["blackboardReaderV2", "共享证据读取", "让子任务按需读取本题的证据与观察。"],
     ["fullSubagentReports", "保留完整子任务报告", "保存完整报告，查看时逐页加载。"],
@@ -51,11 +55,105 @@ export function InformationSettings({
             checked={optimization[key]}
             disabled={disabled || (key === "skillSnapshots" && customSkills)}
             onCheckedChange={(checked) =>
-              onChange({ ...value, optimization: { ...optimization, [key]: checked } })
+              onChange({
+                ...value,
+                optimization: {
+                  ...optimization,
+                  [key]: checked,
+                  review:
+                    !checked && (key === "blackboardReaderV2" || key === "fullSubagentReports")
+                      ? { ...optimization.review, enabled: false }
+                      : optimization.review,
+                },
+              })
             }
           />
         </div>
       ))}
+      <div className="space-y-3 border-t border-border pt-4">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">定向复核</p>
+            <p className="text-xs text-muted-foreground">
+              围绕冲突证据或关键缺口派发有界复核，可能增加模型用量；需先启用共享证据读取和完整子任务报告。
+            </p>
+          </div>
+          <Switch
+            aria-label="定向复核"
+            checked={optimization.review.enabled}
+            disabled={
+              disabled || !optimization.blackboardReaderV2 || !optimization.fullSubagentReports
+            }
+            onCheckedChange={(enabled) =>
+              onChange({
+                ...value,
+                optimization: {
+                  ...optimization,
+                  review: { ...optimization.review, enabled },
+                },
+              })
+            }
+          />
+        </div>
+        {optimization.review.enabled ? (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor={reviewGoalInputId}>每个求解目标最多复核次数</Label>
+              <Input
+                id={reviewGoalInputId}
+                type="number"
+                min={0}
+                max={REVIEW_MAX_PER_GOAL_LIMIT}
+                value={optimization.review.maxPerGoal}
+                disabled={disabled}
+                onChange={(event) => {
+                  const maxPerGoal = Number(event.target.value)
+                  if (
+                    !Number.isInteger(maxPerGoal) ||
+                    maxPerGoal < 0 ||
+                    maxPerGoal > REVIEW_MAX_PER_GOAL_LIMIT
+                  )
+                    return
+                  onChange({
+                    ...value,
+                    optimization: {
+                      ...optimization,
+                      review: { ...optimization.review, maxPerGoal },
+                    },
+                  })
+                }}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor={reviewConcurrentInputId}>同时复核数</Label>
+              <Input
+                id={reviewConcurrentInputId}
+                type="number"
+                min={1}
+                max={REVIEW_MAX_CONCURRENT_LIMIT}
+                value={optimization.review.maxConcurrent}
+                disabled={disabled}
+                onChange={(event) => {
+                  const maxConcurrent = Number(event.target.value)
+                  if (
+                    !Number.isInteger(maxConcurrent) ||
+                    maxConcurrent < 1 ||
+                    maxConcurrent > REVIEW_MAX_CONCURRENT_LIMIT
+                  )
+                    return
+                  onChange({
+                    ...value,
+                    optimization: {
+                      ...optimization,
+                      review: { ...optimization.review, maxConcurrent },
+                    },
+                  })
+                }}
+              />
+            </div>
+          </div>
+        ) : null}
+      </div>
       {optimization.skillSnapshots ? (
         <div className="space-y-4 border-t border-border pt-4">
           <p className="text-xs text-muted-foreground">

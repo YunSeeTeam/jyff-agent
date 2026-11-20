@@ -245,7 +245,10 @@ export function ProjectSettingsPage() {
               </div>
             </Card>
           </SettingsSection>
-          <SettingsSection title="证据、报告与技能" description="配置任务间的信息共享和技能选择。">
+          <SettingsSection
+            title="证据、报告、复核与技能"
+            description="配置任务间的信息共享、定向复核和技能选择。"
+          >
             <Card className="space-y-4 p-4">
               <InformationSettings
                 value={runtime}
