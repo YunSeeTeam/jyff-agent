@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux"
 import { Type } from "typebox"
 import { afterEach, describe, expect, it } from "vite-plus/test"
+import { RunStore } from "../../src/persistence/run-store.ts"
 import {
   CtfSubagentManager,
   createSubagentManagerTools,
@@ -64,6 +65,131 @@ const challenge: ChallengeInfo = {
 }
 
 describe("CtfSubagentManager", () => {
+  it("routes a bounded review brief through Agent and preserves quota across resume (T39)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ctf-review-manager-"))
+    roots.push(root)
+    const store = await RunStore.open(join(root, "runs.sqlite"))
+    store.createRun({ id: "run-review", challengeId: challenge.id, workspace: root, attempt: 1 })
+    const goal = store.solveGoals.begin(challenge.id, true)
+    const admission = { goalId: goal.id, maxPerGoal: 2, maxConcurrent: 1 }
+    const faux = createFauxCore({ provider: "review-manager" })
+    faux.setResponses([
+      fauxAssistantMessage("experiment reproduced"),
+      fauxAssistantMessage("different experiment reproduced"),
+      fauxAssistantMessage("ordinary exploration continues"),
+      fauxAssistantMessage("same review resumed"),
+    ])
+    const discovered = await discoverSubagentRoles(root)
+    const manager = new CtfSubagentManager({
+      projectId: "test",
+      runId: "run-review",
+      runDirectory: root,
+      challenge,
+      sandbox: new MemorySandbox(),
+      agent: {
+        streamFn: faux.streamSimple as AgentOptions["streamFn"],
+        initialState: { model: faux.getModel(), thinkingLevel: "off" },
+      },
+      roles: discovered.roles,
+      reviewAdmission: admission,
+      persistence: {
+        beginExecution: (record, previousExecutionId, review) =>
+          store.beginSubagentExecution(record, previousExecutionId, review),
+        commitResult: (record) => store.commitSubagentResult(record),
+        recordProgress: (record) => store.recordSubagentProgress(record),
+      },
+    })
+    const launch = createSubagentManagerTools(manager).find((tool) => tool.name === "Agent")!
+    const brief = {
+      decision: "whether the offset is stable",
+      sourceMaterial: "worker report run-1/agent-1",
+      evidenceRefs: ["evidence:1 sha256:abcd"],
+      explanations: ["same allocator behavior", "different instance state"],
+      experiment: "repeat the minimal allocation with the same input",
+      scope: "one local allocation sequence",
+      stopCondition: "stop after one comparable observation",
+      resourceConstraints: "one worker and no remote instance",
+      candidatePriority: "report a usable exploit immediately",
+    }
+    try {
+      await expect(
+        launch.execute("invalid", {
+          subagent_type: "general-purpose",
+          prompt: "check offset",
+          description: "offset review",
+          purpose: "review",
+          review: { ...brief, experiment: "" },
+        }),
+      ).rejects.toThrow()
+      expect(store.solveGoals.get(challenge.id)?.reviewUsed).toBe(0)
+      const first = await launch.execute("first", {
+        subagent_type: "general-purpose",
+        prompt: "check offset",
+        description: "offset review",
+        purpose: "review",
+        review: brief,
+      })
+      const reviewId = first.details.id as string
+      expect(store.subagents("run-review")[0]).toMatchObject({
+        id: reviewId,
+        purpose: "review",
+        reviewId: `${goal.id}:${reviewId}`,
+        status: "completed",
+      })
+      expect(store.subagents("run-review")[0]?.prompt).toContain(brief.experiment)
+      expect(store.solveGoals.get(challenge.id)?.reviewUsed).toBe(1)
+      expect(
+        (
+          await launch.execute("second", {
+            subagent_type: "general-purpose",
+            prompt: "check offset again",
+            description: "another review",
+            purpose: "review",
+            review: { ...brief, decision: "another decision" },
+          })
+        ).details,
+      ).toMatchObject({ code: "resource_limit" })
+      expect(store.solveGoals.get(challenge.id)?.reviewUsed).toBe(1)
+      await launch.execute("different-experiment", {
+        subagent_type: "general-purpose",
+        prompt: "distinguish instance state",
+        description: "different experiment",
+        purpose: "review",
+        review: { ...brief, experiment: "repeat with a fresh local instance" },
+      })
+      expect(store.solveGoals.get(challenge.id)?.reviewUsed).toBe(2)
+      expect(
+        (
+          await launch.execute("quota", {
+            subagent_type: "general-purpose",
+            prompt: "another review",
+            description: "quota exhausted",
+            purpose: "review",
+            review: { ...brief, experiment: "test a third distinct input" },
+          })
+        ).details,
+      ).toMatchObject({ code: "resource_limit" })
+      await launch.execute("explore", {
+        subagent_type: "general-purpose",
+        prompt: "try another approach",
+        description: "new approach",
+      })
+      await launch.execute("resume", {
+        subagent_type: "general-purpose",
+        prompt: "clarify the existing observation",
+        description: "same review",
+        resume: reviewId,
+      })
+      expect(store.solveGoals.get(challenge.id)?.reviewUsed).toBe(2)
+      expect(
+        store.subagents("run-review").filter((record) => record.purpose === "review"),
+      ).toHaveLength(2)
+    } finally {
+      await manager.close()
+      store.close()
+    }
+  })
+
   it("后台完成后立即 steer 结构化通知给主 Solver", async () => {
     const root = await mkdtemp(join(tmpdir(), "ctf-subagent-notify-"))
     roots.push(root)

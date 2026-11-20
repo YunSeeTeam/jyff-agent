@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -23,7 +24,7 @@ async function storeFixture(): Promise<RunStore> {
 }
 
 function record(overrides: Partial<SubagentRecord> = {}): SubagentRecord {
-  return {
+  const value: SubagentRecord = {
     id: "worker-1",
     runId: "run-1",
     role: "pwn",
@@ -46,6 +47,11 @@ function record(overrides: Partial<SubagentRecord> = {}): SubagentRecord {
     startedAt: "2026-08-04T10:00:01.000Z",
     ...overrides,
   }
+  if (value.purpose === "review" && value.reviewId && !value.reviewFingerprint) {
+    const goalId = value.reviewId.split(":")[0]
+    value.reviewFingerprint = `${goalId}:${createHash("sha256").update(value.id).digest("hex")}`
+  }
+  return value
 }
 
 describe("RunStore SubAgent persistence", () => {
@@ -158,6 +164,8 @@ describe("RunStore SubAgent persistence", () => {
     store.close()
     const legacy = new DatabaseSync(legacyPath)
     legacy.exec("DROP INDEX run_subagents_review_id")
+    legacy.exec("DROP INDEX run_subagents_review_fingerprint")
+    legacy.exec("ALTER TABLE run_subagents DROP COLUMN review_fingerprint")
     legacy.exec("ALTER TABLE run_subagents DROP COLUMN review_id")
     legacy.exec("ALTER TABLE run_subagents DROP COLUMN purpose")
     legacy.exec("ALTER TABLE solve_goals DROP COLUMN review_used")

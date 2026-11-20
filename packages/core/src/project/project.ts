@@ -29,6 +29,7 @@ import {
   blackboardSnapshotPrompt,
   BLACKBOARD_READER_V2_PROMPT,
   SOLVER_SYSTEM_PROMPT,
+  TARGETED_REVIEW_PROMPT,
   challengeAnnouncementsPrompt,
   challengeContextPrompt,
 } from "@ctf-agent/prompts"
@@ -1570,6 +1571,20 @@ export class Project {
         }
       }
 
+      const reviewGoal =
+        settings.optimization.review.enabled && !this.runStore.isSolved(challengeId)
+          ? (this.runStore.solveGoals.get(challengeId) ??
+            this.runStore.solveGoals.begin(challengeId, false))
+          : undefined
+      const reviewAdmission =
+        reviewGoal?.state === "active"
+          ? {
+              goalId: reviewGoal.id,
+              maxPerGoal: settings.optimization.review.maxPerGoal,
+              maxConcurrent: settings.optimization.review.maxConcurrent,
+            }
+          : undefined
+
       subagentManager = new CtfSubagentManager({
         requestGuard: {
           ...options.requestGuard,
@@ -1589,11 +1604,12 @@ export class Project {
           ? { blackboardReadTool: createBlackboardReadTool(this.runStore, challengeId) }
           : {}),
         fullSubagentReports: settings.optimization.fullSubagentReports,
+        reviewAdmission,
         fixedAttachmentReads,
         localProcessManager,
         persistence: {
-          beginExecution: (record, previousExecutionId) =>
-            this.runStore.beginSubagentExecution(record, previousExecutionId),
+          beginExecution: (record, previousExecutionId, admission) =>
+            this.runStore.beginSubagentExecution(record, previousExecutionId, admission),
           commitResult: (record) => this.runStore.commitSubagentResult(record),
           recordProgress: (record) => this.runStore.recordSubagentProgress(record),
         },
@@ -1630,6 +1646,8 @@ export class Project {
             this.runStore.appendEvent(runId, `subagent_${event}`, {
               subagentId: subagent.id,
               role: subagent.role,
+              ...(subagent.purpose ? { purpose: subagent.purpose } : {}),
+              ...(subagent.reviewId ? { reviewId: subagent.reviewId } : {}),
               description: subagent.description,
               status: subagent.status,
               activeTool: subagent.activeTool,
@@ -1678,6 +1696,7 @@ export class Project {
             systemPrompt: [
               options.agent.initialState?.systemPrompt || SOLVER_SYSTEM_PROMPT,
               ...(readerV2 ? [BLACKBOARD_READER_V2_PROMPT] : []),
+              ...(reviewAdmission ? [TARGETED_REVIEW_PROMPT] : []),
             ]
               .filter(Boolean)
               .join("\n\n"),

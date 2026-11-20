@@ -487,6 +487,7 @@ interface SubagentRow {
   result_kind: SubagentRecord["resultKind"] | null
   purpose: SubagentRecord["purpose"] | null
   review_id: string | null
+  review_fingerprint: string | null
   id: string
   run_id: string
   role: string
@@ -804,6 +805,7 @@ function subagentFromRow(row: SubagentRow): SubagentRecord {
     role: row.role,
     ...(row.purpose == null ? {} : { purpose: row.purpose }),
     ...(row.review_id == null ? {} : { reviewId: row.review_id }),
+    ...(row.review_fingerprint == null ? {} : { reviewFingerprint: row.review_fingerprint }),
     displayName: row.display_name,
     description: row.description,
     status: row.status,
@@ -1012,6 +1014,7 @@ export class RunStore {
         role TEXT NOT NULL,
         purpose TEXT CHECK (purpose IN ('explore', 'verify', 'review')),
         review_id TEXT,
+        review_fingerprint TEXT,
         display_name TEXT NOT NULL,
         description TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -1332,12 +1335,16 @@ export class RunStore {
         "ALTER TABLE run_subagents ADD COLUMN purpose TEXT CHECK (purpose IN ('explore', 'verify', 'review'))",
       ],
       ["review_id", "ALTER TABLE run_subagents ADD COLUMN review_id TEXT"],
+      ["review_fingerprint", "ALTER TABLE run_subagents ADD COLUMN review_fingerprint TEXT"],
     ] as const
     for (const [name, sql] of subagentUsageMigrations) {
       if (!subagentColumns.has(name)) database.exec(sql)
     }
     database.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS run_subagents_review_id ON run_subagents(review_id) WHERE review_id IS NOT NULL",
+    )
+    database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS run_subagents_review_fingerprint ON run_subagents(review_fingerprint) WHERE review_fingerprint IS NOT NULL",
     )
 
     database.exec("BEGIN IMMEDIATE")
@@ -3161,7 +3168,7 @@ export class RunStore {
 
   /** Persist one worker snapshot; lifecycle events remain in run_events for replay. */
   upsertSubagent(record: SubagentRecord): SubagentRecord {
-    if (record.purpose === "review" || record.reviewId)
+    if (record.purpose === "review" || record.reviewId || record.reviewFingerprint)
       throw subagentStoreError("invalid_execution", "Reviews require atomic execution admission")
     return this.upsertSubagentRecord(record)
   }
@@ -3177,15 +3184,16 @@ export class RunStore {
     this.database
       .prepare(`
         INSERT INTO run_subagents (
-          id, run_id, role, purpose, review_id, display_name, description, status, background,
+          id, run_id, role, purpose, review_id, review_fingerprint, display_name, description, status, background,
           prompt, session_path, container_cwd, result, error, active_tool,
           turns, tool_uses, total_tokens, input_tokens, cache_read_tokens,
           cache_write_tokens, created_at, updated_at, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           role = excluded.role,
           purpose = excluded.purpose,
           review_id = excluded.review_id,
+          review_fingerprint = excluded.review_fingerprint,
           display_name = excluded.display_name,
           description = excluded.description,
           status = excluded.status,
@@ -3212,6 +3220,7 @@ export class RunStore {
         record.role,
         record.purpose ?? null,
         record.reviewId ?? null,
+        record.reviewFingerprint ?? null,
         record.displayName,
         record.description,
         record.status,
@@ -3258,13 +3267,15 @@ export class RunStore {
       if (
         !reviewAdmission ||
         record.reviewId !== `${reviewAdmission.goalId}:${record.id}` ||
+        !record.reviewFingerprint?.startsWith(`${reviewAdmission.goalId}:`) ||
+        !/^[0-9a-f]{64}$/.test(record.reviewFingerprint.slice(reviewAdmission.goalId.length + 1)) ||
         !Number.isSafeInteger(reviewAdmission.maxPerGoal) ||
         reviewAdmission.maxPerGoal < 0 ||
         !Number.isSafeInteger(reviewAdmission.maxConcurrent) ||
         reviewAdmission.maxConcurrent < 1
       )
         throw subagentStoreError("invalid_execution", "Review identity or limits are invalid")
-    } else if (record.reviewId || reviewAdmission) {
+    } else if (record.reviewId || record.reviewFingerprint || reviewAdmission) {
       throw subagentStoreError("invalid_execution", "Only a review may carry review admission")
     }
     this.database.exec("BEGIN IMMEDIATE")
@@ -3283,17 +3294,15 @@ export class RunStore {
             "The previous execution changed or remains active",
           )
         }
-        if (old.purpose !== (record.purpose ?? null) || old.review_id !== (record.reviewId ?? null))
+        if (
+          old.purpose !== (record.purpose ?? null) ||
+          old.review_id !== (record.reviewId ?? null) ||
+          old.review_fingerprint !== (record.reviewFingerprint ?? null)
+        )
           throw subagentStoreError("stale_execution", "The task identity changed on resume")
       } else {
         if (previousExecutionId !== null)
           throw subagentStoreError("stale_execution", "Previous execution does not exist")
-        this.upsertSubagentRecord({
-          ...record,
-          executionId: undefined,
-          result: undefined,
-          resultKind: undefined,
-        })
       }
       if (review && reviewAdmission) {
         const run = this.database
@@ -3310,6 +3319,16 @@ export class RunStore {
           )
         if (!old && goal.review_used >= reviewAdmission.maxPerGoal)
           throw subagentStoreError("resource_limit", "Automatic review count is exhausted")
+        if (!old) {
+          const repeated = this.database
+            .prepare("SELECT id FROM run_subagents WHERE review_fingerprint = ? AND id <> ?")
+            .get(record.reviewFingerprint!, record.id)
+          if (repeated)
+            throw subagentStoreError(
+              "resource_limit",
+              "The same evidence and experiment were already reviewed for this goal",
+            )
+        }
         const active = this.database
           .prepare(
             "SELECT COUNT(*) AS count FROM run_subagents WHERE review_id LIKE ? AND id <> ? AND status IN ('queued', 'running')",
@@ -3318,6 +3337,13 @@ export class RunStore {
         if (active.count >= reviewAdmission.maxConcurrent)
           throw subagentStoreError("resource_limit", "Concurrent automatic reviews are full")
       }
+      if (!old)
+        this.upsertSubagentRecord({
+          ...record,
+          executionId: undefined,
+          result: undefined,
+          resultKind: undefined,
+        })
       const updated = this.database
         .prepare(`
         UPDATE run_subagents SET execution_id = ?, status = ?, background = ?, prompt = ?,

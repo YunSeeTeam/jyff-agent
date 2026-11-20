@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { join } from "node:path"
 import {
   type AgentSkill,
@@ -47,6 +47,8 @@ export interface SubagentRecord {
   purpose?: "explore" | "verify" | "review"
   /** For a review, `${goalId}:${subagentId}` binds the attempt to its solve goal. */
   reviewId?: string
+  /** Goal-scoped digest of cited evidence and the distinguishing experiment. */
+  reviewFingerprint?: string
   displayName: string
   description: string
   status: SubagentStatus
@@ -78,6 +80,19 @@ export interface ReviewAdmission {
   maxConcurrent: number
 }
 
+/** An experiment-backed decision question, not a second opinion request. */
+export interface ReviewBrief {
+  decision: string
+  sourceMaterial: string
+  evidenceRefs: string[]
+  explanations: string[]
+  experiment: string
+  scope: string
+  stopCondition: string
+  resourceConstraints: string
+  candidatePriority: string
+}
+
 export type SubagentLifecycleEvent =
   | "created"
   | "started"
@@ -89,7 +104,11 @@ export type SubagentLifecycleEvent =
   | "steered"
 
 export interface SubagentLifecyclePersistence {
-  beginExecution(record: SubagentRecord, previousExecutionId: string | null): SubagentRecord
+  beginExecution(
+    record: SubagentRecord,
+    previousExecutionId: string | null,
+    reviewAdmission?: ReviewAdmission,
+  ): SubagentRecord
   commitResult(record: SubagentRecord): SubagentRecord
   recordProgress(record: SubagentRecord): void
 }
@@ -110,6 +129,7 @@ export interface SubagentManagerOptions {
   fixedAttachmentReads?: FixedAttachmentReads
   localProcessManager?: LocalProcessManager
   fullSubagentReports?: boolean
+  reviewAdmission?: ReviewAdmission
   persistence?: SubagentLifecyclePersistence
   /** 可选注入 web-access 工具，SubAgent 通过 role.tools 白名单决定是否启用。 */
   webAccessTools?: AgentTool[]
@@ -176,6 +196,10 @@ export class CtfSubagentManager {
     return availableSubagentRoles(this.options.roles)
   }
 
+  reviewEnabled(): boolean {
+    return this.options.reviewAdmission !== undefined
+  }
+
   /** Reattach persisted terminal workers so their JSONL sessions can be resumed. */
   restore(records: readonly SubagentRecord[]): void {
     for (const record of records) {
@@ -194,7 +218,8 @@ export class CtfSubagentManager {
     prompt: string
     description: string
     background: boolean
-    purpose?: "explore" | "verify"
+    purpose?: "explore" | "verify" | "review"
+    review?: ReviewBrief
   }): SubagentRecord {
     if (this.closing || this.finalizing) {
       throw new Error("SubAgent manager 正在收尾或关闭")
@@ -207,7 +232,14 @@ export class CtfSubagentManager {
           .join(", ")}`,
       )
     }
-    const prompt = boundedText(input.prompt, "prompt", 32_000)
+    const purpose = input.purpose ?? "explore"
+    if (purpose === "review" && !this.options.reviewAdmission)
+      throw lifecycleError("capability_unavailable", "Automatic review is unavailable for this Run")
+    if (purpose !== "review" && input.review)
+      throw new Error("Only a review may carry a review brief")
+    const preparedReview =
+      purpose === "review" ? reviewPrompt(input.prompt, input.review) : undefined
+    const prompt = preparedReview?.prompt ?? boundedText(input.prompt, "prompt", 32_000)
     const description = boundedText(input.description, "description", 240)
     const id = randomUUID()
     const now = new Date().toISOString()
@@ -216,7 +248,13 @@ export class CtfSubagentManager {
       executionId: randomUUID(),
       runId: this.options.runId,
       role: role.name,
-      purpose: input.purpose ?? "explore",
+      purpose,
+      ...(purpose === "review"
+        ? {
+            reviewId: `${this.options.reviewAdmission!.goalId}:${id}`,
+            reviewFingerprint: `${this.options.reviewAdmission!.goalId}:${preparedReview!.fingerprint}`,
+          }
+        : {}),
       displayName: role.displayName,
       description,
       status: input.background ? "queued" : "running",
@@ -313,9 +351,20 @@ export class CtfSubagentManager {
 
   private begin(record: SubagentRecord, previousExecutionId: string | null): SubagentRecord {
     try {
-      return this.options.persistence?.beginExecution(record, previousExecutionId) ?? record
+      return (
+        this.options.persistence?.beginExecution(
+          record,
+          previousExecutionId,
+          record.purpose === "review" ? this.options.reviewAdmission : undefined,
+        ) ?? record
+      )
     } catch (error) {
-      if (hasLifecycleCode(error, "stale_execution")) throw error
+      if (
+        hasLifecycleCode(error, "stale_execution") ||
+        hasLifecycleCode(error, "resource_limit") ||
+        hasLifecycleCode(error, "capability_unavailable")
+      )
+        throw error
       throw lifecycleError(
         "report_persistence_failed",
         `Cannot begin SubAgent execution: ${errorText(error)}`,
@@ -836,6 +885,24 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
     .availableRoles()
     .map((role) => role.name)
     .join(", ")
+  const reviewEnabled = manager.reviewEnabled()
+  const reviewBriefSchema = Type.Object({
+    decision: Type.String({ minLength: 1, maxLength: 500 }),
+    sourceMaterial: Type.String({ minLength: 1, maxLength: 2_000 }),
+    evidenceRefs: Type.Array(Type.String({ minLength: 1, maxLength: 160 }), {
+      minItems: 1,
+      maxItems: 8,
+    }),
+    explanations: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
+      minItems: 2,
+      maxItems: 4,
+    }),
+    experiment: Type.String({ minLength: 1, maxLength: 2_000 }),
+    scope: Type.String({ minLength: 1, maxLength: 800 }),
+    stopCondition: Type.String({ minLength: 1, maxLength: 500 }),
+    resourceConstraints: Type.String({ minLength: 1, maxLength: 500 }),
+    candidatePriority: Type.String({ minLength: 1, maxLength: 500 }),
+  })
   const tools: AgentTool[] = [
     {
       name: "Agent",
@@ -845,7 +912,12 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
         subagent_type: Type.String(),
         prompt: Type.String({ minLength: 1, maxLength: 32_000 }),
         description: Type.String({ minLength: 1, maxLength: 240 }),
-        purpose: Type.Optional(Type.Union([Type.Literal("explore"), Type.Literal("verify")])),
+        purpose: Type.Optional(
+          reviewEnabled
+            ? Type.Union([Type.Literal("explore"), Type.Literal("verify"), Type.Literal("review")])
+            : Type.Union([Type.Literal("explore"), Type.Literal("verify")]),
+        ),
+        ...(reviewEnabled ? { review: Type.Optional(reviewBriefSchema) } : {}),
         run_in_background: Type.Optional(Type.Boolean()),
         resume: Type.Optional(Type.String()),
       }),
@@ -854,7 +926,8 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           subagent_type: string
           prompt: string
           description: string
-          purpose?: "explore" | "verify"
+          purpose?: "explore" | "verify" | "review"
+          review?: ReviewBrief
           run_in_background?: boolean
           resume?: string
         }
@@ -869,6 +942,7 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           prompt: params.prompt,
           description: params.description,
           purpose: params.purpose,
+          review: params.review,
           background,
         })
         return pageToolResult(
@@ -984,7 +1058,11 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           toolError(error.code as ToolErrorCode, codePointPrefix(error.message, 2_000).text, {
             retryable: error.code === "execution_changed" || error.code === "stale_execution",
             nextAction:
-              "Read the current execution from offset 0; storage failures require operator recovery.",
+              error.code === "resource_limit"
+                ? "Continue solving without a new review; if concurrent reviews are full, wait for one to finish."
+                : error.code === "capability_unavailable"
+                  ? "Continue without automatic review and inspect the active goal and Run configuration."
+                  : "Read the current execution from offset 0; storage failures require operator recovery.",
           }),
         )
       }
@@ -1049,6 +1127,61 @@ function boundedText(value: string, field: string, max: number): string {
   if (!text) throw new Error(`${field} 不能为空`)
   if (text.length > max) throw new Error(`${field} 长度不能超过 ${max}`)
   return text
+}
+
+function reviewPrompt(
+  prompt: string,
+  brief: ReviewBrief | undefined,
+): { prompt: string; fingerprint: string } {
+  if (!brief) throw new Error("Review requires a concrete experiment brief")
+  const field = (value: unknown, name: string, limit: number) => {
+    if (typeof value !== "string") throw new Error(`Review ${name} must be text`)
+    return boundedText(value, `review.${name}`, limit)
+  }
+  if (
+    !Array.isArray(brief.evidenceRefs) ||
+    brief.evidenceRefs.length < 1 ||
+    brief.evidenceRefs.length > 8
+  )
+    throw new Error("Review requires 1–8 evidence references")
+  if (
+    !Array.isArray(brief.explanations) ||
+    brief.explanations.length < 2 ||
+    brief.explanations.length > 4
+  )
+    throw new Error("Review requires 2–4 competing explanations")
+  const normalized: ReviewBrief = {
+    decision: field(brief.decision, "decision", 500),
+    sourceMaterial: field(brief.sourceMaterial, "sourceMaterial", 2_000),
+    evidenceRefs: brief.evidenceRefs.map((item) => field(item, "evidenceRefs", 160)),
+    explanations: brief.explanations.map((item) => field(item, "explanations", 500)),
+    experiment: field(brief.experiment, "experiment", 2_000),
+    scope: field(brief.scope, "scope", 800),
+    stopCondition: field(brief.stopCondition, "stopCondition", 500),
+    resourceConstraints: field(brief.resourceConstraints, "resourceConstraints", 500),
+    candidatePriority: field(brief.candidatePriority, "candidatePriority", 500),
+  }
+  const canonical = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase()
+  const fingerprint = createHash("sha256")
+    .update(
+      JSON.stringify({
+        evidenceRefs: normalized.evidenceRefs.map(canonical).sort(),
+        experiment: canonical(normalized.experiment),
+      }),
+    )
+    .digest("hex")
+  return {
+    prompt: boundedText(
+      [
+        field(prompt, "prompt", 32_000),
+        "Check the cited material before accepting its conclusions. Perform only the bounded experiment below; report observed evidence, untested conditions, and whether the decision changes. A candidate flag or directly usable exploit must be reported immediately for Solver validation.",
+        `<review_brief>${JSON.stringify(normalized)}</review_brief>`,
+      ].join("\n\n"),
+      "review prompt",
+      32_000,
+    ),
+    fingerprint,
+  }
 }
 
 function errorText(error: unknown): string {

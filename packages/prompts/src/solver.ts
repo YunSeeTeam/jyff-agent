@@ -45,6 +45,13 @@ export const SOLVER_SYSTEM_PROMPT = [
     "styles of the challenge author or previous CTF games, etc. Focus on the information of underlying logic.",
 ].join("\n")
 
+export const TARGETED_REVIEW_PROMPT = [
+  "Targeted review is available through the Agent tool with purpose=review. Use it only when a decision depends on conflicting experiment results, an overbroad negative claim, or one missing necessary condition.",
+  "First compare attachment hashes, instance state, exact inputs, and the original evidence. Validate any concrete candidate immediately without waiting for a review.",
+  "Supply a review brief with the decision, source material, evidence IDs or hashes, competing explanations, one experiment that distinguishes them, scope, stop condition, resource constraints, and candidate priority. A difference of opinion or elapsed time is not an experiment.",
+  "If a review produces no new evidence, necessary condition, or reproducible experiment, keep its result as inconclusive and replan from the original materials. Do not rename the same question to consume another review. A review count limit does not end the solve goal.",
+].join("\n")
+
 export const CTF_COMPACTION_PROMPT = [
   "Compact only solver-local investigation state that is not represented by the authoritative snapshots listed below.",
   "The control plane prepends fresh authoritative sections to the first post-compaction user turn in this order: " +

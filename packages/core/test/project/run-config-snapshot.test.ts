@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { CtfSubagent } from "@ctf-agent/agents"
-import { SOLVER_SYSTEM_PROMPT } from "@ctf-agent/prompts"
+import { SOLVER_SYSTEM_PROMPT, TARGETED_REVIEW_PROMPT } from "@ctf-agent/prompts"
 import type { CommandResult, Sandbox, SandboxExecOptions } from "@ctf-agent/sandbox"
 import type { AgentOptions } from "@earendil-works/pi-agent-core"
 import type { Model } from "@earendil-works/pi-ai"
@@ -13,6 +13,7 @@ import { Project } from "../../src/project/project.ts"
 import { RunStore } from "../../src/persistence/run-store.ts"
 import {
   buildRunConfigSnapshot,
+  BUILD_OPTIMIZATION_CAPABILITIES,
   canonicalJson,
   effectiveRunSettings,
   type RunConfigSnapshot,
@@ -109,6 +110,65 @@ async function snapshotOf(root: string, runId: string): Promise<RunConfigSnapsho
 }
 
 describe("Run configuration freeze", () => {
+  it("wires targeted review through a Project Run while the production gate stays closed", async () => {
+    const capabilities = BUILD_OPTIMIZATION_CAPABILITIES as Set<string>
+    expect(capabilities.has("review")).toBe(false)
+    capabilities.add("review")
+    let project: Project | undefined
+    try {
+      const root = await fixture()
+      const settings = mergeRunSettings(defaultRunSettings(), {
+        optimization: {
+          blackboardReaderV2: true,
+          fullSubagentReports: true,
+          review: { enabled: true, maxPerGoal: 1, maxConcurrent: 1 },
+        },
+      })
+      project = (await openProject(root, { runSettings: () => settings })).project
+      const faux = createFauxCore({ provider: "project-review" })
+      faux.setResponses([fauxAssistantMessage("one comparable observation")])
+      const solver = await project.createSolver("warmup-flag", {
+        agent: {
+          streamFn: faux.streamSimple as AgentOptions["streamFn"],
+          initialState: { model: faux.getModel(), thinkingLevel: "off" },
+        },
+      })
+      expect(solver.state.systemPrompt).toContain(TARGETED_REVIEW_PROMPT)
+      const goal = project.solveGoals.get("warmup-flag")
+      expect(goal?.state).toBe("active")
+      const launch = solver.tools.find((tool) => tool.name === "Agent")!
+      const result = await launch.execute("review", {
+        subagent_type: "general-purpose",
+        prompt: "distinguish allocator state",
+        description: "one comparable experiment",
+        purpose: "review",
+        review: {
+          decision: "whether the offset is stable",
+          sourceMaterial: "the initial worker's observation",
+          evidenceRefs: ["evidence:1 sha256:abcd"],
+          explanations: ["same local state", "fresh instance differs"],
+          experiment: "repeat once on a fresh local instance",
+          scope: "one local run",
+          stopCondition: "stop after one comparable result",
+          resourceConstraints: "one worker; no remote instance",
+          candidatePriority: "report a usable candidate immediately",
+        },
+      })
+      expect(result.isError).not.toBe(true)
+      expect(project.subagents(solver.runId)[0]).toMatchObject({
+        purpose: "review",
+        reviewId: expect.stringContaining(goal!.id),
+        status: "completed",
+      })
+      expect(project.solveGoals.get("warmup-flag")?.reviewUsed).toBe(1)
+      await solver.close("manual")
+    } finally {
+      await project?.close()
+      capabilities.delete("review")
+    }
+    expect(capabilities.has("review")).toBe(false)
+  })
+
   it("freezes settings, skills, roles, model, and runtime profile before the Run starts", async () => {
     const root = await fixture()
     const { project } = await openProject(root)
