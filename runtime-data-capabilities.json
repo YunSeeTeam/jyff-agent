@@ -7,6 +7,7 @@
     "pending-sandbox-cleanup": 1,
     "frozen-artifacts": 1,
     "fixed-attachment-reads": 1,
-    "local-processes": 1
+    "local-processes": 1,
+    "review-ledger": 1
   }
 }

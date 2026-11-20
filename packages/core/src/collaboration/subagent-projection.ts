@@ -56,6 +56,8 @@ export function subagentSummary(
     runId: record.runId,
     ...(record.executionId ? { executionId: record.executionId } : {}),
     role: codePointPrefix(record.role, NAME_MAX_CODE_POINTS).text,
+    ...(record.purpose ? { purpose: record.purpose } : {}),
+    ...(record.reviewId ? { reviewId: record.reviewId } : {}),
     displayName: codePointPrefix(record.displayName, NAME_MAX_CODE_POINTS).text,
     status: record.status,
     createdAt: record.createdAt,

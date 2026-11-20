@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { DatabaseSync } from "node:sqlite"
 import { afterEach, describe, expect, it } from "vite-plus/test"
 import type { SubagentRecord } from "../../src/collaboration/subagent-manager.ts"
 import { RunStore } from "../../src/persistence/run-store.ts"
@@ -48,6 +49,126 @@ function record(overrides: Partial<SubagentRecord> = {}): SubagentRecord {
 }
 
 describe("RunStore SubAgent persistence", () => {
+  it("commits review count with execution, includes queued work in concurrency, and preserves count on resume (T39)", async () => {
+    const store = await storeFixture()
+    store.createRun({ id: "run-1", challengeId: "pwn-1", workspace: "workspace", attempt: 1 })
+    const goal = store.solveGoals.begin("pwn-1", true)
+    const admission = { goalId: goal.id, maxPerGoal: 2, maxConcurrent: 1 }
+    expect(() =>
+      store.upsertSubagent(record({ purpose: "review", reviewId: `${goal.id}:worker-1` })),
+    ).toThrow(expect.objectContaining({ code: "invalid_execution" }))
+    const first = store.beginSubagentExecution(
+      record({ purpose: "review", reviewId: `${goal.id}:worker-1`, executionId: "first" }),
+      null,
+      admission,
+    )
+    expect(store.solveGoals.get("pwn-1")?.reviewUsed).toBe(1)
+    const secondInput = record({
+      id: "worker-2",
+      purpose: "review",
+      reviewId: `${goal.id}:worker-2`,
+      executionId: "second",
+      status: "queued",
+    })
+    expect(() => store.beginSubagentExecution(secondInput, null, admission)).toThrow(
+      expect.objectContaining({ code: "resource_limit" }),
+    )
+    expect(store.subagents("run-1")).toHaveLength(1)
+    expect(store.solveGoals.get("pwn-1")?.reviewUsed).toBe(1)
+    const firstDone = store.commitSubagentResult({ ...first, status: "completed" })
+    const second = store.beginSubagentExecution(secondInput, null, admission)
+    expect(store.solveGoals.get("pwn-1")?.reviewUsed).toBe(2)
+    expect(() =>
+      store.beginSubagentExecution(
+        { ...firstDone, executionId: "first-resume", status: "running" },
+        "first",
+        admission,
+      ),
+    ).toThrow(expect.objectContaining({ code: "resource_limit" }))
+    store.commitSubagentResult({ ...second, status: "completed" })
+    const resumed = store.beginSubagentExecution(
+      { ...firstDone, executionId: "first-resume", status: "running" },
+      "first",
+      admission,
+    )
+    expect(resumed.reviewId).toBe(first.reviewId)
+    expect(store.solveGoals.get("pwn-1")?.reviewUsed).toBe(2)
+    store.commitSubagentResult({ ...resumed, status: "completed" })
+    store.updateRun("run-1", { status: "closed" })
+    // A later Solver Run of the same goal is still allowed and sees the same count.
+    expect(
+      store.createRun({ id: "run-2", challengeId: "pwn-1", workspace: "workspace", attempt: 2 }).id,
+    ).toBe("run-2")
+    expect(() =>
+      store.beginSubagentExecution(
+        record({
+          id: "worker-3",
+          runId: "run-2",
+          purpose: "review",
+          reviewId: `${goal.id}:worker-3`,
+          executionId: "third",
+        }),
+        null,
+        admission,
+      ),
+    ).toThrow(expect.objectContaining({ code: "resource_limit" }))
+    expect(store.solveGoals.get("pwn-1")?.reviewUsed).toBe(2)
+    store.solveGoals.update(goal.id, { state: "stopped" })
+    const nextGoal = store.solveGoals.begin("pwn-1", false)
+    expect(nextGoal.id).not.toBe(goal.id)
+    expect(nextGoal.reviewUsed).toBe(0)
+    store.close()
+  })
+
+  it("restores review identity after restart and migrates old NULL classifications", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ctf-review-ledger-"))
+    roots.push(root)
+    const path = join(root, "runs.sqlite")
+    let store = await RunStore.open(path)
+    store.createRun({ id: "run-1", challengeId: "rev-1", workspace: "workspace", attempt: 1 })
+    const goal = store.solveGoals.begin("rev-1", true)
+    const admission = { goalId: goal.id, maxPerGoal: 1, maxConcurrent: 1 }
+    store.beginSubagentExecution(
+      record({ purpose: "review", reviewId: `${goal.id}:worker-1`, executionId: "first" }),
+      null,
+      admission,
+    )
+    expect(store.dataCapabilities()["review-ledger"]).toBe(1)
+    store.close()
+    store = await RunStore.open(path)
+    expect(store.solveGoals.get("rev-1")?.reviewUsed).toBe(1)
+    expect(store.markInterruptedSubagents()).toMatchObject([
+      { purpose: "review", reviewId: `${goal.id}:worker-1`, status: "interrupted" },
+    ])
+    const interrupted = store.subagents("run-1")[0]!
+    const resumed = store.beginSubagentExecution(
+      { ...interrupted, executionId: "second", status: "running" },
+      "first",
+      admission,
+    )
+    expect(resumed.reviewId).toBe(interrupted.reviewId)
+    expect(store.solveGoals.get("rev-1")?.reviewUsed).toBe(1)
+    store.close()
+
+    const legacyPath = join(root, "legacy.sqlite")
+    store = await RunStore.open(legacyPath)
+    store.createRun({ id: "old-run", challengeId: "old", workspace: "workspace", attempt: 1 })
+    store.upsertSubagent(record({ runId: "old-run" }))
+    store.solveGoals.begin("old", true)
+    store.close()
+    const legacy = new DatabaseSync(legacyPath)
+    legacy.exec("DROP INDEX run_subagents_review_id")
+    legacy.exec("ALTER TABLE run_subagents DROP COLUMN review_id")
+    legacy.exec("ALTER TABLE run_subagents DROP COLUMN purpose")
+    legacy.exec("ALTER TABLE solve_goals DROP COLUMN review_used")
+    legacy.close()
+    store = await RunStore.open(legacyPath)
+    expect(store.solveGoals.get("old")?.reviewUsed).toBe(0)
+    expect(store.subagents("old-run")[0]).not.toHaveProperty("purpose")
+    expect(store.subagents("old-run")[0]).not.toHaveProperty("reviewId")
+    store.close()
+  })
+
   it("CAS isolates resumes and the first terminal writer wins (T13/T14)", async () => {
     const store = await storeFixture()
     store.createRun({ id: "run-1", challengeId: "pwn-1", workspace: "workspace", attempt: 1 })

@@ -40,6 +40,7 @@ describe("ProjectPage", () => {
         requiresAuto: false,
         retryAt: null,
         failures: 0,
+        reviewUsed: 0,
         reason: "供应商配额暂不可用",
         updatedAt: "2026-11-15T00:00:00Z",
       },

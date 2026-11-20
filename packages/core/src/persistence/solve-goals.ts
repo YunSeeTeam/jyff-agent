@@ -12,6 +12,8 @@ export interface SolveGoal {
   requiresAuto: boolean
   retryAt: string | null
   failures: number
+  /** Automatic review starts committed for this goal, including completed reviews. */
+  reviewUsed: number
   reason: string | null
   updatedAt: string
 }
@@ -25,13 +27,15 @@ export const SOLVE_GOALS_SCHEMA = `
     requires_auto INTEGER NOT NULL CHECK (requires_auto IN (0, 1)),
     retry_at TEXT,
     failures INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0),
+    review_used INTEGER NOT NULL DEFAULT 0 CHECK (review_used >= 0),
     reason TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
 `
 
 const select = `SELECT id, challenge_id AS challengeId, state, run_id AS runId,
-  requires_auto AS requiresAuto, retry_at AS retryAt, failures, reason, updated_at AS updatedAt
+  requires_auto AS requiresAuto, retry_at AS retryAt, failures,
+  review_used AS reviewUsed, reason, updated_at AS updatedAt
   FROM solve_goals`
 
 export class SolveGoalStore {
@@ -65,7 +69,8 @@ export class SolveGoalStore {
       VALUES (?, ?, 'active', NULL, ?, ?)
       ON CONFLICT(challenge_id) DO UPDATE SET
         id = excluded.id, state = 'active', run_id = NULL,
-        requires_auto = excluded.requires_auto, retry_at = NULL, failures = 0, reason = NULL,
+        requires_auto = excluded.requires_auto, retry_at = NULL, failures = 0,
+        review_used = 0, reason = NULL,
         updated_at = excluded.updated_at
     `)
       .run(challengeId, randomUUID(), requiresAuto ? 1 : 0, new Date().toISOString())

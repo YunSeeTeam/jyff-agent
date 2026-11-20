@@ -316,6 +316,7 @@ describe("CtfSubagentManager", () => {
       role: "general-purpose",
       prompt: "verify the leak",
       description: "leak check",
+      purpose: "verify",
       background: false,
     })
     const result = await manager.wait(created.id)
@@ -324,6 +325,7 @@ describe("CtfSubagentManager", () => {
       id: created.id,
       runId: "run-1",
       role: "general-purpose",
+      purpose: "verify",
       status: "completed",
       result: "verified heap leak at offset 0x20",
       background: false,

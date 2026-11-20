@@ -47,6 +47,8 @@ export interface SubagentSummaryDto {
   id: string
   runId: string
   role: string
+  purpose?: "explore" | "verify" | "review"
+  reviewId?: string
   displayName: string
   status: SubagentStatus
   createdAt: string

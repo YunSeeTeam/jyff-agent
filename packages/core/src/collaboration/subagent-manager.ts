@@ -43,6 +43,10 @@ export interface SubagentRecord {
   id: string
   runId: string
   role: string
+  /** NULL in pre-stage-6 records: their task classification is unknown. */
+  purpose?: "explore" | "verify" | "review"
+  /** For a review, `${goalId}:${subagentId}` binds the attempt to its solve goal. */
+  reviewId?: string
   displayName: string
   description: string
   status: SubagentStatus
@@ -65,6 +69,13 @@ export interface SubagentRecord {
   updatedAt: string
   startedAt?: string
   completedAt?: string
+}
+
+/** Passed to RunStore so admission and execution identity commit in one transaction. */
+export interface ReviewAdmission {
+  goalId: string
+  maxPerGoal: number
+  maxConcurrent: number
 }
 
 export type SubagentLifecycleEvent =
@@ -183,6 +194,7 @@ export class CtfSubagentManager {
     prompt: string
     description: string
     background: boolean
+    purpose?: "explore" | "verify"
   }): SubagentRecord {
     if (this.closing || this.finalizing) {
       throw new Error("SubAgent manager 正在收尾或关闭")
@@ -204,6 +216,7 @@ export class CtfSubagentManager {
       executionId: randomUUID(),
       runId: this.options.runId,
       role: role.name,
+      purpose: input.purpose ?? "explore",
       displayName: role.displayName,
       description,
       status: input.background ? "queued" : "running",
@@ -832,6 +845,7 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
         subagent_type: Type.String(),
         prompt: Type.String({ minLength: 1, maxLength: 32_000 }),
         description: Type.String({ minLength: 1, maxLength: 240 }),
+        purpose: Type.Optional(Type.Union([Type.Literal("explore"), Type.Literal("verify")])),
         run_in_background: Type.Optional(Type.Boolean()),
         resume: Type.Optional(Type.String()),
       }),
@@ -840,6 +854,7 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           subagent_type: string
           prompt: string
           description: string
+          purpose?: "explore" | "verify"
           run_in_background?: boolean
           resume?: string
         }
@@ -853,6 +868,7 @@ export function createSubagentManagerTools(manager: CtfSubagentManager): AgentTo
           role: params.subagent_type,
           prompt: params.prompt,
           description: params.description,
+          purpose: params.purpose,
           background,
         })
         return pageToolResult(

@@ -14,7 +14,7 @@ import {
   FixedAttachmentReadStore,
 } from "./fixed-attachment-reads.ts"
 import { LOCAL_PROCESS_SCHEMA, LocalProcessStore } from "./local-processes.ts"
-import type { SubagentRecord } from "../collaboration/subagent-manager.ts"
+import type { ReviewAdmission, SubagentRecord } from "../collaboration/subagent-manager.ts"
 import type {
   RemoteEnvironmentLeaseRecord,
   RemoteEnvironmentPriority,
@@ -73,6 +73,7 @@ export const RUN_STORE_DATA_CAPABILITIES = {
   "frozen-artifacts": 1,
   "fixed-attachment-reads": 1,
   "local-processes": 1,
+  "review-ledger": 1,
 } as const
 
 export type RunCloseReason =
@@ -484,6 +485,8 @@ interface EventRow {
 interface SubagentRow {
   execution_id: string | null
   result_kind: SubagentRecord["resultKind"] | null
+  purpose: SubagentRecord["purpose"] | null
+  review_id: string | null
   id: string
   run_id: string
   role: string
@@ -799,6 +802,8 @@ function subagentFromRow(row: SubagentRow): SubagentRecord {
     id: row.id,
     runId: row.run_id,
     role: row.role,
+    ...(row.purpose == null ? {} : { purpose: row.purpose }),
+    ...(row.review_id == null ? {} : { reviewId: row.review_id }),
     displayName: row.display_name,
     description: row.description,
     status: row.status,
@@ -1005,6 +1010,8 @@ export class RunStore {
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         role TEXT NOT NULL,
+        purpose TEXT CHECK (purpose IN ('explore', 'verify', 'review')),
+        review_id TEXT,
         display_name TEXT NOT NULL,
         description TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -1212,6 +1219,15 @@ export class RunStore {
       )
     }
     database.exec(SOLVE_GOALS_SCHEMA)
+    const solveGoalColumns = new Set(
+      (database.prepare("PRAGMA table_info(solve_goals)").all() as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    )
+    if (!solveGoalColumns.has("review_used"))
+      database.exec(
+        "ALTER TABLE solve_goals ADD COLUMN review_used INTEGER NOT NULL DEFAULT 0 CHECK (review_used >= 0)",
+      )
     database.exec(FIXED_ATTACHMENT_READS_SCHEMA)
     database.exec(LOCAL_PROCESS_SCHEMA)
     for (const [name, definition] of [
@@ -1311,10 +1327,18 @@ export class RunStore {
         "cache_write_tokens",
         "ALTER TABLE run_subagents ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0)",
       ],
+      [
+        "purpose",
+        "ALTER TABLE run_subagents ADD COLUMN purpose TEXT CHECK (purpose IN ('explore', 'verify', 'review'))",
+      ],
+      ["review_id", "ALTER TABLE run_subagents ADD COLUMN review_id TEXT"],
     ] as const
     for (const [name, sql] of subagentUsageMigrations) {
       if (!subagentColumns.has(name)) database.exec(sql)
     }
+    database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS run_subagents_review_id ON run_subagents(review_id) WHERE review_id IS NOT NULL",
+    )
 
     database.exec("BEGIN IMMEDIATE")
     try {
@@ -3137,6 +3161,12 @@ export class RunStore {
 
   /** Persist one worker snapshot; lifecycle events remain in run_events for replay. */
   upsertSubagent(record: SubagentRecord): SubagentRecord {
+    if (record.purpose === "review" || record.reviewId)
+      throw subagentStoreError("invalid_execution", "Reviews require atomic execution admission")
+    return this.upsertSubagentRecord(record)
+  }
+
+  private upsertSubagentRecord(record: SubagentRecord): SubagentRecord {
     this.assertOpen()
     this.getRunOrThrow(record.runId)
     const current = this.database
@@ -3147,13 +3177,15 @@ export class RunStore {
     this.database
       .prepare(`
         INSERT INTO run_subagents (
-          id, run_id, role, display_name, description, status, background,
+          id, run_id, role, purpose, review_id, display_name, description, status, background,
           prompt, session_path, container_cwd, result, error, active_tool,
           turns, tool_uses, total_tokens, input_tokens, cache_read_tokens,
           cache_write_tokens, created_at, updated_at, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           role = excluded.role,
+          purpose = excluded.purpose,
+          review_id = excluded.review_id,
           display_name = excluded.display_name,
           description = excluded.description,
           status = excluded.status,
@@ -3178,6 +3210,8 @@ export class RunStore {
         record.id,
         record.runId,
         record.role,
+        record.purpose ?? null,
+        record.reviewId ?? null,
         record.displayName,
         record.description,
         record.status,
@@ -3206,6 +3240,7 @@ export class RunStore {
   beginSubagentExecution(
     record: SubagentRecord,
     previousExecutionId: string | null,
+    reviewAdmission?: ReviewAdmission,
   ): SubagentRecord {
     this.assertOpen()
     if (
@@ -3217,6 +3252,20 @@ export class RunStore {
         "invalid_execution",
         "A new execution identity and active state are required",
       )
+    }
+    const review = record.purpose === "review"
+    if (review) {
+      if (
+        !reviewAdmission ||
+        record.reviewId !== `${reviewAdmission.goalId}:${record.id}` ||
+        !Number.isSafeInteger(reviewAdmission.maxPerGoal) ||
+        reviewAdmission.maxPerGoal < 0 ||
+        !Number.isSafeInteger(reviewAdmission.maxConcurrent) ||
+        reviewAdmission.maxConcurrent < 1
+      )
+        throw subagentStoreError("invalid_execution", "Review identity or limits are invalid")
+    } else if (record.reviewId || reviewAdmission) {
+      throw subagentStoreError("invalid_execution", "Only a review may carry review admission")
     }
     this.database.exec("BEGIN IMMEDIATE")
     try {
@@ -3234,15 +3283,40 @@ export class RunStore {
             "The previous execution changed or remains active",
           )
         }
+        if (old.purpose !== (record.purpose ?? null) || old.review_id !== (record.reviewId ?? null))
+          throw subagentStoreError("stale_execution", "The task identity changed on resume")
       } else {
         if (previousExecutionId !== null)
           throw subagentStoreError("stale_execution", "Previous execution does not exist")
-        this.upsertSubagent({
+        this.upsertSubagentRecord({
           ...record,
           executionId: undefined,
           result: undefined,
           resultKind: undefined,
         })
+      }
+      if (review && reviewAdmission) {
+        const run = this.database
+          .prepare("SELECT challenge_id FROM runs WHERE id = ?")
+          .get(record.runId) as { challenge_id: string } | undefined
+        if (!run) throw subagentStoreError("stale_execution", "Review Run does not exist")
+        const goal = this.database
+          .prepare("SELECT id, state, review_used FROM solve_goals WHERE challenge_id = ?")
+          .get(run.challenge_id) as { id: string; state: string; review_used: number } | undefined
+        if (!goal || goal.id !== reviewAdmission.goalId || goal.state !== "active")
+          throw subagentStoreError(
+            "capability_unavailable",
+            "An active solve goal is required for review",
+          )
+        if (!old && goal.review_used >= reviewAdmission.maxPerGoal)
+          throw subagentStoreError("resource_limit", "Automatic review count is exhausted")
+        const active = this.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM run_subagents WHERE review_id LIKE ? AND id <> ? AND status IN ('queued', 'running')",
+          )
+          .get(`${goal.id}:%`, record.id) as { count: number }
+        if (active.count >= reviewAdmission.maxConcurrent)
+          throw subagentStoreError("resource_limit", "Concurrent automatic reviews are full")
       }
       const updated = this.database
         .prepare(`
@@ -3263,10 +3337,26 @@ export class RunStore {
         )
       if (Number(updated.changes) !== 1)
         throw subagentStoreError("stale_execution", "Execution CAS failed")
+      if (review && reviewAdmission) {
+        if (!old)
+          this.database
+            .prepare("UPDATE solve_goals SET review_used = review_used + 1 WHERE id = ?")
+            .run(reviewAdmission.goalId)
+        this.database
+          .prepare(
+            "INSERT OR IGNORE INTO runtime_data_capabilities (name, version) VALUES ('review-ledger', 1)",
+          )
+          .run()
+      }
       this.insertEvent(
         record.runId,
         "subagent_execution_started",
-        { subagentId: record.id, executionId: record.executionId },
+        {
+          subagentId: record.id,
+          executionId: record.executionId,
+          ...(record.purpose ? { purpose: record.purpose } : {}),
+          ...(record.reviewId ? { reviewId: record.reviewId } : {}),
+        },
         record.updatedAt,
       )
       const saved = this.subagentRecord(record.runId, record.id)
